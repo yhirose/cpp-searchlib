@@ -31,18 +31,12 @@ std::optional<Expression> parse_query(const Index &index, std::string_view sv) {
   };
 
   auto list_handler = [&](Operation operation) {
-    return [&](const peg::SemanticValues &vs) {
+    return [=](const peg::SemanticValues &vs) {
       if (vs.size() == 1) {
         return std::any_cast<Expression>(vs[0]);
       }
-
-      Expression expr;
-      expr.operation = Operation::Adjacent;
-      expr.term_id = -1;
-      for (const auto &v : vs) {
-        expr.nodes.emplace_back(std::any_cast<Expression>(v));
-      }
-      return expr;
+      return Expression{operation, static_cast<size_t>(-1),
+                        vs.transform<Expression>()};
     };
   };
   parser["OR"] = list_handler(Operation::Or);
@@ -61,7 +55,8 @@ std::optional<Expression> parse_query(const Index &index, std::string_view sv) {
       throw peg::parse_error(msg.c_str());
     }
 
-    return Expression{Operation::Term, index.term_dictionary.at(term)};
+    auto term_id = index.term_dictionary.at(term);
+    return Expression{Operation::Term, term_id};
   };
 
   // parser.log = [](size_t line, size_t col, const std::string& msg) {

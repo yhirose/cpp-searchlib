@@ -11,8 +11,9 @@ using namespace std;
 std::vector<std::string> sample_data = {
     "This is the first document.",
     "This is the second document.",
-    "This is the third document. This is the second sentence in the third "
-    "document.",
+    "This is the third document. This is the second sentence in the third.",
+    "Fourth document",
+    "Hello World!",
 };
 
 auto sample_normalizer = [](auto sv) { return unicode::to_lowercase(sv); };
@@ -24,7 +25,8 @@ void sample_index(searchlib::Index &index,
   size_t document_id = 0;
   for (const auto &s : sample_data) {
     std::vector<searchlib::TextRange> text_ranges;
-    searchlib::PlainUTF8Tokenizer tokenizer(s, index.normalizer, text_ranges);
+    searchlib::UTF8PlainTextTokenizer tokenizer(s, index.normalizer,
+                                                text_ranges);
 
     searchlib::indexing(index, tokenizer, document_id);
 
@@ -33,18 +35,21 @@ void sample_index(searchlib::Index &index,
   }
 }
 
-TEST_CASE("PlainUTF8Tokenizer Test", "[tokenizer]") {
+TEST_CASE("UTF8PlainTextTokenizer Test", "[tokenizer]") {
   std::vector<std::vector<std::string>> expected = {
       {"this", "is", "the", "first", "document"},
       {"this", "is", "the", "second", "document"},
       {"this", "is", "the", "third", "document", "this", "is", "the", "second",
-       "sentence", "in", "the", "third", "document"},
+       "sentence", "in", "the", "third"},
+      {"fourth", "document"},
+      {"hello", "world"},
   };
 
   size_t document_id = 0;
   for (const auto &s : sample_data) {
     std::vector<searchlib::TextRange> text_ranges;
-    searchlib::PlainUTF8Tokenizer tokenizer(s, sample_normalizer, text_ranges);
+    searchlib::UTF8PlainTextTokenizer tokenizer(s, sample_normalizer,
+                                                text_ranges);
     std::vector<std::string> actual;
     tokenizer.tokenize(
         [&](auto &str, auto) { actual.emplace_back(searchlib::u8(str)); });
@@ -66,7 +71,7 @@ TEST_CASE("Parsing query Test", "[query]") {
   }
 
   {
-    auto expr = parse_query(index, " HELLO ");
+    auto expr = parse_query(index, " nothing ");
     REQUIRE(expr == std::nullopt);
   }
 }
@@ -80,8 +85,7 @@ TEST_CASE("Term search Test", "[search]") {
     auto expr = parse_query(index, " The ");
     auto result = perform_search(index, *expr);
 
-    auto document_count = result->document_count();
-    REQUIRE(document_count == 3);
+    REQUIRE(result->size() == 3);
 
     {
       auto index = 0;
@@ -120,8 +124,7 @@ TEST_CASE("Term search Test", "[search]") {
     auto expr = parse_query(index, " second ");
     auto result = perform_search(index, *expr);
 
-    auto document_count = result->document_count();
-    REQUIRE(document_count == 2);
+    REQUIRE(result->size() == 2);
 
     {
       auto index = 0;
@@ -148,5 +151,168 @@ TEST_CASE("Term search Test", "[search]") {
       REQUIRE(rng.position == 40);
       REQUIRE(rng.length == 6);
     }
+  }
+}
+
+TEST_CASE("And search Test", "[search]") {
+  searchlib::Index index;
+  searchlib::TextRangeList text_range_list;
+  sample_index(index, text_range_list);
+
+  {
+    auto expr = parse_query(index, " the second third ");
+
+    REQUIRE(expr->operation == searchlib::Operation::And);
+    REQUIRE(expr->nodes.size() == 3);
+
+    auto result = perform_search(index, *expr);
+
+    REQUIRE(result->size() == 1);
+
+    {
+      auto index = 0;
+      REQUIRE(result->document_id(index) == 2);
+      REQUIRE(result->search_hit_count(index) == 6);
+
+      {
+        auto hit_index = 1;
+        REQUIRE(result->term_position(index, hit_index) == 3);
+        REQUIRE(result->term_count(index, hit_index) == 1);
+
+        auto rng =
+            searchlib::text_range(text_range_list, *result, index, hit_index);
+        REQUIRE(rng.position == 12);
+        REQUIRE(rng.length == 5);
+      }
+
+      {
+        auto hit_index = 3;
+        REQUIRE(result->term_position(index, hit_index) == 8);
+        REQUIRE(result->term_count(index, hit_index) == 1);
+
+        auto rng =
+            searchlib::text_range(text_range_list, *result, index, hit_index);
+        REQUIRE(rng.position == 40);
+        REQUIRE(rng.length == 6);
+      }
+
+      {
+        auto hit_index = 5;
+        REQUIRE(result->term_position(index, hit_index) == 12);
+        REQUIRE(result->term_count(index, hit_index) == 1);
+
+        auto rng =
+            searchlib::text_range(text_range_list, *result, index, hit_index);
+        REQUIRE(rng.position == 63);
+        REQUIRE(rng.length == 5);
+      }
+    }
+  }
+}
+
+TEST_CASE("Or search Test", "[search]") {
+  searchlib::Index index;
+  searchlib::TextRangeList text_range_list;
+  sample_index(index, text_range_list);
+
+  {
+    auto expr = parse_query(index, " third | HELLO | second ");
+
+    REQUIRE(expr->operation == searchlib::Operation::Or);
+    REQUIRE(expr->nodes.size() == 3);
+
+    auto result = perform_search(index, *expr);
+
+    REQUIRE(result->size() == 3);
+
+    {
+      auto index = 0;
+      REQUIRE(result->document_id(index) == 1);
+      REQUIRE(result->search_hit_count(index) == 1);
+
+      {
+        auto hit_index = 0;
+        REQUIRE(result->term_position(index, hit_index) == 3);
+        REQUIRE(result->term_count(index, hit_index) == 1);
+
+        auto rng =
+            searchlib::text_range(text_range_list, *result, index, hit_index);
+        REQUIRE(rng.position == 12);
+        REQUIRE(rng.length == 6);
+      }
+    }
+
+    {
+      auto index = 1;
+      REQUIRE(result->document_id(index) == 2);
+      REQUIRE(result->search_hit_count(index) == 3);
+
+      {
+        auto hit_index = 0;
+        REQUIRE(result->term_position(index, hit_index) == 3);
+        REQUIRE(result->term_count(index, hit_index) == 1);
+
+        auto rng =
+            searchlib::text_range(text_range_list, *result, index, hit_index);
+        REQUIRE(rng.position == 12);
+        REQUIRE(rng.length == 5);
+      }
+
+      {
+        auto hit_index = 1;
+        REQUIRE(result->term_position(index, hit_index) == 8);
+        REQUIRE(result->term_count(index, hit_index) == 1);
+
+        auto rng =
+            searchlib::text_range(text_range_list, *result, index, hit_index);
+        REQUIRE(rng.position == 40);
+        REQUIRE(rng.length == 6);
+      }
+
+      {
+        auto hit_index = 2;
+        REQUIRE(result->term_position(index, hit_index) == 12);
+        REQUIRE(result->term_count(index, hit_index) == 1);
+
+        auto rng =
+            searchlib::text_range(text_range_list, *result, index, hit_index);
+        REQUIRE(rng.position == 63);
+        REQUIRE(rng.length == 5);
+      }
+    }
+
+    {
+      auto index = 2;
+      REQUIRE(result->document_id(index) == 4);
+      REQUIRE(result->search_hit_count(index) == 1);
+
+      {
+        auto hit_index = 0;
+        REQUIRE(result->term_position(index, hit_index) == 0);
+        REQUIRE(result->term_count(index, hit_index) == 1);
+
+        auto rng =
+            searchlib::text_range(text_range_list, *result, index, hit_index);
+        REQUIRE(rng.position == 0);
+        REQUIRE(rng.length == 5);
+      }
+    }
+  }
+}
+
+TEST_CASE("Adjacent search Test", "[search]") {
+  searchlib::Index index;
+  searchlib::TextRangeList text_range_list;
+  sample_index(index, text_range_list);
+
+  {
+    auto expr = parse_query(index, R"( "the second sentence" )");
+
+    REQUIRE(expr->operation == searchlib::Operation::Adjacent);
+    REQUIRE(expr->nodes.size() == 3);
+
+    auto result = perform_search(index, *expr);
+
+    // REQUIRE(result->size() == 1);
   }
 }

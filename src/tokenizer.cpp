@@ -14,12 +14,14 @@ using namespace unicode;
 
 namespace searchlib {
 
-PlainUTF8Tokenizer::PlainUTF8Tokenizer(std::string_view sv,
-                                       Normalizer normalizer,
-                                       std::vector<TextRange> &text_ranges)
+Tokenizer::~Tokenizer() = default;
+
+UTF8PlainTextTokenizer::UTF8PlainTextTokenizer(
+    std::string_view sv, Normalizer normalizer,
+    std::vector<TextRange> &text_ranges)
     : sv_(sv), normalizer_(normalizer), text_ranges_(text_ranges) {}
 
-void PlainUTF8Tokenizer::tokenize(TokenizeCallback callback) {
+void UTF8PlainTextTokenizer::tokenize(TokenizeCallback callback) {
   size_t pos = 0;
   size_t term_pos = 0;
   while (pos < sv_.size()) {

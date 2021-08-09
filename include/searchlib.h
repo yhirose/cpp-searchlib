@@ -21,14 +21,13 @@ namespace searchlib {
 
 using Normalizer = std::function<std::u32string(std::u32string_view)>;
 
-// NOTE: `std::map` shouldn't be used
+using PositionalList =
+    std::map<size_t /*document_id*/, std::vector<size_t /*position*/>>;
+
 struct Index {
+  std::vector<std::u32string /*str*/> terms;
   std::map<std::u32string /*str*/, size_t /*term_id*/> term_dictionary;
-
-  using PositionalList =
-      std::map<size_t /*document_id*/, std::vector<size_t /*position*/>>;
-
-  std::map<size_t /*term_id*/, PositionalList> positional_index;
+  std::vector<PositionalList> posting_list;
 
   Normalizer normalizer;
 };
@@ -63,7 +62,8 @@ class SearchResult {
  public:
   virtual ~SearchResult() = 0;
 
-  virtual size_t document_count() const = 0;
+  virtual size_t size() const = 0;
+
   virtual size_t document_id(size_t index) const = 0;
   virtual size_t search_hit_count(size_t index) const = 0;
 
@@ -90,13 +90,13 @@ TextRange text_range(const TextRangeList &text_range_list,
                      size_t search_hit_index);
 
 //-----------------------------------------------------------------------------
-// Tokenizer
+// Tokenizers
 //-----------------------------------------------------------------------------
 
-class PlainUTF8Tokenizer : public Tokenizer {
+class UTF8PlainTextTokenizer : public Tokenizer {
  public:
-  PlainUTF8Tokenizer(std::string_view sv, Normalizer normalizer,
-                     std::vector<TextRange> &text_ranges);
+  UTF8PlainTextTokenizer(std::string_view sv, Normalizer normalizer,
+                         std::vector<TextRange> &text_ranges);
   void tokenize(TokenizeCallback callback) override;
 
  private:
