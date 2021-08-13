@@ -9,10 +9,8 @@ std::vector<std::string> sample_data = {
   "This is the third document. This is the second sentence in the third document."
 };
 
-auto sample_normalizer = [](auto sv) { return unicode::to_lowercase(sv); };
-
 searchlib::Index index;
-index.normalizer = sample_normalizer;
+index.normalizer = [](auto sv) { return unicode::to_lowercase(sv); };
 
 searchlib::TextRangeList text_range_list;
 
