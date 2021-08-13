@@ -2,6 +2,12 @@
 
 C++17 full-text search engine library (WIP)
 
+TODO:
+- [ ] 'NEAR' operator support
+- [ ] Posting list compression
+- [ ] Scoring and ranking
+- [ ] Search scope (document, section, paragraph)
+
 ```cpp
 std::vector<std::string> documents = {
   "This is the first document.",
