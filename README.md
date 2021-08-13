@@ -29,15 +29,16 @@ for (const auto &s : sample_data) {
 }
 
 // Search...
-auto expr = searchlib::parse_query(index, " first | second third ");
+auto expr = searchlib::parse_query(index, R"( first | "the second sentence" )");
 
 auto result = searchlib::perform_search(index, *expr);
 result->size();
 result->document_id(index);
 result->search_hit_count(index);
-result->term_position(index, 0);
+result->term_position(index, search_hit_index);
+result->term_count(index, search_hit_index);
 
-auto rng = searchlib::text_range(text_range_list, *result, index, 0);
+auto rng = searchlib::text_range(text_range_list, *result, index, search_hit_index);
 rng.position;
 rng.length;
 ```
