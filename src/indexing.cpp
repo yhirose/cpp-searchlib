@@ -10,24 +10,25 @@
 
 namespace searchlib {
 
-void indexing(Index &index, Tokenizer &tokenizer, size_t document_id) {
-  tokenizer.tokenize([&](auto& str, auto term_pos) {
-    if (!contains(index.term_dictionary, str)) {
-      index.terms.push_back(str);
-      index.term_dictionary[str] = index.term_dictionary.size();
+void indexing(InvertedIndex &inverted_index, Tokenizer &tokenizer,
+              size_t document_id) {
+  tokenizer.tokenize([&](auto &str, auto term_pos) {
+    if (!contains(inverted_index.term_dictionary, str)) {
+      inverted_index.terms.push_back(str);
+      inverted_index.term_dictionary[str] =
+          inverted_index.term_dictionary.size();
     }
 
-    auto term_id = index.term_dictionary[str];
-    assert(term_id <= index.posting_list.size());
+    auto term_id = inverted_index.term_dictionary[str];
+    assert(term_id <= inverted_index.posting_list.size());
 
-    if (term_id == index.posting_list.size()) {
-      index.posting_list.resize(term_id + 1);
+    if (term_id == inverted_index.posting_list.size()) {
+      inverted_index.posting_list.resize(term_id + 1);
     }
 
-    index.posting_list[term_id][document_id].push_back(term_pos);
+    inverted_index.posting_list[term_id][document_id].push_back(term_pos);
   });
 }
-
 
 }  // namespace searchlib
 

@@ -24,9 +24,9 @@ using Normalizer = std::function<std::u32string(std::u32string_view)>;
 using PositionalList =
     std::map<size_t /*document_id*/, std::vector<size_t /*position*/>>;
 
-struct Index {
-  std::vector<std::u32string /*str*/> terms;
+struct InvertedIndex {
   std::map<std::u32string /*str*/, size_t /*term_id*/> term_dictionary;
+  std::vector<std::u32string /*str*/> terms;
   std::vector<PositionalList> posting_list;
 
   Normalizer normalizer;
@@ -42,7 +42,7 @@ class Tokenizer {
   virtual void tokenize(TokenizeCallback callback) = 0;
 };
 
-void indexing(Index &index, Tokenizer &tokenizer, size_t document_id);
+void indexing(InvertedIndex &index, Tokenizer &tokenizer, size_t document_id);
 
 //-----------------------------------------------------------------------------
 // Search
@@ -56,7 +56,8 @@ struct Expression {
   std::vector<Expression> nodes;
 };
 
-std::optional<Expression> parse_query(const Index &index, std::string_view sv);
+std::optional<Expression> parse_query(const InvertedIndex &index,
+                                      std::string_view sv);
 
 class SearchResult {
  public:
@@ -69,9 +70,10 @@ class SearchResult {
 
   virtual size_t term_position(size_t index, size_t search_hit_index) const = 0;
   virtual size_t term_count(size_t index, size_t search_hit_index) const = 0;
+  virtual bool has_term_pos(size_t index, size_t term_pos) const = 0;
 };
 
-std::shared_ptr<SearchResult> perform_search(const Index &index,
+std::shared_ptr<SearchResult> perform_search(const InvertedIndex &index,
                                              const Expression &expr);
 
 //-----------------------------------------------------------------------------

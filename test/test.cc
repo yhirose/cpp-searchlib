@@ -18,7 +18,7 @@ std::vector<std::string> sample_data = {
 
 auto sample_normalizer = [](auto sv) { return unicode::to_lowercase(sv); };
 
-void sample_index(searchlib::Index &index,
+void sample_index(searchlib::InvertedIndex &index,
                   searchlib::TextRangeList &text_range_list) {
   index.normalizer = sample_normalizer;
 
@@ -59,7 +59,7 @@ TEST_CASE("UTF8PlainTextTokenizer Test", "[tokenizer]") {
 }
 
 TEST_CASE("Parsing query Test", "[query]") {
-  searchlib::Index index;
+  searchlib::InvertedIndex index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
 
@@ -77,7 +77,7 @@ TEST_CASE("Parsing query Test", "[query]") {
 }
 
 TEST_CASE("Term search Test", "[search]") {
-  searchlib::Index index;
+  searchlib::InvertedIndex index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
 
@@ -155,7 +155,7 @@ TEST_CASE("Term search Test", "[search]") {
 }
 
 TEST_CASE("And search Test", "[search]") {
-  searchlib::Index index;
+  searchlib::InvertedIndex index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
 
@@ -211,7 +211,7 @@ TEST_CASE("And search Test", "[search]") {
 }
 
 TEST_CASE("Or search Test", "[search]") {
-  searchlib::Index index;
+  searchlib::InvertedIndex index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
 
@@ -301,7 +301,7 @@ TEST_CASE("Or search Test", "[search]") {
 }
 
 TEST_CASE("Adjacent search Test", "[search]") {
-  searchlib::Index index;
+  searchlib::InvertedIndex index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
 
@@ -313,6 +313,23 @@ TEST_CASE("Adjacent search Test", "[search]") {
 
     auto result = perform_search(index, *expr);
 
-    // REQUIRE(result->size() == 1);
+    REQUIRE(result->size() == 1);
+
+    {
+      auto index = 0;
+      REQUIRE(result->document_id(index) == 2);
+      REQUIRE(result->search_hit_count(index) == 1);
+
+      {
+        auto hit_index = 0;
+        REQUIRE(result->term_position(index, hit_index) == 7);
+        REQUIRE(result->term_count(index, hit_index) == 3);
+
+        auto rng =
+            searchlib::text_range(text_range_list, *result, index, hit_index);
+        REQUIRE(rng.position == 36);
+        REQUIRE(rng.length == 19);
+      }
+    }
   }
 }

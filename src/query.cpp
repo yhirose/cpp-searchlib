@@ -11,7 +11,8 @@
 
 namespace searchlib {
 
-std::optional<Expression> parse_query(const Index &index, std::string_view sv) {
+std::optional<Expression> parse_query(const InvertedIndex &inverted_index,
+                                      std::string_view sv) {
   static peg::parser parser(R"(
     ROOT        <- OR?
     OR          <- AND ('|' AND)*
@@ -46,16 +47,16 @@ std::optional<Expression> parse_query(const Index &index, std::string_view sv) {
   parser["TERM"] = [&](const peg::SemanticValues &vs) {
     auto term = u32(vs.token());
 
-    if (index.normalizer) {
-      term = index.normalizer(term);
+    if (inverted_index.normalizer) {
+      term = inverted_index.normalizer(term);
     }
 
-    if (!contains(index.term_dictionary, term)) {
+    if (!contains(inverted_index.term_dictionary, term)) {
       std::string msg = "invalid term '" + vs.token_to_string() + "'.";
       throw peg::parse_error(msg.c_str());
     }
 
-    auto term_id = index.term_dictionary.at(term);
+    auto term_id = inverted_index.term_dictionary.at(term);
     return Expression{Operation::Term, term_id};
   };
 
