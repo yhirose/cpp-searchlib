@@ -12,7 +12,7 @@ namespace searchlib {
 
 void indexing(InvertedIndex &inverted_index, Tokenizer &tokenizer,
               size_t document_id) {
-  tokenizer.tokenize([&](auto &str, auto term_pos) {
+  tokenizer.tokenize([&](const auto &str, auto term_pos) {
     if (!contains(inverted_index.term_dictionary, str)) {
       inverted_index.terms.push_back(str);
       inverted_index.term_dictionary[str] =

@@ -8,6 +8,16 @@
 
 using namespace std;
 
+std::vector<std::string> split(const std::string &input, char delimiter) {
+  istringstream ss(input);
+  std::string field;
+  std::vector<std::string> result;
+  while (std::getline(ss, field, delimiter)) {
+    result.push_back(field);
+  }
+  return result;
+}
+
 std::vector<std::string> sample_data = {
     "This is the first document.",
     "This is the second document.",
@@ -16,11 +26,9 @@ std::vector<std::string> sample_data = {
     "Hello World!",
 };
 
-auto sample_normalizer = [](auto sv) { return unicode::to_lowercase(sv); };
-
 void sample_index(searchlib::InvertedIndex &index,
                   searchlib::TextRangeList &text_range_list) {
-  index.normalizer = sample_normalizer;
+  index.normalizer = [](auto sv) { return unicode::to_lowercase(sv); };
 
   size_t document_id = 0;
   for (const auto &s : sample_data) {
@@ -48,8 +56,8 @@ TEST_CASE("UTF8PlainTextTokenizer Test", "[tokenizer]") {
   size_t document_id = 0;
   for (const auto &s : sample_data) {
     std::vector<searchlib::TextRange> text_ranges;
-    searchlib::UTF8PlainTextTokenizer tokenizer(s, sample_normalizer,
-                                                text_ranges);
+    searchlib::UTF8PlainTextTokenizer tokenizer(
+        s, [](auto sv) { return unicode::to_lowercase(sv); }, text_ranges);
     std::vector<std::string> actual;
     tokenizer.tokenize(
         [&](auto &str, auto) { actual.emplace_back(searchlib::u8(str)); });
@@ -331,5 +339,44 @@ TEST_CASE("Adjacent search Test", "[search]") {
         REQUIRE(rng.length == 19);
       }
     }
+  }
+}
+
+void kjv_index(searchlib::InvertedIndex &index,
+               searchlib::TextRangeList &text_range_list) {
+  index.normalizer = [](auto sv) { return unicode::to_lowercase(sv); };
+  std::ifstream fs("../test/t_kjv.tsv");
+  std::string line;
+  while (std::getline(fs, line)) {
+    auto fields = split(line, '\t');
+    auto document_id = std::stoi(fields[0]);
+    const auto &s = fields[4];
+
+    std::vector<searchlib::TextRange> text_ranges;
+    searchlib::UTF8PlainTextTokenizer tokenizer(s, index.normalizer,
+                                                text_ranges);
+
+    searchlib::indexing(index, tokenizer, document_id);
+
+    text_range_list.emplace(document_id, std::move(text_ranges));
+  }
+}
+
+TEST_CASE("KJB Test", "[kjv]") {
+  searchlib::InvertedIndex index;
+  searchlib::TextRangeList text_range_list;
+
+  kjv_index(index, text_range_list);
+
+  {
+    auto expr = parse_query(index, R"( apple )");
+    auto result = perform_search(index, *expr);
+    REQUIRE(result->size() == 8);
+  }
+
+  {
+    auto expr = parse_query(index, R"( "apple tree" )");
+    auto result = perform_search(index, *expr);
+    REQUIRE(result->size() == 3);
   }
 }

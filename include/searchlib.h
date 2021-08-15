@@ -11,6 +11,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace searchlib {
@@ -25,7 +26,9 @@ using PositionalList =
     std::map<size_t /*document_id*/, std::vector<size_t /*position*/>>;
 
 struct InvertedIndex {
-  std::map<std::u32string /*str*/, size_t /*term_id*/> term_dictionary;
+  std::unordered_map<std::u32string /*str*/, size_t /*term_id*/>
+      term_dictionary;
+
   std::vector<std::u32string /*str*/> terms;
   std::vector<PositionalList> posting_list;
 
@@ -85,7 +88,8 @@ struct TextRange {
   size_t length;
 };
 
-using TextRangeList = std::map<size_t /*document_id*/, std::vector<TextRange>>;
+using TextRangeList =
+    std::unordered_map<size_t /*document_id*/, std::vector<TextRange>>;
 
 TextRange text_range(const TextRangeList &text_range_list,
                      const SearchResult &result, size_t index,
