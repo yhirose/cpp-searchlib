@@ -20,7 +20,6 @@ namespace searchlib {
 // Indexer
 //-----------------------------------------------------------------------------
 
-// using Normalizer = std::function<std::u32string(std::u32string_view)>;
 using Normalizer = std::function<std::u32string(const std::u32string &)>;
 
 using PositionalList =

@@ -7,6 +7,7 @@
 
 #include "searchlib.h"
 #include "utils.h"
+#include <cassert>
 
 namespace searchlib {
 
