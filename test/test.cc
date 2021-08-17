@@ -1,15 +1,20 @@
 ﻿#include <searchlib.h>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <catch2/catch_test_macros.hpp>
 
 #include "lib/unicodelib.h"
 #include "utils.h"
 
-#define CATCH_CONFIG_MAIN
-#include "catch.hpp"
-
-using namespace std;
+#ifdef _MSC_BUILD
+const auto KJV_PATH = "../../test/t_kjv.tsv";
+#else
+const auto KJV_PATH = "../test/t_kjv.tsv";
+#endif
 
 std::vector<std::string> split(const std::string &input, char delimiter) {
-  istringstream ss(input);
+  std::istringstream ss(input);
   std::string field;
   std::vector<std::string> result;
   while (std::getline(ss, field, delimiter)) {
@@ -52,7 +57,7 @@ void sample_index(searchlib::InvertedIndex &index,
 void kjv_index(searchlib::InvertedIndex &index,
                searchlib::TextRangeList &text_range_list) {
   index.normalizer = [](auto sv) { return unicode::to_lowercase(sv); };
-  std::ifstream fs("../test/t_kjv.tsv");
+  std::ifstream fs(KJV_PATH);
   std::string line;
   while (std::getline(fs, line)) {
     auto fields = split(line, '\t');
@@ -590,7 +595,7 @@ TEST_CASE("UTF8 decode performance Test", "[kjv]") {
   // };
   auto normalizer = to_lowercase;
 
-  std::ifstream fs("../test/t_kjv.tsv");
+  std::ifstream fs(KJV_PATH);
 
   std::string s;
   while (std::getline(fs, s)) {

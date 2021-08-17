@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include <algorithm>
+#include <functional>
 #include <map>
 #include <optional>
 #include <string>
