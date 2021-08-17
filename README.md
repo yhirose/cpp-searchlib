@@ -3,9 +3,8 @@
 C++17 full-text search engine library (WIP)
 
 TODO:
-- [ ] 'NEAR' operator support
-- [ ] Posting list compression
 - [ ] Scoring and ranking
+- [ ] Posting list compression
 - [ ] Search scope (document, section, paragraph)
 
 ```cpp
@@ -17,7 +16,7 @@ std::vector<std::string> documents = {
 };
 
 searchlib::InvertedIndex index;
-index.normalizer = [](auto sv) { return unicode::to_lowercase(sv); };
+index.normalizer = [](auto str) { return unicode::to_lowercase(str); };
 
 searchlib::TextRangeList text_range_list;
 

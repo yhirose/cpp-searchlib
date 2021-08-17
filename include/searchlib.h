@@ -20,7 +20,8 @@ namespace searchlib {
 // Indexer
 //-----------------------------------------------------------------------------
 
-using Normalizer = std::function<std::u32string(std::u32string_view)>;
+// using Normalizer = std::function<std::u32string(std::u32string_view)>;
+using Normalizer = std::function<std::u32string(const std::u32string &)>;
 
 using PositionalList =
     std::map<size_t /*document_id*/, std::vector<size_t /*position*/>>;
@@ -51,11 +52,12 @@ void indexing(InvertedIndex &index, Tokenizer &tokenizer, size_t document_id);
 // Search
 //-----------------------------------------------------------------------------
 
-enum class Operation { Term, And, Adjacent, Or };
+enum class Operation { Term, And, Adjacent, Or, Near };
 
 struct Expression {
   Operation operation;
   size_t term_id;
+  size_t near_size;
   std::vector<Expression> nodes;
 };
 

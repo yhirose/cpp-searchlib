@@ -18,6 +18,12 @@ std::vector<std::string> split(const std::string &input, char delimiter) {
   return result;
 }
 
+std::u32string to_lowercase(std::u32string str) {
+  std::transform(str.begin(), str.end(), str.begin(),
+                 [](auto c) { return std::tolower(c); });
+  return str;
+}
+
 std::vector<std::string> sample_data = {
     "This is the first document.",
     "This is the second document.",
@@ -40,6 +46,26 @@ void sample_index(searchlib::InvertedIndex &index,
 
     text_range_list.emplace(document_id, std::move(text_ranges));
     document_id++;
+  }
+}
+
+void kjv_index(searchlib::InvertedIndex &index,
+               searchlib::TextRangeList &text_range_list) {
+  index.normalizer = [](auto sv) { return unicode::to_lowercase(sv); };
+  std::ifstream fs("../test/t_kjv.tsv");
+  std::string line;
+  while (std::getline(fs, line)) {
+    auto fields = split(line, '\t');
+    auto document_id = std::stoi(fields[0]);
+    const auto &s = fields[4];
+
+    std::vector<searchlib::TextRange> text_ranges;
+    searchlib::UTF8PlainTextTokenizer tokenizer(s, index.normalizer,
+                                                text_ranges);
+
+    searchlib::indexing(index, tokenizer, document_id);
+
+    text_range_list.emplace(document_id, std::move(text_ranges));
   }
 }
 
@@ -84,7 +110,7 @@ TEST_CASE("Parsing query Test", "[query]") {
   }
 }
 
-TEST_CASE("Term search Test", "[search]") {
+TEST_CASE("Term search Test", "[memory]") {
   searchlib::InvertedIndex index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
@@ -162,7 +188,7 @@ TEST_CASE("Term search Test", "[search]") {
   }
 }
 
-TEST_CASE("And search Test", "[search]") {
+TEST_CASE("And search Test", "[memory]") {
   searchlib::InvertedIndex index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
@@ -218,7 +244,7 @@ TEST_CASE("And search Test", "[search]") {
   }
 }
 
-TEST_CASE("Or search Test", "[search]") {
+TEST_CASE("Or search Test", "[memory]") {
   searchlib::InvertedIndex index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
@@ -308,7 +334,86 @@ TEST_CASE("Or search Test", "[search]") {
   }
 }
 
-TEST_CASE("Adjacent search Test", "[search]") {
+TEST_CASE("Adjacent search Test", "[memory]") {
+  searchlib::InvertedIndex index;
+  searchlib::TextRangeList text_range_list;
+  sample_index(index, text_range_list);
+
+  {
+    auto expr = parse_query(index, R"( "is the" )");
+
+    REQUIRE(expr->operation == searchlib::Operation::Adjacent);
+    REQUIRE(expr->nodes.size() == 2);
+
+    auto result = perform_search(index, *expr);
+
+    REQUIRE(result->size() == 3);
+
+    {
+      auto index = 0;
+      REQUIRE(result->document_id(index) == 0);
+      REQUIRE(result->search_hit_count(index) == 1);
+
+      {
+        auto hit_index = 0;
+        REQUIRE(result->term_position(index, hit_index) == 1);
+        REQUIRE(result->term_count(index, hit_index) == 2);
+
+        auto rng =
+            searchlib::text_range(text_range_list, *result, index, hit_index);
+        REQUIRE(rng.position == 5);
+        REQUIRE(rng.length == 6);
+      }
+    }
+
+    {
+      auto index = 1;
+      REQUIRE(result->document_id(index) == 1);
+      REQUIRE(result->search_hit_count(index) == 1);
+
+      {
+        auto hit_index = 0;
+        REQUIRE(result->term_position(index, hit_index) == 1);
+        REQUIRE(result->term_count(index, hit_index) == 2);
+
+        auto rng =
+            searchlib::text_range(text_range_list, *result, index, hit_index);
+        REQUIRE(rng.position == 5);
+        REQUIRE(rng.length == 6);
+      }
+    }
+
+    {
+      auto index = 2;
+      REQUIRE(result->document_id(index) == 2);
+      REQUIRE(result->search_hit_count(index) == 2);
+
+      {
+        auto hit_index = 0;
+        REQUIRE(result->term_position(index, hit_index) == 1);
+        REQUIRE(result->term_count(index, hit_index) == 2);
+
+        auto rng =
+            searchlib::text_range(text_range_list, *result, index, hit_index);
+        REQUIRE(rng.position == 5);
+        REQUIRE(rng.length == 6);
+      }
+
+      {
+        auto hit_index = 1;
+        REQUIRE(result->term_position(index, hit_index) == 6);
+        REQUIRE(result->term_count(index, hit_index) == 2);
+
+        auto rng =
+            searchlib::text_range(text_range_list, *result, index, hit_index);
+        REQUIRE(rng.position == 33);
+        REQUIRE(rng.length == 6);
+      }
+    }
+  }
+}
+
+TEST_CASE("Adjacent search with 3 words Test", "[memory]") {
   searchlib::InvertedIndex index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
@@ -342,23 +447,121 @@ TEST_CASE("Adjacent search Test", "[search]") {
   }
 }
 
-void kjv_index(searchlib::InvertedIndex &index,
-               searchlib::TextRangeList &text_range_list) {
-  index.normalizer = [](auto sv) { return unicode::to_lowercase(sv); };
-  std::ifstream fs("../test/t_kjv.tsv");
-  std::string line;
-  while (std::getline(fs, line)) {
-    auto fields = split(line, '\t');
-    auto document_id = std::stoi(fields[0]);
-    const auto &s = fields[4];
+TEST_CASE("Near search Test", "[memory]") {
+  searchlib::InvertedIndex index;
+  searchlib::TextRangeList text_range_list;
+  sample_index(index, text_range_list);
 
-    std::vector<searchlib::TextRange> text_ranges;
-    searchlib::UTF8PlainTextTokenizer tokenizer(s, index.normalizer,
-                                                text_ranges);
+  {
+    auto expr = parse_query(index, R"( second ~ document )");
 
-    searchlib::indexing(index, tokenizer, document_id);
+    REQUIRE(expr->operation == searchlib::Operation::Near);
+    REQUIRE(expr->nodes.size() == 2);
 
-    text_range_list.emplace(document_id, std::move(text_ranges));
+    auto result = perform_search(index, *expr);
+
+    REQUIRE(result->size() == 2);
+
+    {
+      auto index = 0;
+      REQUIRE(result->document_id(index) == 1);
+      REQUIRE(result->search_hit_count(index) == 2);
+
+      {
+        auto hit_index = 0;
+        REQUIRE(result->term_position(index, hit_index) == 3);
+        REQUIRE(result->term_count(index, hit_index) == 1);
+
+        auto rng =
+            searchlib::text_range(text_range_list, *result, index, hit_index);
+        REQUIRE(rng.position == 12);
+        REQUIRE(rng.length == 6);
+      }
+
+      {
+        auto hit_index = 1;
+        REQUIRE(result->term_position(index, hit_index) == 4);
+        REQUIRE(result->term_count(index, hit_index) == 1);
+
+        auto rng =
+            searchlib::text_range(text_range_list, *result, index, hit_index);
+        REQUIRE(rng.position == 19);
+        REQUIRE(rng.length == 8);
+      }
+    }
+
+    {
+      auto index = 1;
+      REQUIRE(result->document_id(index) == 2);
+      REQUIRE(result->search_hit_count(index) == 2);
+
+      {
+        auto hit_index = 0;
+        REQUIRE(result->term_position(index, hit_index) == 4);
+        REQUIRE(result->term_count(index, hit_index) == 1);
+
+        auto rng =
+            searchlib::text_range(text_range_list, *result, index, hit_index);
+        REQUIRE(rng.position == 18);
+        REQUIRE(rng.length == 8);
+      }
+
+      {
+        auto hit_index = 1;
+        REQUIRE(result->term_position(index, hit_index) == 8);
+        REQUIRE(result->term_count(index, hit_index) == 1);
+
+        auto rng =
+            searchlib::text_range(text_range_list, *result, index, hit_index);
+        REQUIRE(rng.position == 40);
+        REQUIRE(rng.length == 6);
+      }
+    }
+  }
+}
+
+TEST_CASE("Near search with phrase Test", "[memory]") {
+  searchlib::InvertedIndex index;
+  searchlib::TextRangeList text_range_list;
+  sample_index(index, text_range_list);
+
+  {
+    auto expr = parse_query(index, R"( sentence ~ "is the" )");
+
+    REQUIRE(expr->operation == searchlib::Operation::Near);
+    REQUIRE(expr->nodes.size() == 2);
+
+    auto result = perform_search(index, *expr);
+
+    REQUIRE(result->size() == 1);
+
+    {
+      auto index = 0;
+      REQUIRE(result->document_id(index) == 2);
+      REQUIRE(result->search_hit_count(index) == 2);
+
+      {
+        auto hit_index = 0;
+        REQUIRE(result->term_position(index, hit_index) == 6);
+        REQUIRE(result->term_count(index, hit_index) == 2);
+
+        auto rng =
+            searchlib::text_range(text_range_list, *result, index, hit_index);
+        REQUIRE(rng.position == 33);
+        REQUIRE(rng.length == 6);
+      }
+
+      {
+        auto hit_index = 1;
+        REQUIRE(result->term_position(index, hit_index) == 9);
+        REQUIRE(result->term_count(index, hit_index) == 1);
+
+        auto rng =
+            searchlib::text_range(text_range_list, *result, index, hit_index);
+        REQUIRE(rng.position == 47);
+        REQUIRE(rng.length == 8);
+      }
+    }
   }
 }
 
@@ -380,3 +583,22 @@ TEST_CASE("KJB Test", "[kjv]") {
     REQUIRE(result->size() == 3);
   }
 }
+
+TEST_CASE("UTF8 decode performance Test", "[kjv]") {
+  // auto normalizer = [](const auto &str) {
+  //   return unicode::to_lowercase(str);
+  // };
+  auto normalizer = to_lowercase;
+
+  std::ifstream fs("../test/t_kjv.tsv");
+
+  std::string s;
+  while (std::getline(fs, s)) {
+    std::vector<searchlib::TextRange> text_ranges;
+
+    searchlib::UTF8PlainTextTokenizer tokenizer(s, normalizer, text_ranges);
+
+    tokenizer.tokenize([&](auto &str, auto) {});
+  }
+}
+

@@ -16,7 +16,8 @@ std::optional<Expression> parse_query(const InvertedIndex &inverted_index,
   static peg::parser parser(R"(
     ROOT        <- OR?
     OR          <- AND ('|' AND)*
-    AND         <- PRIMARY+
+    AND         <- NEAR+
+    NEAR        <- PRIMARY ('~' PRIMARY)*
     PRIMARY     <- PHRASE / TERM / '(' OR ')'
     PHRASE      <- '"' TERM+ '"'
     TERM        <- < [a-zA-Z0-9-]+ >
@@ -31,17 +32,20 @@ std::optional<Expression> parse_query(const InvertedIndex &inverted_index,
     return std::nullopt;
   };
 
+  size_t DEFAULT_NEAR_SIZE = 4;
+
   auto list_handler = [&](Operation operation) {
     return [=](const peg::SemanticValues &vs) {
       if (vs.size() == 1) {
         return std::any_cast<Expression>(vs[0]);
       }
-      return Expression{operation, static_cast<size_t>(-1),
+      return Expression{operation, static_cast<size_t>(-1), DEFAULT_NEAR_SIZE,
                         vs.transform<Expression>()};
     };
   };
   parser["OR"] = list_handler(Operation::Or);
   parser["AND"] = list_handler(Operation::And);
+  parser["NEAR"] = list_handler(Operation::Near);
   parser["PHRASE"] = list_handler(Operation::Adjacent);
 
   parser["TERM"] = [&](const peg::SemanticValues &vs) {
