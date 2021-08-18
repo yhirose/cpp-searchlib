@@ -2,11 +2,13 @@
 #include <searchlib.h>
 
 #include <fstream>
+#include <filesystem>
 
 #include "test_utils.h"
 
 #ifdef _MSC_BUILD
-const auto KJV_PATH = "../../test/t_kjv.tsv";
+// Visual Studio runs tests in "build/test/Debug".
+const auto KJV_PATH = "../../../test/t_kjv.tsv";
 #else
 const auto KJV_PATH = "../test/t_kjv.tsv";
 #endif

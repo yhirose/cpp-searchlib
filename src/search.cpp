@@ -181,7 +181,7 @@ static std::pair<size_t /*min*/, size_t /*max*/> min_max_slots(
 static bool skip_cursors(
     const std::vector<std::shared_ptr<SearchResult>> &postings,
     std::vector<size_t> &cursors, size_t document_id) {
-  for (int slot = postings.size() - 1; slot >= 0; slot--) {
+  for (size_t slot = 0; slot < postings.size(); slot++) {
     // TODO: skip list suport
     while (cursors[slot] < postings[slot]->size()) {
       if (postings[slot]->document_id(cursors[slot]) >= document_id) {
@@ -200,7 +200,7 @@ static bool skip_cursors(
 static bool increment_all_cursors(
     const std::vector<std::shared_ptr<SearchResult>> &postings,
     std::vector<size_t> &cursors) {
-  for (int slot = postings.size() - 1; slot >= 0; slot--) {
+  for (size_t slot = 0; slot < postings.size(); slot++) {
     cursors[slot]++;
     if (cursors[slot] == postings[slot]->size()) {
       return true;
