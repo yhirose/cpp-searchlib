@@ -1,6 +1,5 @@
-﻿#include <searchlib.h>
-
-#include <catch2/catch_test_macros.hpp>
+﻿#include <gtest/gtest.h>
+#include <searchlib.h>
 
 #include "test_utils.h"
 
@@ -29,7 +28,7 @@ void sample_index(searchlib::InvertedIndex &index,
   }
 }
 
-TEST_CASE("UTF8PlainTextTokenizer Test", "[tokenizer]") {
+TEST(TokenizerTest, UTF8PlainTextTokenizer) {
   std::vector<std::vector<std::string>> expected = {
       {"this", "is", "the", "first", "document"},
       {"this", "is", "the", "second", "document"},
@@ -47,30 +46,30 @@ TEST_CASE("UTF8PlainTextTokenizer Test", "[tokenizer]") {
     std::vector<std::string> actual;
     tokenizer.tokenize(
         [&](auto &str, auto) { actual.emplace_back(searchlib::u8(str)); });
-    REQUIRE(actual == expected[document_id]);
+    EXPECT_EQ(expected[document_id], actual);
     document_id++;
   }
 }
 
-TEST_CASE("Parsing query Test", "[query]") {
+TEST(QueryTest, ParsingQuery) {
   searchlib::InvertedIndex index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
 
   {
     auto expr = parse_query(index, " The ");
-    REQUIRE(expr != std::nullopt);
-    REQUIRE((*expr).operation == searchlib::Operation::Term);
-    REQUIRE((*expr).term_id == 2);
+    EXPECT_NE(std::nullopt, expr);
+    EXPECT_EQ(searchlib::Operation::Term, (*expr).operation);
+    EXPECT_EQ(2, (*expr).term_id);
   }
 
   {
     auto expr = parse_query(index, " nothing ");
-    REQUIRE(expr == std::nullopt);
+    EXPECT_EQ(std::nullopt, expr);
   }
 }
 
-TEST_CASE("Term search Test", "[term]") {
+TEST(TermTest, TermSearch) {
   searchlib::InvertedIndex index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
@@ -79,38 +78,38 @@ TEST_CASE("Term search Test", "[term]") {
     auto expr = parse_query(index, " The ");
     auto result = perform_search(index, *expr);
 
-    REQUIRE(result->size() == 3);
+    EXPECT_EQ(3, result->size());
 
     {
       auto index = 0;
-      REQUIRE(result->document_id(index) == 0);
-      REQUIRE(result->search_hit_count(index) == 1);
+      EXPECT_EQ(0, result->document_id(index));
+      EXPECT_EQ(1, result->search_hit_count(index));
 
-      REQUIRE(result->term_position(index, 0) == 2);
-      REQUIRE(result->term_count(index, 0) == 1);
+      EXPECT_EQ(2, result->term_position(index, 0));
+      EXPECT_EQ(1, result->term_count(index, 0));
 
       auto rng = searchlib::text_range(text_range_list, *result, index, 0);
-      REQUIRE(rng.position == 8);
-      REQUIRE(rng.length == 3);
+      EXPECT_EQ(8, rng.position);
+      EXPECT_EQ(3, rng.length);
     }
 
     {
       auto index = 2;
-      REQUIRE(result->document_id(index) == 2);
-      REQUIRE(result->search_hit_count(index) == 3);
+      EXPECT_EQ(2, result->document_id(index));
+      EXPECT_EQ(3, result->search_hit_count(index));
 
-      REQUIRE(result->term_position(index, 0) == 2);
-      REQUIRE(result->term_count(index, 0) == 1);
+      EXPECT_EQ(2, result->term_position(index, 0));
+      EXPECT_EQ(1, result->term_count(index, 0));
 
-      REQUIRE(result->term_position(index, 1) == 7);
-      REQUIRE(result->term_count(index, 1) == 1);
+      EXPECT_EQ(7, result->term_position(index, 1));
+      EXPECT_EQ(1, result->term_count(index, 1));
 
-      REQUIRE(result->term_position(index, 2) == 11);
-      REQUIRE(result->term_count(index, 2) == 1);
+      EXPECT_EQ(11, result->term_position(index, 2));
+      EXPECT_EQ(1, result->term_count(index, 2));
 
       auto rng = searchlib::text_range(text_range_list, *result, index, 2);
-      REQUIRE(rng.position == 59);
-      REQUIRE(rng.length == 3);
+      EXPECT_EQ(59, rng.position);
+      EXPECT_EQ(3, rng.length);
     }
   }
 
@@ -118,37 +117,37 @@ TEST_CASE("Term search Test", "[term]") {
     auto expr = parse_query(index, " second ");
     auto result = perform_search(index, *expr);
 
-    REQUIRE(result->size() == 2);
+    EXPECT_EQ(2, result->size());
 
     {
       auto index = 0;
-      REQUIRE(result->document_id(index) == 1);
-      REQUIRE(result->search_hit_count(index) == 1);
+      EXPECT_EQ(1, result->document_id(index));
+      EXPECT_EQ(1, result->search_hit_count(index));
 
-      REQUIRE(result->term_position(index, 0) == 3);
-      REQUIRE(result->term_count(index, 0) == 1);
+      EXPECT_EQ(3, result->term_position(index, 0));
+      EXPECT_EQ(1, result->term_count(index, 0));
 
       auto rng = searchlib::text_range(text_range_list, *result, index, 0);
-      REQUIRE(rng.position == 12);
-      REQUIRE(rng.length == 6);
+      EXPECT_EQ(12, rng.position);
+      EXPECT_EQ(6, rng.length);
     }
 
     {
       auto index = 1;
-      REQUIRE(result->document_id(index) == 2);
-      REQUIRE(result->search_hit_count(index) == 1);
+      EXPECT_EQ(2, result->document_id(index));
+      EXPECT_EQ(1, result->search_hit_count(index));
 
-      REQUIRE(result->term_position(index, 0) == 8);
-      REQUIRE(result->term_count(index, 0) == 1);
+      EXPECT_EQ(8, result->term_position(index, 0));
+      EXPECT_EQ(1, result->term_count(index, 0));
 
       auto rng = searchlib::text_range(text_range_list, *result, index, 0);
-      REQUIRE(rng.position == 40);
-      REQUIRE(rng.length == 6);
+      EXPECT_EQ(40, rng.position);
+      EXPECT_EQ(6, rng.length);
     }
   }
 }
 
-TEST_CASE("And search Test", "[and]") {
+TEST(AndTest, AndSearch) {
   searchlib::InvertedIndex index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
@@ -156,55 +155,55 @@ TEST_CASE("And search Test", "[and]") {
   {
     auto expr = parse_query(index, " the second third ");
 
-    REQUIRE(expr->operation == searchlib::Operation::And);
-    REQUIRE(expr->nodes.size() == 3);
+    EXPECT_EQ(searchlib::Operation::And, expr->operation);
+    EXPECT_EQ(3, expr->nodes.size());
 
     auto result = perform_search(index, *expr);
 
-    REQUIRE(result->size() == 1);
+    EXPECT_EQ(1, result->size());
 
     {
       auto index = 0;
-      REQUIRE(result->document_id(index) == 2);
-      REQUIRE(result->search_hit_count(index) == 6);
+      EXPECT_EQ(2, result->document_id(index));
+      EXPECT_EQ(6, result->search_hit_count(index));
 
       {
         auto hit_index = 1;
-        REQUIRE(result->term_position(index, hit_index) == 3);
-        REQUIRE(result->term_count(index, hit_index) == 1);
+        EXPECT_EQ(3, result->term_position(index, hit_index));
+        EXPECT_EQ(1, result->term_count(index, hit_index));
 
         auto rng =
             searchlib::text_range(text_range_list, *result, index, hit_index);
-        REQUIRE(rng.position == 12);
-        REQUIRE(rng.length == 5);
+        EXPECT_EQ(12, rng.position);
+        EXPECT_EQ(5, rng.length);
       }
 
       {
         auto hit_index = 3;
-        REQUIRE(result->term_position(index, hit_index) == 8);
-        REQUIRE(result->term_count(index, hit_index) == 1);
+        EXPECT_EQ(8, result->term_position(index, hit_index));
+        EXPECT_EQ(1, result->term_count(index, hit_index));
 
         auto rng =
             searchlib::text_range(text_range_list, *result, index, hit_index);
-        REQUIRE(rng.position == 40);
-        REQUIRE(rng.length == 6);
+        EXPECT_EQ(40, rng.position);
+        EXPECT_EQ(6, rng.length);
       }
 
       {
         auto hit_index = 5;
-        REQUIRE(result->term_position(index, hit_index) == 12);
-        REQUIRE(result->term_count(index, hit_index) == 1);
+        EXPECT_EQ(12, result->term_position(index, hit_index));
+        EXPECT_EQ(1, result->term_count(index, hit_index));
 
         auto rng =
             searchlib::text_range(text_range_list, *result, index, hit_index);
-        REQUIRE(rng.position == 63);
-        REQUIRE(rng.length == 5);
+        EXPECT_EQ(63, rng.position);
+        EXPECT_EQ(5, rng.length);
       }
     }
   }
 }
 
-TEST_CASE("Or search Test", "[or]") {
+TEST(OrTest, OrSearch) {
   searchlib::InvertedIndex index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
@@ -212,89 +211,89 @@ TEST_CASE("Or search Test", "[or]") {
   {
     auto expr = parse_query(index, " third | HELLO | second ");
 
-    REQUIRE(expr->operation == searchlib::Operation::Or);
-    REQUIRE(expr->nodes.size() == 3);
+    EXPECT_EQ(searchlib::Operation::Or, expr->operation);
+    EXPECT_EQ(3, expr->nodes.size());
 
     auto result = perform_search(index, *expr);
 
-    REQUIRE(result->size() == 3);
+    EXPECT_EQ(3, result->size());
 
     {
       auto index = 0;
-      REQUIRE(result->document_id(index) == 1);
-      REQUIRE(result->search_hit_count(index) == 1);
+      EXPECT_EQ(1, result->document_id(index));
+      EXPECT_EQ(1, result->search_hit_count(index));
 
       {
         auto hit_index = 0;
-        REQUIRE(result->term_position(index, hit_index) == 3);
-        REQUIRE(result->term_count(index, hit_index) == 1);
+        EXPECT_EQ(3, result->term_position(index, hit_index));
+        EXPECT_EQ(1, result->term_count(index, hit_index));
 
         auto rng =
             searchlib::text_range(text_range_list, *result, index, hit_index);
-        REQUIRE(rng.position == 12);
-        REQUIRE(rng.length == 6);
+        EXPECT_EQ(12, rng.position);
+        EXPECT_EQ(6, rng.length);
       }
     }
 
     {
       auto index = 1;
-      REQUIRE(result->document_id(index) == 2);
-      REQUIRE(result->search_hit_count(index) == 3);
+      EXPECT_EQ(2, result->document_id(index));
+      EXPECT_EQ(3, result->search_hit_count(index));
 
       {
         auto hit_index = 0;
-        REQUIRE(result->term_position(index, hit_index) == 3);
-        REQUIRE(result->term_count(index, hit_index) == 1);
+        EXPECT_EQ(3, result->term_position(index, hit_index));
+        EXPECT_EQ(1, result->term_count(index, hit_index));
 
         auto rng =
             searchlib::text_range(text_range_list, *result, index, hit_index);
-        REQUIRE(rng.position == 12);
-        REQUIRE(rng.length == 5);
+        EXPECT_EQ(12, rng.position);
+        EXPECT_EQ(5, rng.length);
       }
 
       {
         auto hit_index = 1;
-        REQUIRE(result->term_position(index, hit_index) == 8);
-        REQUIRE(result->term_count(index, hit_index) == 1);
+        EXPECT_EQ(8, result->term_position(index, hit_index));
+        EXPECT_EQ(1, result->term_count(index, hit_index));
 
         auto rng =
             searchlib::text_range(text_range_list, *result, index, hit_index);
-        REQUIRE(rng.position == 40);
-        REQUIRE(rng.length == 6);
+        EXPECT_EQ(40, rng.position);
+        EXPECT_EQ(6, rng.length);
       }
 
       {
         auto hit_index = 2;
-        REQUIRE(result->term_position(index, hit_index) == 12);
-        REQUIRE(result->term_count(index, hit_index) == 1);
+        EXPECT_EQ(12, result->term_position(index, hit_index));
+        EXPECT_EQ(1, result->term_count(index, hit_index));
 
         auto rng =
             searchlib::text_range(text_range_list, *result, index, hit_index);
-        REQUIRE(rng.position == 63);
-        REQUIRE(rng.length == 5);
+        EXPECT_EQ(63, rng.position);
+        EXPECT_EQ(5, rng.length);
       }
     }
 
     {
       auto index = 2;
-      REQUIRE(result->document_id(index) == 4);
-      REQUIRE(result->search_hit_count(index) == 1);
+      EXPECT_EQ(4, result->document_id(index));
+      EXPECT_EQ(1, result->search_hit_count(index));
 
       {
         auto hit_index = 0;
-        REQUIRE(result->term_position(index, hit_index) == 0);
-        REQUIRE(result->term_count(index, hit_index) == 1);
+        EXPECT_EQ(0, result->term_position(index, hit_index));
+        EXPECT_EQ(1, result->term_count(index, hit_index));
 
         auto rng =
             searchlib::text_range(text_range_list, *result, index, hit_index);
-        REQUIRE(rng.position == 0);
-        REQUIRE(rng.length == 5);
+        EXPECT_EQ(0, rng.position);
+        EXPECT_EQ(5, rng.length);
       }
     }
   }
 }
 
-TEST_CASE("Adjacent search Test", "[adjacent]") {
+TEST(AdjacentTest, AdjacentSearch) {
   searchlib::InvertedIndex index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
@@ -302,78 +301,78 @@ TEST_CASE("Adjacent search Test", "[adjacent]") {
   {
     auto expr = parse_query(index, R"( "is the" )");
 
-    REQUIRE(expr->operation == searchlib::Operation::Adjacent);
-    REQUIRE(expr->nodes.size() == 2);
+    EXPECT_EQ(searchlib::Operation::Adjacent, expr->operation);
+    EXPECT_EQ(2, expr->nodes.size());
 
     auto result = perform_search(index, *expr);
 
-    REQUIRE(result->size() == 3);
+    EXPECT_EQ(3, result->size());
 
     {
       auto index = 0;
-      REQUIRE(result->document_id(index) == 0);
-      REQUIRE(result->search_hit_count(index) == 1);
+      EXPECT_EQ(0, result->document_id(index));
+      EXPECT_EQ(1, result->search_hit_count(index));
 
       {
         auto hit_index = 0;
-        REQUIRE(result->term_position(index, hit_index) == 1);
-        REQUIRE(result->term_count(index, hit_index) == 2);
+        EXPECT_EQ(1, result->term_position(index, hit_index));
+        EXPECT_EQ(2, result->term_count(index, hit_index));
 
         auto rng =
             searchlib::text_range(text_range_list, *result, index, hit_index);
-        REQUIRE(rng.position == 5);
-        REQUIRE(rng.length == 6);
+        EXPECT_EQ(5, rng.position);
+        EXPECT_EQ(6, rng.length);
       }
     }
 
     {
       auto index = 1;
-      REQUIRE(result->document_id(index) == 1);
-      REQUIRE(result->search_hit_count(index) == 1);
+      EXPECT_EQ(1, result->document_id(index));
+      EXPECT_EQ(1, result->search_hit_count(index));
 
       {
         auto hit_index = 0;
-        REQUIRE(result->term_position(index, hit_index) == 1);
-        REQUIRE(result->term_count(index, hit_index) == 2);
+        EXPECT_EQ(1, result->term_position(index, hit_index));
+        EXPECT_EQ(2, result->term_count(index, hit_index));
 
         auto rng =
             searchlib::text_range(text_range_list, *result, index, hit_index);
-        REQUIRE(rng.position == 5);
-        REQUIRE(rng.length == 6);
+        EXPECT_EQ(5, rng.position);
+        EXPECT_EQ(6, rng.length);
       }
     }
 
     {
       auto index = 2;
-      REQUIRE(result->document_id(index) == 2);
-      REQUIRE(result->search_hit_count(index) == 2);
+      EXPECT_EQ(2, result->document_id(index));
+      EXPECT_EQ(2, result->search_hit_count(index));
 
       {
         auto hit_index = 0;
-        REQUIRE(result->term_position(index, hit_index) == 1);
-        REQUIRE(result->term_count(index, hit_index) == 2);
+        EXPECT_EQ(1, result->term_position(index, hit_index));
+        EXPECT_EQ(2, result->term_count(index, hit_index));
 
         auto rng =
             searchlib::text_range(text_range_list, *result, index, hit_index);
-        REQUIRE(rng.position == 5);
-        REQUIRE(rng.length == 6);
+        EXPECT_EQ(5, rng.position);
+        EXPECT_EQ(6, rng.length);
       }
 
       {
         auto hit_index = 1;
-        REQUIRE(result->term_position(index, hit_index) == 6);
-        REQUIRE(result->term_count(index, hit_index) == 2);
+        EXPECT_EQ(6, result->term_position(index, hit_index));
+        EXPECT_EQ(2, result->term_count(index, hit_index));
 
         auto rng =
             searchlib::text_range(text_range_list, *result, index, hit_index);
-        REQUIRE(rng.position == 33);
-        REQUIRE(rng.length == 6);
+        EXPECT_EQ(33, rng.position);
+        EXPECT_EQ(6, rng.length);
       }
     }
   }
 }
 
-TEST_CASE("Adjacent search with 3 words Test", "[adjacent]") {
+TEST(AdjacentTest, AdjacentSearchWith3Words) {
   searchlib::InvertedIndex index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
@@ -381,33 +380,33 @@ TEST_CASE("Adjacent search with 3 words Test", "[adjacent]") {
   {
     auto expr = parse_query(index, R"( "the second sentence" )");
 
-    REQUIRE(expr->operation == searchlib::Operation::Adjacent);
-    REQUIRE(expr->nodes.size() == 3);
+    EXPECT_EQ(searchlib::Operation::Adjacent, expr->operation);
+    EXPECT_EQ(3, expr->nodes.size());
 
     auto result = perform_search(index, *expr);
 
-    REQUIRE(result->size() == 1);
+    EXPECT_EQ(1, result->size());
 
     {
       auto index = 0;
-      REQUIRE(result->document_id(index) == 2);
-      REQUIRE(result->search_hit_count(index) == 1);
+      EXPECT_EQ(2, result->document_id(index));
+      EXPECT_EQ(1, result->search_hit_count(index));
 
       {
         auto hit_index = 0;
-        REQUIRE(result->term_position(index, hit_index) == 7);
-        REQUIRE(result->term_count(index, hit_index) == 3);
+        EXPECT_EQ(7, result->term_position(index, hit_index));
+        EXPECT_EQ(3, result->term_count(index, hit_index));
 
         auto rng =
             searchlib::text_range(text_range_list, *result, index, hit_index);
-        REQUIRE(rng.position == 36);
-        REQUIRE(rng.length == 19);
+        EXPECT_EQ(36, rng.position);
+        EXPECT_EQ(19, rng.length);
       }
     }
   }
 }
 
-TEST_CASE("Near search Test", "[near]") {
+TEST(NearTest, NearSearch) {
   searchlib::InvertedIndex index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
@@ -415,72 +414,72 @@ TEST_CASE("Near search Test", "[near]") {
   {
     auto expr = parse_query(index, R"( second ~ document )");
 
-    REQUIRE(expr->operation == searchlib::Operation::Near);
-    REQUIRE(expr->nodes.size() == 2);
+    EXPECT_EQ(searchlib::Operation::Near, expr->operation);
+    EXPECT_EQ(2, expr->nodes.size());
 
     auto result = perform_search(index, *expr);
 
-    REQUIRE(result->size() == 2);
+    EXPECT_EQ(2, result->size());
 
     {
       auto index = 0;
-      REQUIRE(result->document_id(index) == 1);
-      REQUIRE(result->search_hit_count(index) == 2);
+      EXPECT_EQ(1, result->document_id(index));
+      EXPECT_EQ(2, result->search_hit_count(index));
 
       {
         auto hit_index = 0;
-        REQUIRE(result->term_position(index, hit_index) == 3);
-        REQUIRE(result->term_count(index, hit_index) == 1);
+        EXPECT_EQ(3, result->term_position(index, hit_index));
+        EXPECT_EQ(1, result->term_count(index, hit_index));
 
         auto rng =
             searchlib::text_range(text_range_list, *result, index, hit_index);
-        REQUIRE(rng.position == 12);
-        REQUIRE(rng.length == 6);
+        EXPECT_EQ(12, rng.position);
+        EXPECT_EQ(6, rng.length);
       }
 
       {
         auto hit_index = 1;
-        REQUIRE(result->term_position(index, hit_index) == 4);
-        REQUIRE(result->term_count(index, hit_index) == 1);
+        EXPECT_EQ(4, result->term_position(index, hit_index));
+        EXPECT_EQ(1, result->term_count(index, hit_index));
 
         auto rng =
             searchlib::text_range(text_range_list, *result, index, hit_index);
-        REQUIRE(rng.position == 19);
-        REQUIRE(rng.length == 8);
+        EXPECT_EQ(19, rng.position);
+        EXPECT_EQ(8, rng.length);
       }
     }
 
     {
       auto index = 1;
-      REQUIRE(result->document_id(index) == 2);
-      REQUIRE(result->search_hit_count(index) == 2);
+      EXPECT_EQ(2, result->document_id(index));
+      EXPECT_EQ(2, result->search_hit_count(index));
 
       {
         auto hit_index = 0;
-        REQUIRE(result->term_position(index, hit_index) == 4);
-        REQUIRE(result->term_count(index, hit_index) == 1);
+        EXPECT_EQ(4, result->term_position(index, hit_index));
+        EXPECT_EQ(1, result->term_count(index, hit_index));
 
         auto rng =
             searchlib::text_range(text_range_list, *result, index, hit_index);
-        REQUIRE(rng.position == 18);
-        REQUIRE(rng.length == 8);
+        EXPECT_EQ(18, rng.position);
+        EXPECT_EQ(8, rng.length);
       }
 
       {
         auto hit_index = 1;
-        REQUIRE(result->term_position(index, hit_index) == 8);
-        REQUIRE(result->term_count(index, hit_index) == 1);
+        EXPECT_EQ(8, result->term_position(index, hit_index));
+        EXPECT_EQ(1, result->term_count(index, hit_index));
 
         auto rng =
             searchlib::text_range(text_range_list, *result, index, hit_index);
-        REQUIRE(rng.position == 40);
-        REQUIRE(rng.length == 6);
+        EXPECT_EQ(40, rng.position);
+        EXPECT_EQ(6, rng.length);
       }
     }
   }
 }
 
-TEST_CASE("Near search with phrase Test", "[near]") {
+TEST(NearTest, NearSearchWithPhrase) {
   searchlib::InvertedIndex index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
@@ -488,38 +487,38 @@ TEST_CASE("Near search with phrase Test", "[near]") {
   {
     auto expr = parse_query(index, R"( sentence ~ "is the" )");
 
-    REQUIRE(expr->operation == searchlib::Operation::Near);
-    REQUIRE(expr->nodes.size() == 2);
+    EXPECT_EQ(searchlib::Operation::Near, expr->operation);
+    EXPECT_EQ(2, expr->nodes.size());
 
     auto result = perform_search(index, *expr);
 
-    REQUIRE(result->size() == 1);
+    EXPECT_EQ(1, result->size());
 
     {
       auto index = 0;
-      REQUIRE(result->document_id(index) == 2);
-      REQUIRE(result->search_hit_count(index) == 2);
+      EXPECT_EQ(2, result->document_id(index));
+      EXPECT_EQ(2, result->search_hit_count(index));
 
       {
         auto hit_index = 0;
-        REQUIRE(result->term_position(index, hit_index) == 6);
-        REQUIRE(result->term_count(index, hit_index) == 2);
+        EXPECT_EQ(6, result->term_position(index, hit_index));
+        EXPECT_EQ(2, result->term_count(index, hit_index));
 
         auto rng =
             searchlib::text_range(text_range_list, *result, index, hit_index);
-        REQUIRE(rng.position == 33);
-        REQUIRE(rng.length == 6);
+        EXPECT_EQ(33, rng.position);
+        EXPECT_EQ(6, rng.length);
       }
 
       {
         auto hit_index = 1;
-        REQUIRE(result->term_position(index, hit_index) == 9);
-        REQUIRE(result->term_count(index, hit_index) == 1);
+        EXPECT_EQ(9, result->term_position(index, hit_index));
+        EXPECT_EQ(1, result->term_count(index, hit_index));
 
         auto rng =
             searchlib::text_range(text_range_list, *result, index, hit_index);
-        REQUIRE(rng.position == 47);
-        REQUIRE(rng.length == 8);
+        EXPECT_EQ(47, rng.position);
+        EXPECT_EQ(8, rng.length);
       }
     }
   }

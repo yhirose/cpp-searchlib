@@ -1,6 +1,6 @@
-﻿#include <searchlib.h>
+﻿#include <gtest/gtest.h>
+#include <searchlib.h>
 
-#include <catch2/catch_test_macros.hpp>
 #include <fstream>
 
 #include "test_utils.h"
@@ -31,7 +31,7 @@ void kjv_index(searchlib::InvertedIndex &index,
   }
 }
 
-TEST_CASE("KJB Test", "[kjv]") {
+TEST(KJVTest, SimpleTest) {
   searchlib::InvertedIndex index;
   searchlib::TextRangeList text_range_list;
 
@@ -40,17 +40,17 @@ TEST_CASE("KJB Test", "[kjv]") {
   {
     auto expr = parse_query(index, R"( apple )");
     auto result = perform_search(index, *expr);
-    REQUIRE(result->size() == 8);
+    EXPECT_EQ(8, result->size());
   }
 
   {
     auto expr = parse_query(index, R"( "apple tree" )");
     auto result = perform_search(index, *expr);
-    REQUIRE(result->size() == 3);
+    EXPECT_EQ(3, result->size());
   }
 }
 
-TEST_CASE("UTF8 decode performance Test", "[kjv]") {
+TEST(KJVTest, UTF8DecodePerformance) {
   // auto normalizer = [](const auto &str) {
   //   return unicode::to_lowercase(str);
   // };

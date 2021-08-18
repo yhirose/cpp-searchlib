@@ -1,9 +1,10 @@
 # cpp-searchlib
 
-C++17 full-text search engine library (WIP)
+C++17 full-text search engine library (WIP. Far from release...)
 
 TODO:
-- [ ] Scoring and ranking
+- [ ] TF-IDF scoring and ranking
+- [ ] Save/load index to/from storage
 - [ ] Posting list compression
 - [ ] Search scope (document, section, paragraph)
 
