@@ -8,12 +8,12 @@ FetchContent_Declare(
   GIT_REPOSITORY https://github.com/catchorg/Catch2.git
   GIT_TAG        v3.0.0-preview3
 )
-
 FetchContent_MakeAvailable(Catch2)
 
-
 add_executable(
-  test-main test.cc
+  test-main
+  test.cc
+  test_kjv.cc
   ../src/utils.cpp
   ../src/indexing.cpp
   ../src/search.cpp

@@ -1,33 +1,8 @@
 ﻿#include <searchlib.h>
-#include <fstream>
-#include <sstream>
-#include <string>
+
 #include <catch2/catch_test_macros.hpp>
 
-#include "lib/unicodelib.h"
-#include "utils.h"
-
-#ifdef _MSC_BUILD
-const auto KJV_PATH = "../../test/t_kjv.tsv";
-#else
-const auto KJV_PATH = "../test/t_kjv.tsv";
-#endif
-
-std::vector<std::string> split(const std::string &input, char delimiter) {
-  std::istringstream ss(input);
-  std::string field;
-  std::vector<std::string> result;
-  while (std::getline(ss, field, delimiter)) {
-    result.push_back(field);
-  }
-  return result;
-}
-
-std::u32string to_lowercase(std::u32string str) {
-  std::transform(str.begin(), str.end(), str.begin(),
-                 [](auto c) { return std::tolower(c); });
-  return str;
-}
+#include "test_utils.h"
 
 std::vector<std::string> sample_data = {
     "This is the first document.",
@@ -51,26 +26,6 @@ void sample_index(searchlib::InvertedIndex &index,
 
     text_range_list.emplace(document_id, std::move(text_ranges));
     document_id++;
-  }
-}
-
-void kjv_index(searchlib::InvertedIndex &index,
-               searchlib::TextRangeList &text_range_list) {
-  index.normalizer = [](auto sv) { return unicode::to_lowercase(sv); };
-  std::ifstream fs(KJV_PATH);
-  std::string line;
-  while (std::getline(fs, line)) {
-    auto fields = split(line, '\t');
-    auto document_id = std::stoi(fields[0]);
-    const auto &s = fields[4];
-
-    std::vector<searchlib::TextRange> text_ranges;
-    searchlib::UTF8PlainTextTokenizer tokenizer(s, index.normalizer,
-                                                text_ranges);
-
-    searchlib::indexing(index, tokenizer, document_id);
-
-    text_range_list.emplace(document_id, std::move(text_ranges));
   }
 }
 
@@ -115,7 +70,7 @@ TEST_CASE("Parsing query Test", "[query]") {
   }
 }
 
-TEST_CASE("Term search Test", "[memory]") {
+TEST_CASE("Term search Test", "[term]") {
   searchlib::InvertedIndex index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
@@ -193,7 +148,7 @@ TEST_CASE("Term search Test", "[memory]") {
   }
 }
 
-TEST_CASE("And search Test", "[memory]") {
+TEST_CASE("And search Test", "[and]") {
   searchlib::InvertedIndex index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
@@ -249,7 +204,7 @@ TEST_CASE("And search Test", "[memory]") {
   }
 }
 
-TEST_CASE("Or search Test", "[memory]") {
+TEST_CASE("Or search Test", "[or]") {
   searchlib::InvertedIndex index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
@@ -339,7 +294,7 @@ TEST_CASE("Or search Test", "[memory]") {
   }
 }
 
-TEST_CASE("Adjacent search Test", "[memory]") {
+TEST_CASE("Adjacent search Test", "[adjacent]") {
   searchlib::InvertedIndex index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
@@ -418,7 +373,7 @@ TEST_CASE("Adjacent search Test", "[memory]") {
   }
 }
 
-TEST_CASE("Adjacent search with 3 words Test", "[memory]") {
+TEST_CASE("Adjacent search with 3 words Test", "[adjacent]") {
   searchlib::InvertedIndex index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
@@ -452,7 +407,7 @@ TEST_CASE("Adjacent search with 3 words Test", "[memory]") {
   }
 }
 
-TEST_CASE("Near search Test", "[memory]") {
+TEST_CASE("Near search Test", "[near]") {
   searchlib::InvertedIndex index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
@@ -525,7 +480,7 @@ TEST_CASE("Near search Test", "[memory]") {
   }
 }
 
-TEST_CASE("Near search with phrase Test", "[memory]") {
+TEST_CASE("Near search with phrase Test", "[near]") {
   searchlib::InvertedIndex index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
@@ -569,41 +524,3 @@ TEST_CASE("Near search with phrase Test", "[memory]") {
     }
   }
 }
-
-TEST_CASE("KJB Test", "[kjv]") {
-  searchlib::InvertedIndex index;
-  searchlib::TextRangeList text_range_list;
-
-  kjv_index(index, text_range_list);
-
-  {
-    auto expr = parse_query(index, R"( apple )");
-    auto result = perform_search(index, *expr);
-    REQUIRE(result->size() == 8);
-  }
-
-  {
-    auto expr = parse_query(index, R"( "apple tree" )");
-    auto result = perform_search(index, *expr);
-    REQUIRE(result->size() == 3);
-  }
-}
-
-TEST_CASE("UTF8 decode performance Test", "[kjv]") {
-  // auto normalizer = [](const auto &str) {
-  //   return unicode::to_lowercase(str);
-  // };
-  auto normalizer = to_lowercase;
-
-  std::ifstream fs(KJV_PATH);
-
-  std::string s;
-  while (std::getline(fs, s)) {
-    std::vector<searchlib::TextRange> text_ranges;
-
-    searchlib::UTF8PlainTextTokenizer tokenizer(s, normalizer, text_ranges);
-
-    tokenizer.tokenize([&](auto &str, auto) {});
-  }
-}
-
