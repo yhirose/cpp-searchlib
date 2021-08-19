@@ -27,14 +27,25 @@ using Normalizer = std::function<std::u32string(const std::u32string &)>;
 using PositionalList =
     std::map<size_t /*document_id*/, std::vector<size_t /*position*/>>;
 
+struct Term {
+  std::u32string str;
+  size_t tf;
+};
+
 struct InvertedIndex {
   std::unordered_map<std::u32string /*str*/, size_t /*term_id*/>
       term_dictionary;
 
-  std::vector<std::u32string /*str*/> terms;
+  std::vector<Term> terms;
   std::vector<PositionalList> posting_list;
 
+  size_t document_count = 0;
+
   Normalizer normalizer;
+
+  size_t df(size_t term_id) const {
+    return posting_list[term_id].size();
+  }
 };
 
 class Tokenizer {

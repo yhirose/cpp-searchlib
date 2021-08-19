@@ -26,6 +26,12 @@ void sample_index(searchlib::InvertedIndex &index,
     text_range_list.emplace(document_id, std::move(text_ranges));
     document_id++;
   }
+
+  EXPECT_EQ(document_id, index.document_count);
+
+  auto term_id = index.term_dictionary[U"the"];
+  EXPECT_EQ(5, index.terms[term_id].tf);
+  EXPECT_EQ(3, index.df(term_id));
 }
 
 TEST(TokenizerTest, UTF8PlainTextTokenizer) {

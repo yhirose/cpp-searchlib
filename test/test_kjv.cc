@@ -10,12 +10,14 @@
 // Visual Studio runs tests in "build/test/Debug".
 const auto KJV_PATH = "../../../test/t_kjv.tsv";
 #else
-const auto KJV_PATH = "../test/t_kjv.tsv";
+const auto KJV_PATH = "../../test/t_kjv.tsv";
 #endif
 
 void kjv_index(searchlib::InvertedIndex &index,
                searchlib::TextRangeList &text_range_list) {
   index.normalizer = [](auto sv) { return unicode::to_lowercase(sv); };
+  std::cout << KJV_PATH << std::endl;
+  std::cout << std::filesystem::current_path() << std::endl;
   std::ifstream fs(KJV_PATH);
   std::string line;
   while (std::getline(fs, line)) {
