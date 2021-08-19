@@ -1,8 +1,8 @@
 ﻿#include <gtest/gtest.h>
 #include <searchlib.h>
 
-#include <fstream>
 #include <filesystem>
+#include <fstream>
 
 #include "test_utils.h"
 
@@ -29,7 +29,7 @@ void kjv_index(searchlib::InvertedIndex &index,
     searchlib::UTF8PlainTextTokenizer tokenizer(s, index.normalizer,
                                                 text_ranges);
 
-    searchlib::indexing(index, tokenizer, document_id);
+    index.indexing(document_id, tokenizer);
 
     text_range_list.emplace(document_id, std::move(text_ranges));
   }

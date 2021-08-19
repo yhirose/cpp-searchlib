@@ -21,16 +21,16 @@ void sample_index(searchlib::InvertedIndex &index,
     searchlib::UTF8PlainTextTokenizer tokenizer(s, index.normalizer,
                                                 text_ranges);
 
-    searchlib::indexing(index, tokenizer, document_id);
+    index.indexing(document_id, tokenizer);
 
     text_range_list.emplace(document_id, std::move(text_ranges));
     document_id++;
   }
 
-  EXPECT_EQ(document_id, index.document_count);
+  EXPECT_EQ(document_id, index.document_count());
 
-  auto term_id = index.term_dictionary[U"the"];
-  EXPECT_EQ(5, index.terms[term_id].tf);
+  auto term_id = index.term_id(U"the");
+  EXPECT_EQ(5, index.tf(term_id));
   EXPECT_EQ(3, index.df(term_id));
 }
 

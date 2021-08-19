@@ -49,18 +49,14 @@ std::optional<Expression> parse_query(const InvertedIndex &inverted_index,
   parser["PHRASE"] = list_handler(Operation::Adjacent);
 
   parser["TERM"] = [&](const peg::SemanticValues &vs) {
-    auto term = u32(vs.token());
+    auto term = inverted_index.normalize(u32(vs.token()));
 
-    if (inverted_index.normalizer) {
-      term = inverted_index.normalizer(term);
-    }
-
-    if (!contains(inverted_index.term_dictionary, term)) {
+    if (!inverted_index.has_term(term)) {
       std::string msg = "invalid term '" + vs.token_to_string() + "'.";
       throw peg::parse_error(msg.c_str());
     }
 
-    auto term_id = inverted_index.term_dictionary.at(term);
+    auto term_id = inverted_index.term_id(term);
     return Expression{Operation::Term, term_id};
   };
 

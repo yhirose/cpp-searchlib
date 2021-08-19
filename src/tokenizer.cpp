@@ -14,7 +14,9 @@ using namespace unicode;
 
 namespace searchlib {
 
-Tokenizer::~Tokenizer() = default;
+ITokenizer::~ITokenizer() = default;
+
+//-----------------------------------------------------------------------------
 
 UTF8PlainTextTokenizer::UTF8PlainTextTokenizer(
     std::string_view sv, Normalizer normalizer,
