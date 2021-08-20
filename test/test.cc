@@ -11,7 +11,7 @@ std::vector<std::string> sample_data = {
     "Hello World!",
 };
 
-void sample_index(searchlib::InvertedIndex &index,
+void sample_index(searchlib::OnMemoryIndxer &index,
                   searchlib::TextRangeList &text_range_list) {
   index.normalizer = [](auto sv) { return unicode::to_lowercase(sv); };
 
@@ -58,7 +58,7 @@ TEST(TokenizerTest, UTF8PlainTextTokenizer) {
 }
 
 TEST(QueryTest, ParsingQuery) {
-  searchlib::InvertedIndex index;
+  searchlib::OnMemoryIndxer index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
 
@@ -76,7 +76,7 @@ TEST(QueryTest, ParsingQuery) {
 }
 
 TEST(TermTest, TermSearch) {
-  searchlib::InvertedIndex index;
+  searchlib::OnMemoryIndxer index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
 
@@ -154,7 +154,7 @@ TEST(TermTest, TermSearch) {
 }
 
 TEST(AndTest, AndSearch) {
-  searchlib::InvertedIndex index;
+  searchlib::OnMemoryIndxer index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
 
@@ -210,7 +210,7 @@ TEST(AndTest, AndSearch) {
 }
 
 TEST(OrTest, OrSearch) {
-  searchlib::InvertedIndex index;
+  searchlib::OnMemoryIndxer index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
 
@@ -300,7 +300,7 @@ TEST(OrTest, OrSearch) {
 }
 
 TEST(AdjacentTest, AdjacentSearch) {
-  searchlib::InvertedIndex index;
+  searchlib::OnMemoryIndxer index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
 
@@ -379,7 +379,7 @@ TEST(AdjacentTest, AdjacentSearch) {
 }
 
 TEST(AdjacentTest, AdjacentSearchWith3Words) {
-  searchlib::InvertedIndex index;
+  searchlib::OnMemoryIndxer index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
 
@@ -413,7 +413,7 @@ TEST(AdjacentTest, AdjacentSearchWith3Words) {
 }
 
 TEST(NearTest, NearSearch) {
-  searchlib::InvertedIndex index;
+  searchlib::OnMemoryIndxer index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
 
@@ -486,7 +486,7 @@ TEST(NearTest, NearSearch) {
 }
 
 TEST(NearTest, NearSearchWithPhrase) {
-  searchlib::InvertedIndex index;
+  searchlib::OnMemoryIndxer index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
 

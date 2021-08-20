@@ -14,8 +14,6 @@ using namespace unicode;
 
 namespace searchlib {
 
-ITokenizer::~ITokenizer() = default;
-
 //-----------------------------------------------------------------------------
 
 UTF8PlainTextTokenizer::UTF8PlainTextTokenizer(

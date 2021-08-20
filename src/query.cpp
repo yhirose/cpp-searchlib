@@ -11,7 +11,7 @@
 
 namespace searchlib {
 
-std::optional<Expression> parse_query(const InvertedIndex &inverted_index,
+std::optional<Expression> parse_query(const IInvertedIndex &inverted_index,
                                       std::string_view sv) {
   static peg::parser parser(R"(
     ROOT        <- OR?
