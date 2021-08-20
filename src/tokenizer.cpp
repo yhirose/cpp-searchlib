@@ -17,18 +17,19 @@ namespace searchlib {
 //-----------------------------------------------------------------------------
 
 UTF8PlainTextTokenizer::UTF8PlainTextTokenizer(
-    std::string_view sv, Normalizer normalizer,
+    std::string_view text,
+    std::function<std::u32string(const std::u32string &str)> normalizer,
     std::vector<TextRange> &text_ranges)
-    : sv_(sv), normalizer_(normalizer), text_ranges_(text_ranges) {}
+    : text_(text), normalizer_(normalizer), text_ranges_(text_ranges) {}
 
 void UTF8PlainTextTokenizer::tokenize(TokenizeCallback callback) {
   size_t pos = 0;
   size_t term_pos = 0;
-  while (pos < sv_.size()) {
+  while (pos < text_.size()) {
     // Skip
-    while (pos < sv_.size()) {
+    while (pos < text_.size()) {
       char32_t cp;
-      auto len = utf8::decode_codepoint(&sv_[pos], sv_.size() - pos, cp);
+      auto len = utf8::decode_codepoint(&text_[pos], text_.size() - pos, cp);
       if (is_letter(cp)) {
         break;
       }
@@ -39,9 +40,9 @@ void UTF8PlainTextTokenizer::tokenize(TokenizeCallback callback) {
     auto beg = pos;
     std::u32string str;
 
-    while (pos < sv_.size()) {
+    while (pos < text_.size()) {
       char32_t cp;
-      auto len = utf8::decode_codepoint(&sv_[pos], sv_.size() - pos, cp);
+      auto len = utf8::decode_codepoint(&text_[pos], text_.size() - pos, cp);
       if (!is_letter(cp)) {
         break;
       }

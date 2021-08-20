@@ -13,7 +13,7 @@ const auto KJV_PATH = "../../../test/t_kjv.tsv";
 const auto KJV_PATH = "../../test/t_kjv.tsv";
 #endif
 
-void kjv_index(searchlib::OnMemoryIndxer &index,
+void kjv_index(searchlib::OnMemoryIndex &index,
                searchlib::TextRangeList &text_range_list) {
   index.normalizer = [](auto sv) { return unicode::to_lowercase(sv); };
   std::ifstream fs(KJV_PATH);
@@ -34,7 +34,7 @@ void kjv_index(searchlib::OnMemoryIndxer &index,
 }
 
 TEST(KJVTest, SimpleTest) {
-  searchlib::OnMemoryIndxer index;
+  searchlib::OnMemoryIndex index;
   searchlib::TextRangeList text_range_list;
 
   kjv_index(index, text_range_list);

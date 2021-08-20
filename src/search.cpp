@@ -17,8 +17,9 @@ namespace searchlib {
 
 class TermSearchResult : public IPostings {
  public:
-  TermSearchResult(const IInvertedIndex &inverted_index, size_t term_id)
-      : postings_(inverted_index.postings(term_id)) {}
+  TermSearchResult(const IInvertedIndex &inverted_index,
+                   const std::u32string &str)
+      : postings_(inverted_index.postings(str)) {}
 
   ~TermSearchResult() override = default;
 
@@ -333,7 +334,7 @@ static std::shared_ptr<IPostings> union_postings(
 
 static std::shared_ptr<IPostings> perform_term_operation(
     const IInvertedIndex &inverted_index, const Expression &expr) {
-  return std::make_shared<TermSearchResult>(inverted_index, expr.term_id);
+  return std::make_shared<TermSearchResult>(inverted_index, expr.term_str);
 }
 
 static std::shared_ptr<IPostings> perform_and_operation(
@@ -431,7 +432,7 @@ static std::shared_ptr<IPostings> perform_near_operation(
               auto [prev_slot, prev_term_count] = prev_item;
               auto [term_pos, item] = *it;
               auto delta = term_pos - (prev_term_pos + prev_term_count - 1);
-              if (delta > expr.near_size) {
+              if (delta > expr.near_operation_distance) {
                 near = false;
                 break;
               }

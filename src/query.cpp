@@ -12,7 +12,7 @@
 namespace searchlib {
 
 std::optional<Expression> parse_query(const IInvertedIndex &inverted_index,
-                                      std::string_view sv) {
+                                      std::string_view query) {
   static peg::parser parser(R"(
     ROOT        <- OR?
     OR          <- AND ('|' AND)*
@@ -39,7 +39,7 @@ std::optional<Expression> parse_query(const IInvertedIndex &inverted_index,
       if (vs.size() == 1) {
         return std::any_cast<Expression>(vs[0]);
       }
-      return Expression{operation, static_cast<size_t>(-1), DEFAULT_NEAR_SIZE,
+      return Expression{operation, std::u32string(), DEFAULT_NEAR_SIZE,
                         vs.transform<Expression>()};
     };
   };
@@ -56,8 +56,7 @@ std::optional<Expression> parse_query(const IInvertedIndex &inverted_index,
       throw peg::parse_error(msg.c_str());
     }
 
-    auto term_id = inverted_index.term_id(term);
-    return Expression{Operation::Term, term_id};
+    return Expression{Operation::Term, term};
   };
 
   // parser.log = [](size_t line, size_t col, const std::string& msg) {
@@ -65,7 +64,7 @@ std::optional<Expression> parse_query(const IInvertedIndex &inverted_index,
   // };
 
   std::optional<Expression> expr;
-  if (!parser.parse(sv, expr)) {
+  if (!parser.parse(query, expr)) {
     return std::nullopt;
   }
 

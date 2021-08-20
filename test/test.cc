@@ -11,7 +11,7 @@ std::vector<std::string> sample_data = {
     "Hello World!",
 };
 
-void sample_index(searchlib::OnMemoryIndxer &index,
+void sample_index(searchlib::OnMemoryIndex &index,
                   searchlib::TextRangeList &text_range_list) {
   index.normalizer = [](auto sv) { return unicode::to_lowercase(sv); };
 
@@ -29,9 +29,9 @@ void sample_index(searchlib::OnMemoryIndxer &index,
 
   EXPECT_EQ(document_id, index.document_count());
 
-  auto term_id = index.term_id(U"the");
-  EXPECT_EQ(5, index.tf(term_id));
-  EXPECT_EQ(3, index.df(term_id));
+  auto term = U"the";
+  EXPECT_EQ(5, index.tf(term));
+  EXPECT_EQ(3, index.df(term));
 }
 
 TEST(TokenizerTest, UTF8PlainTextTokenizer) {
@@ -58,7 +58,7 @@ TEST(TokenizerTest, UTF8PlainTextTokenizer) {
 }
 
 TEST(QueryTest, ParsingQuery) {
-  searchlib::OnMemoryIndxer index;
+  searchlib::OnMemoryIndex index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
 
@@ -66,7 +66,7 @@ TEST(QueryTest, ParsingQuery) {
     auto expr = parse_query(index, " The ");
     EXPECT_NE(std::nullopt, expr);
     EXPECT_EQ(searchlib::Operation::Term, (*expr).operation);
-    EXPECT_EQ(2, (*expr).term_id);
+    EXPECT_EQ(U"the", (*expr).term_str);
   }
 
   {
@@ -76,7 +76,7 @@ TEST(QueryTest, ParsingQuery) {
 }
 
 TEST(TermTest, TermSearch) {
-  searchlib::OnMemoryIndxer index;
+  searchlib::OnMemoryIndex index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
 
@@ -154,7 +154,7 @@ TEST(TermTest, TermSearch) {
 }
 
 TEST(AndTest, AndSearch) {
-  searchlib::OnMemoryIndxer index;
+  searchlib::OnMemoryIndex index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
 
@@ -210,7 +210,7 @@ TEST(AndTest, AndSearch) {
 }
 
 TEST(OrTest, OrSearch) {
-  searchlib::OnMemoryIndxer index;
+  searchlib::OnMemoryIndex index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
 
@@ -300,7 +300,7 @@ TEST(OrTest, OrSearch) {
 }
 
 TEST(AdjacentTest, AdjacentSearch) {
-  searchlib::OnMemoryIndxer index;
+  searchlib::OnMemoryIndex index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
 
@@ -379,7 +379,7 @@ TEST(AdjacentTest, AdjacentSearch) {
 }
 
 TEST(AdjacentTest, AdjacentSearchWith3Words) {
-  searchlib::OnMemoryIndxer index;
+  searchlib::OnMemoryIndex index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
 
@@ -413,7 +413,7 @@ TEST(AdjacentTest, AdjacentSearchWith3Words) {
 }
 
 TEST(NearTest, NearSearch) {
-  searchlib::OnMemoryIndxer index;
+  searchlib::OnMemoryIndex index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
 
@@ -486,7 +486,7 @@ TEST(NearTest, NearSearch) {
 }
 
 TEST(NearTest, NearSearchWithPhrase) {
-  searchlib::OnMemoryIndxer index;
+  searchlib::OnMemoryIndex index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
 
