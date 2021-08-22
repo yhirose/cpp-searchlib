@@ -27,11 +27,10 @@ void sample_index(searchlib::OnMemoryIndex &index,
     document_id++;
   }
 
-  EXPECT_EQ(document_id, index.document_count());
+  EXPECT_EQ(sample_documents.size(), index.document_count());
 
   auto term = U"the";
   EXPECT_EQ(5, index.term_occurrences(term));
-  EXPECT_EQ(3, index.document_frequency(term));
 }
 
 TEST(TokenizerTest, UTF8PlainTextTokenizer) {
@@ -527,5 +526,56 @@ TEST(NearTest, NearSearchWithPhrase) {
         EXPECT_EQ(8, rng.length);
       }
     }
+  }
+}
+
+bool close_enough(double expect, double actual) {
+  auto tolerance = 0.001;
+  return (expect - tolerance) <= actual && actual <= (expect + tolerance);
+}
+
+TEST(TF_IDF_Test, TF_IDF) {
+  searchlib::OnMemoryIndex index;
+
+  std::vector<std::string> documents = {
+      "apple orange orange banana",
+      "banana orange strawberry strawberry grape",
+  };
+
+  size_t document_id = 0;
+  for (const auto &doc : documents) {
+    searchlib::UTF8PlainTextTokenizer tokenizer(doc);
+    index.indexing(document_id, tokenizer);
+    document_id++;
+  }
+
+  {
+    auto term = U"apple";
+    EXPECT_TRUE(close_enough(0.25, index.tf_idf(term, 0)));
+    EXPECT_TRUE(close_enough(0, index.tf_idf(term, 1)));
+  }
+
+  {
+    auto term = U"orange";
+    EXPECT_TRUE(close_enough(0, index.tf_idf(term, 0)));
+    EXPECT_TRUE(close_enough(0, index.tf_idf(term, 1)));
+  }
+
+  {
+    auto term = U"banana";
+    EXPECT_TRUE(close_enough(0, index.tf_idf(term, 0)));
+    EXPECT_TRUE(close_enough(0, index.tf_idf(term, 1)));
+  }
+
+  {
+    auto term = U"strawberry";
+    EXPECT_TRUE(close_enough(0, index.tf_idf(term, 0)));
+    EXPECT_TRUE(close_enough(0.4, index.tf_idf(term, 1)));
+  }
+
+  {
+    auto term = U"grape";
+    EXPECT_TRUE(close_enough(0, index.tf_idf(term, 0)));
+    EXPECT_TRUE(close_enough(0.2, index.tf_idf(term, 1)));
   }
 }

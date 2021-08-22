@@ -62,9 +62,9 @@ OnMemoryIndex::Postings::find_positions_map(size_t index) const {
 
 //-----------------------------------------------------------------------------
 
-size_t OnMemoryIndex::document_count() const { return document_count_; }
+size_t OnMemoryIndex::document_count() const { return documents_.size(); }
 
-bool OnMemoryIndex::has_term(const std::u32string &str) const {
+bool OnMemoryIndex::term_exists(const std::u32string &str) const {
   return contains(term_dictionary_, str);
 }
 
@@ -72,8 +72,30 @@ size_t OnMemoryIndex::term_occurrences(const std::u32string &str) const {
   return term_dictionary_.at(str).term_occurrences;
 }
 
-size_t OnMemoryIndex::document_frequency(const std::u32string &str) const {
-  return term_dictionary_.at(str).postings.size();
+size_t OnMemoryIndex::df(const std::u32string &str) const {
+  return postings(str).size();
+}
+
+double OnMemoryIndex::tf(const std::u32string &str, size_t document_id) const {
+  const auto &p = postings(str);
+  for (size_t i = 0; i < p.size(); i++) {
+    if (p.document_id(i) == document_id) {
+      return static_cast<double>(p.search_hit_count(i)) /
+             static_cast<double>(documents_.at(document_id).term_count);
+    }
+  }
+  return 0.0;
+}
+
+double OnMemoryIndex::idf(const std::u32string &str) const {
+  auto adjustment = 0.001;
+  return std::log2(static_cast<double>(documents_.size() + adjustment) /
+                   (static_cast<double>(df(str) + adjustment)));
+}
+
+double OnMemoryIndex::tf_idf(const std::u32string &str,
+                             size_t document_id) const {
+  return tf(str, document_id) * idf(str);
 }
 
 const IPostings &OnMemoryIndex::postings(const std::u32string &str) const {
@@ -81,6 +103,7 @@ const IPostings &OnMemoryIndex::postings(const std::u32string &str) const {
 }
 
 void OnMemoryIndex::indexing(size_t document_id, ITokenizer &tokenizer) {
+  size_t term_count = 0;
   tokenizer.tokenize([&](const auto &str, auto term_pos) {
     if (!contains(term_dictionary_, str)) {
       term_dictionary_[str] = {str, 0};
@@ -89,9 +112,11 @@ void OnMemoryIndex::indexing(size_t document_id, ITokenizer &tokenizer) {
     auto &term = term_dictionary_.at(str);
     term.term_occurrences++;
     term.postings.add_term_position(document_id, term_pos);
+
+    term_count++;
   });
 
-  document_count_++;
+  documents_[document_id] = {term_count};
 }
 
 std::u32string OnMemoryIndex::normalize(const std::u32string &str) const {

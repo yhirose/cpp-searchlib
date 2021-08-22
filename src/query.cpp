@@ -51,7 +51,7 @@ std::optional<Expression> parse_query(const IInvertedIndex &inverted_index,
   parser["TERM"] = [&](const peg::SemanticValues &vs) {
     auto term = inverted_index.normalize(u32(vs.token()));
 
-    if (!inverted_index.has_term(term)) {
+    if (!inverted_index.term_exists(term)) {
       std::string msg = "invalid term '" + vs.token_to_string() + "'.";
       throw peg::parse_error(msg.c_str());
     }
