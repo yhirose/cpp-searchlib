@@ -19,7 +19,7 @@ namespace searchlib {
 UTF8PlainTextTokenizer::UTF8PlainTextTokenizer(
     std::string_view text,
     std::function<std::u32string(const std::u32string &str)> normalizer,
-    std::vector<TextRange> &text_ranges)
+    std::vector<TextRange> *text_ranges)
     : text_(text), normalizer_(normalizer), text_ranges_(text_ranges) {}
 
 void UTF8PlainTextTokenizer::tokenize(TokenizeCallback callback) {
@@ -52,7 +52,9 @@ void UTF8PlainTextTokenizer::tokenize(TokenizeCallback callback) {
 
     if (!str.empty()) {
       callback((normalizer_ ? normalizer_(str) : str), term_pos);
-      text_ranges_.push_back({beg, pos - beg});
+      if (text_ranges_) {
+        text_ranges_->push_back({beg, pos - beg});
+      }
       term_pos++;
     }
   }

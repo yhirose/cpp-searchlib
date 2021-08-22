@@ -72,7 +72,7 @@ size_t OnMemoryIndex::term_occurrences(const std::u32string &str) const {
   return term_dictionary_.at(str).term_occurrences;
 }
 
-size_t OnMemoryIndex::term_document_count(const std::u32string &str) const {
+size_t OnMemoryIndex::document_frequency(const std::u32string &str) const {
   return term_dictionary_.at(str).postings.size();
 }
 

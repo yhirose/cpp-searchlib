@@ -3,7 +3,7 @@
 
 #include "test_utils.h"
 
-std::vector<std::string> sample_data = {
+std::vector<std::string> sample_documents = {
     "This is the first document.",
     "This is the second document.",
     "This is the third document. This is the second sentence in the third.",
@@ -16,10 +16,10 @@ void sample_index(searchlib::OnMemoryIndex &index,
   index.normalizer = [](auto sv) { return unicode::to_lowercase(sv); };
 
   size_t document_id = 0;
-  for (const auto &s : sample_data) {
+  for (const auto &doc : sample_documents) {
     std::vector<searchlib::TextRange> text_ranges;
-    searchlib::UTF8PlainTextTokenizer tokenizer(s, index.normalizer,
-                                                text_ranges);
+    searchlib::UTF8PlainTextTokenizer tokenizer(doc, index.normalizer,
+                                                &text_ranges);
 
     index.indexing(document_id, tokenizer);
 
@@ -31,7 +31,7 @@ void sample_index(searchlib::OnMemoryIndex &index,
 
   auto term = U"the";
   EXPECT_EQ(5, index.term_occurrences(term));
-  EXPECT_EQ(3, index.term_document_count(term));
+  EXPECT_EQ(3, index.document_frequency(term));
 }
 
 TEST(TokenizerTest, UTF8PlainTextTokenizer) {
@@ -45,10 +45,10 @@ TEST(TokenizerTest, UTF8PlainTextTokenizer) {
   };
 
   size_t document_id = 0;
-  for (const auto &s : sample_data) {
+  for (const auto &doc : sample_documents) {
     std::vector<searchlib::TextRange> text_ranges;
     searchlib::UTF8PlainTextTokenizer tokenizer(
-        s, [](auto sv) { return unicode::to_lowercase(sv); }, text_ranges);
+        doc, [](auto sv) { return unicode::to_lowercase(sv); }, &text_ranges);
     std::vector<std::string> actual;
     tokenizer.tokenize(
         [&](auto &str, auto) { actual.emplace_back(searchlib::u8(str)); });

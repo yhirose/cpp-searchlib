@@ -44,7 +44,7 @@ class IInvertedIndex {
 
   virtual bool has_term(const std::u32string &str) const = 0;
   virtual size_t term_occurrences(const std::u32string &str) const = 0;
-  virtual size_t term_document_count(const std::u32string &str) const = 0;
+  virtual size_t document_frequency(const std::u32string &str) const = 0;
 
   virtual const IPostings &postings(const std::u32string &str) const = 0;
 
@@ -96,7 +96,7 @@ class OnMemoryIndex : public IInvertedIndex {
 
   bool has_term(const std::u32string &str) const override;
   virtual size_t term_occurrences(const std::u32string &str) const override;
-  virtual size_t term_document_count(const std::u32string &str) const override;
+  virtual size_t document_frequency(const std::u32string &str) const override;
 
   virtual const IPostings &postings(const std::u32string &str) const override;
 
@@ -155,15 +155,15 @@ class UTF8PlainTextTokenizer : public OnMemoryIndex::ITokenizer {
  public:
   UTF8PlainTextTokenizer(
       std::string_view text,
-      std::function<std::u32string(const std::u32string &str)> normalizer,
-      std::vector<TextRange> &text_ranges);
+      std::function<std::u32string(const std::u32string &str)> normalizer = nullptr,
+      std::vector<TextRange> *text_ranges = nullptr);
 
   void tokenize(TokenizeCallback callback) override;
 
  private:
   std::string_view text_;
   std::function<std::u32string(const std::u32string &str)> normalizer_;
-  std::vector<TextRange> &text_ranges_;
+  std::vector<TextRange> *text_ranges_;
 };
 
 }  // namespace searchlib

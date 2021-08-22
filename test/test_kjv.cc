@@ -25,7 +25,7 @@ void kjv_index(searchlib::OnMemoryIndex &index,
 
     std::vector<searchlib::TextRange> text_ranges;
     searchlib::UTF8PlainTextTokenizer tokenizer(s, index.normalizer,
-                                                text_ranges);
+                                                &text_ranges);
 
     index.indexing(document_id, tokenizer);
 
@@ -62,10 +62,7 @@ TEST(KJVTest, UTF8DecodePerformance) {
 
   std::string s;
   while (std::getline(fs, s)) {
-    std::vector<searchlib::TextRange> text_ranges;
-
-    searchlib::UTF8PlainTextTokenizer tokenizer(s, normalizer, text_ranges);
-
+    searchlib::UTF8PlainTextTokenizer tokenizer(s, normalizer);
     tokenizer.tokenize([&](auto &str, auto) {});
   }
 }
