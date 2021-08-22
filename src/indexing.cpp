@@ -68,11 +68,11 @@ bool OnMemoryIndex::has_term(const std::u32string &str) const {
   return contains(term_dictionary_, str);
 }
 
-size_t OnMemoryIndex::tf(const std::u32string &str) const {
-  return term_dictionary_.at(str).tf;
+size_t OnMemoryIndex::term_occurrences(const std::u32string &str) const {
+  return term_dictionary_.at(str).term_occurrences;
 }
 
-size_t OnMemoryIndex::df(const std::u32string &str) const {
+size_t OnMemoryIndex::term_document_count(const std::u32string &str) const {
   return term_dictionary_.at(str).postings.size();
 }
 
@@ -87,7 +87,7 @@ void OnMemoryIndex::indexing(size_t document_id, ITokenizer &tokenizer) {
     }
 
     auto &term = term_dictionary_.at(str);
-    term.tf++;
+    term.term_occurrences++;
     term.postings.add_term_position(document_id, term_pos);
   });
 

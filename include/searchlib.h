@@ -43,8 +43,9 @@ class IInvertedIndex {
   virtual size_t document_count() const = 0;
 
   virtual bool has_term(const std::u32string &str) const = 0;
-  virtual size_t tf(const std::u32string &str) const = 0;
-  virtual size_t df(const std::u32string &str) const = 0;
+  virtual size_t term_occurrences(const std::u32string &str) const = 0;
+  virtual size_t term_document_count(const std::u32string &str) const = 0;
+
   virtual const IPostings &postings(const std::u32string &str) const = 0;
 
   virtual std::u32string normalize(const std::u32string &str) const = 0;
@@ -94,8 +95,9 @@ class OnMemoryIndex : public IInvertedIndex {
   size_t document_count() const override;
 
   bool has_term(const std::u32string &str) const override;
-  virtual size_t tf(const std::u32string &str) const override;
-  virtual size_t df(const std::u32string &str) const override;
+  virtual size_t term_occurrences(const std::u32string &str) const override;
+  virtual size_t term_document_count(const std::u32string &str) const override;
+
   virtual const IPostings &postings(const std::u32string &str) const override;
 
   std::u32string normalize(const std::u32string &str) const override;
@@ -137,7 +139,7 @@ class OnMemoryIndex : public IInvertedIndex {
 
   struct Term {
     std::u32string str;
-    size_t tf;
+    size_t term_occurrences;
     Postings postings;
   };
 

@@ -30,8 +30,8 @@ void sample_index(searchlib::OnMemoryIndex &index,
   EXPECT_EQ(document_id, index.document_count());
 
   auto term = U"the";
-  EXPECT_EQ(5, index.tf(term));
-  EXPECT_EQ(3, index.df(term));
+  EXPECT_EQ(5, index.term_occurrences(term));
+  EXPECT_EQ(3, index.term_document_count(term));
 }
 
 TEST(TokenizerTest, UTF8PlainTextTokenizer) {
