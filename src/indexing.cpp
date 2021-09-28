@@ -40,8 +40,8 @@ size_t OnMemoryIndex::Postings::term_count(size_t index,
   return 1;
 }
 
-bool OnMemoryIndex::Postings::has_term_pos(size_t index,
-                                           size_t term_pos) const {
+bool OnMemoryIndex::Postings::is_term_position(size_t index,
+                                               size_t term_pos) const {
   const auto &positions = find_positions_map(index)->second;
   return std::binary_search(positions.begin(), positions.end(), term_pos);
 }

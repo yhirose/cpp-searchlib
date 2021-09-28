@@ -41,8 +41,8 @@ class TermSearchResult : public IPostings {
     return 1;
   }
 
-  bool has_term_pos(size_t index, size_t term_pos) const override {
-    return postings_.has_term_pos(index, term_pos);
+  bool is_term_position(size_t index, size_t term_pos) const override {
+    return postings_.is_term_position(index, term_pos);
   }
 
  private:
@@ -73,7 +73,7 @@ class Position {
     return term_counts_[search_hit_index];
   }
 
-  bool has_term_pos(size_t term_pos) const {
+  bool is_term_position(size_t term_pos) const {
     return std::binary_search(term_positions_.begin(), term_positions_.end(),
                               term_pos);
   }
@@ -106,8 +106,8 @@ class SearchResult : public IPostings {
     return positions_[index]->term_count(search_hit_index);
   }
 
-  bool has_term_pos(size_t index, size_t term_pos) const override {
-    return positions_[index]->has_term_pos(term_pos);
+  bool is_term_position(size_t index, size_t term_pos) const override {
+    return positions_[index]->is_term_position(term_pos);
   }
 
   void push_back(std::shared_ptr<Position> info) { positions_.push_back(info); }
@@ -237,7 +237,7 @@ static bool is_adjacent(
 
     auto delta = slot - target_slot;
     auto next_term_pos = term_pos + delta;
-    ret = positings_list[slot]->has_term_pos(cursors[slot], next_term_pos);
+    ret = positings_list[slot]->is_term_position(cursors[slot], next_term_pos);
   }
 
   return ret;

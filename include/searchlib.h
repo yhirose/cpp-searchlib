@@ -33,7 +33,8 @@ class IPostings {
 
   virtual size_t term_position(size_t index, size_t search_hit_index) const = 0;
   virtual size_t term_count(size_t index, size_t search_hit_index) const = 0;
-  virtual bool has_term_pos(size_t index, size_t term_pos) const = 0;
+
+  virtual bool is_term_position(size_t index, size_t term_pos) const = 0;
 };
 
 class IInvertedIndex {
@@ -128,7 +129,7 @@ class OnMemoryIndex : public IInvertedIndex {
     size_t search_hit_count(size_t index) const override;
     size_t term_position(size_t index, size_t search_hit_index) const override;
     size_t term_count(size_t index, size_t search_hit_index) const override;
-    bool has_term_pos(size_t index, size_t term_pos) const override;
+    bool is_term_position(size_t index, size_t term_pos) const override;
 
     void add_term_position(size_t document_id, size_t term_pos);
 
