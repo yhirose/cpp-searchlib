@@ -6,12 +6,7 @@
 
 #include "test_utils.h"
 
-#ifdef _MSC_BUILD
-// Visual Studio runs tests in "build/test/Debug".
-const auto KJV_PATH = "../../../test/t_kjv.tsv";
-#else
 const auto KJV_PATH = "../../test/t_kjv.tsv";
-#endif
 
 void kjv_index(searchlib::OnMemoryIndex &index,
                searchlib::TextRangeList &text_range_list) {
