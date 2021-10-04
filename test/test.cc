@@ -11,17 +11,17 @@ std::vector<std::string> sample_documents = {
     "Hello World!",
 };
 
-void sample_index(searchlib::OnMemoryIndex &index,
+void sample_index(searchlib::InvertedIndex &index,
                   searchlib::TextRangeList &text_range_list) {
-  index.normalizer = [](auto sv) { return unicode::to_lowercase(sv); };
+  searchlib::Indexer::set_normalizer(
+      index, [](auto sv) { return unicode::to_lowercase(sv); });
 
   size_t document_id = 0;
   for (const auto &doc : sample_documents) {
     std::vector<searchlib::TextRange> text_ranges;
-    searchlib::UTF8PlainTextTokenizer tokenizer(doc, index.normalizer,
-                                                &text_ranges);
+    searchlib::UTF8PlainTextTokenizer tokenizer(doc, &text_ranges);
 
-    index.indexing(document_id, tokenizer);
+    searchlib::Indexer::indexing(index, document_id, tokenizer);
 
     text_range_list.emplace(document_id, std::move(text_ranges));
     document_id++;
@@ -46,10 +46,10 @@ TEST(TokenizerTest, UTF8PlainTextTokenizer) {
   size_t document_id = 0;
   for (const auto &doc : sample_documents) {
     std::vector<searchlib::TextRange> text_ranges;
-    searchlib::UTF8PlainTextTokenizer tokenizer(
-        doc, [](auto sv) { return unicode::to_lowercase(sv); }, &text_ranges);
+    searchlib::UTF8PlainTextTokenizer tokenizer(doc, &text_ranges);
     std::vector<std::string> actual;
     tokenizer.tokenize(
+        [](auto sv) { return unicode::to_lowercase(sv); },
         [&](auto &str, auto) { actual.emplace_back(searchlib::u8(str)); });
     EXPECT_EQ(expected[document_id], actual);
     document_id++;
@@ -57,7 +57,7 @@ TEST(TokenizerTest, UTF8PlainTextTokenizer) {
 }
 
 TEST(QueryTest, ParsingQuery) {
-  searchlib::OnMemoryIndex index;
+  searchlib::InvertedIndex index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
 
@@ -75,7 +75,7 @@ TEST(QueryTest, ParsingQuery) {
 }
 
 TEST(TermTest, TermSearch) {
-  searchlib::OnMemoryIndex index;
+  searchlib::InvertedIndex index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
 
@@ -153,7 +153,7 @@ TEST(TermTest, TermSearch) {
 }
 
 TEST(AndTest, AndSearch) {
-  searchlib::OnMemoryIndex index;
+  searchlib::InvertedIndex index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
 
@@ -209,7 +209,7 @@ TEST(AndTest, AndSearch) {
 }
 
 TEST(OrTest, OrSearch) {
-  searchlib::OnMemoryIndex index;
+  searchlib::InvertedIndex index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
 
@@ -299,7 +299,7 @@ TEST(OrTest, OrSearch) {
 }
 
 TEST(AdjacentTest, AdjacentSearch) {
-  searchlib::OnMemoryIndex index;
+  searchlib::InvertedIndex index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
 
@@ -378,7 +378,7 @@ TEST(AdjacentTest, AdjacentSearch) {
 }
 
 TEST(AdjacentTest, AdjacentSearchWith3Words) {
-  searchlib::OnMemoryIndex index;
+  searchlib::InvertedIndex index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
 
@@ -412,7 +412,7 @@ TEST(AdjacentTest, AdjacentSearchWith3Words) {
 }
 
 TEST(NearTest, NearSearch) {
-  searchlib::OnMemoryIndex index;
+  searchlib::InvertedIndex index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
 
@@ -485,7 +485,7 @@ TEST(NearTest, NearSearch) {
 }
 
 TEST(NearTest, NearSearchWithPhrase) {
-  searchlib::OnMemoryIndex index;
+  searchlib::InvertedIndex index;
   searchlib::TextRangeList text_range_list;
   sample_index(index, text_range_list);
 
@@ -535,7 +535,7 @@ bool close_enough(double expect, double actual) {
 }
 
 TEST(TF_IDF_Test, TF_IDF) {
-  searchlib::OnMemoryIndex index;
+  searchlib::InvertedIndex index;
 
   std::vector<std::string> documents = {
       "apple orange orange banana",
@@ -545,7 +545,7 @@ TEST(TF_IDF_Test, TF_IDF) {
   size_t document_id = 0;
   for (const auto &doc : documents) {
     searchlib::UTF8PlainTextTokenizer tokenizer(doc);
-    index.indexing(document_id, tokenizer);
+    searchlib::Indexer::indexing(index, document_id, tokenizer);
     document_id++;
   }
 

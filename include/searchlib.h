@@ -19,7 +19,7 @@
 namespace searchlib {
 
 //-----------------------------------------------------------------------------
-// Inverted Index
+// Inverted Index Interface
 //-----------------------------------------------------------------------------
 
 class IPostings {
@@ -90,10 +90,10 @@ TextRange text_range(const TextRangeList &text_range_list,
                      size_t search_hit_index);
 
 //-----------------------------------------------------------------------------
-// OnMemoryIndex
+// InvertedIndex
 //-----------------------------------------------------------------------------
 
-class OnMemoryIndex : public IInvertedIndex {
+class InvertedIndex : public IInvertedIndex {
  public:
   size_t document_count() const override;
 
@@ -106,22 +106,9 @@ class OnMemoryIndex : public IInvertedIndex {
 
   std::u32string normalize(const std::u32string &str) const override;
 
-  // For indexing
-  class ITokenizer {
-   public:
-    virtual ~ITokenizer() = 0;
-
-    using TokenizeCallback =
-        std::function<void(const std::u32string &str, size_t term_pos)>;
-
-    virtual void tokenize(TokenizeCallback callback) = 0;
-  };
-
-  void indexing(size_t document_id, ITokenizer &tokenizer);
-
-  std::function<std::u32string(const std::u32string &str)> normalizer;
-
  private:
+  friend class Indexer;
+
   class Postings : public IPostings {
    public:
     size_t size() const override;
@@ -155,27 +142,53 @@ class OnMemoryIndex : public IInvertedIndex {
   double tf(const std::u32string &str, size_t document_id) const;
   double idf(const std::u32string &str) const;
 
+  std::function<std::u32string(const std::u32string &str)> normalizer_;
   std::unordered_map<size_t /*document_id*/, Document> documents_;
   std::unordered_map<std::u32string /*str*/, Term> term_dictionary_;
+};
+
+//-----------------------------------------------------------------------------
+// Indexer
+//-----------------------------------------------------------------------------
+
+class ITokenizer {
+ public:
+  virtual ~ITokenizer() = 0;
+
+  virtual void tokenize(
+      std::function<std::u32string(const std::u32string &str)> normalizer,
+      std::function<void(const std::u32string &str, size_t term_pos)>
+          callback) = 0;
+};
+
+class Indexer {
+ public:
+  Indexer() = delete;
+
+  static void set_normalizer(
+      InvertedIndex &index,
+      std::function<std::u32string(const std::u32string &str)> normalizer);
+
+  static void indexing(InvertedIndex &index, size_t document_id,
+                       ITokenizer &tokenizer);
 };
 
 //-----------------------------------------------------------------------------
 // Tokenizers
 //-----------------------------------------------------------------------------
 
-class UTF8PlainTextTokenizer : public OnMemoryIndex::ITokenizer {
+class UTF8PlainTextTokenizer : public ITokenizer {
  public:
-  UTF8PlainTextTokenizer(
-      std::string_view text,
-      std::function<std::u32string(const std::u32string &str)> normalizer =
-          nullptr,
-      std::vector<TextRange> *text_ranges = nullptr);
+  UTF8PlainTextTokenizer(std::string_view text,
+                         std::vector<TextRange> *text_ranges = nullptr);
 
-  void tokenize(TokenizeCallback callback) override;
+  void tokenize(
+      std::function<std::u32string(const std::u32string &str)> normalizer,
+      std::function<void(const std::u32string &str, size_t term_pos)> callback)
+      override;
 
  private:
   std::string_view text_;
-  std::function<std::u32string(const std::u32string &str)> normalizer_;
   std::vector<TextRange> *text_ranges_;
 };
 

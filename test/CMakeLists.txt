@@ -17,7 +17,8 @@ add_executable(
   test.cc
   test_kjv.cc
   ../src/utils.cpp
-  ../src/indexing.cpp
+  ../src/indexer.cpp
+  ../src/invertedindex.cpp
   ../src/search.cpp
   ../src/query.cpp
   ../src/textrange.cpp

@@ -16,21 +16,24 @@ std::vector<std::string> documents = {
   "This is not the first document."
 };
 
+// Indexing...
 searchlib::InvertedIndex index;
-index.normalizer = [](auto str) { return unicode::to_lowercase(str); };
-
 searchlib::TextRangeList text_range_list;
 
-// Indexing...
-size_t document_id = 0;
-for (const auto &doc : documents) {
-  std::vector<searchlib::TextRange> text_ranges;
-  searchlib::UTF8PlainTextTokenizer tokenizer(doc, index.normalizer, text_ranges);
+{
+  searchlib::Indexer::set_normalizer(
+    index, [](auto str) { return unicode::to_lowercase(str); });
 
-  searchlib::indexing(index, tokenizer, document_id);
+  size_t document_id = 0;
+  for (const auto &doc : documents) {
+    std::vector<searchlib::TextRange> text_ranges;
+    searchlib::UTF8PlainTextTokenizer tokenizer(doc, text_ranges);
 
-  text_range_list.emplace(document_id, std::move(text_ranges));
-  document_id++;
+    searchlib::Indexer::indexing(index, tokenizer, document_id);
+
+    text_range_list.emplace(document_id, std::move(text_ranges));
+    document_id++;
+  }
 }
 
 // Search...

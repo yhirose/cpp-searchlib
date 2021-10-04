@@ -8,9 +8,11 @@
 
 const auto KJV_PATH = "../../test/t_kjv.tsv";
 
-void kjv_index(searchlib::OnMemoryIndex &index,
+void kjv_index(searchlib::InvertedIndex &index,
                searchlib::TextRangeList &text_range_list) {
-  index.normalizer = [](auto sv) { return unicode::to_lowercase(sv); };
+  searchlib::Indexer::set_normalizer(
+      index, [](auto sv) { return unicode::to_lowercase(sv); });
+
   std::ifstream fs(KJV_PATH);
   std::string line;
   while (std::getline(fs, line)) {
@@ -19,17 +21,16 @@ void kjv_index(searchlib::OnMemoryIndex &index,
     const auto &s = fields[4];
 
     std::vector<searchlib::TextRange> text_ranges;
-    searchlib::UTF8PlainTextTokenizer tokenizer(s, index.normalizer,
-                                                &text_ranges);
+    searchlib::UTF8PlainTextTokenizer tokenizer(s, &text_ranges);
 
-    index.indexing(document_id, tokenizer);
+    searchlib::Indexer::indexing(index, document_id, tokenizer);
 
     text_range_list.emplace(document_id, std::move(text_ranges));
   }
 }
 
 TEST(KJVTest, SimpleTest) {
-  searchlib::OnMemoryIndex index;
+  searchlib::InvertedIndex index;
   searchlib::TextRangeList text_range_list;
 
   kjv_index(index, text_range_list);
@@ -57,8 +58,8 @@ TEST(KJVTest, UTF8DecodePerformance) {
 
   std::string s;
   while (std::getline(fs, s)) {
-    searchlib::UTF8PlainTextTokenizer tokenizer(s, normalizer);
-    tokenizer.tokenize([&](auto &str, auto) {});
+    searchlib::UTF8PlainTextTokenizer tokenizer(s);
+    tokenizer.tokenize(normalizer, [&](auto &str, auto) {});
   }
 }
 
