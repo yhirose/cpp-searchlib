@@ -529,11 +529,6 @@ TEST(NearTest, NearSearchWithPhrase) {
   }
 }
 
-bool close_enough(double expect, double actual) {
-  auto tolerance = 0.001;
-  return (expect - tolerance) <= actual && actual <= (expect + tolerance);
-}
-
 TEST(TF_IDF_Test, TF_IDF) {
   searchlib::InvertedIndex index;
 
@@ -551,31 +546,66 @@ TEST(TF_IDF_Test, TF_IDF) {
 
   {
     auto term = U"apple";
-    EXPECT_TRUE(close_enough(0.25, index.tf_idf(term, 0)));
-    EXPECT_TRUE(close_enough(0, index.tf_idf(term, 1)));
+
+    EXPECT_EQ(1, index.df(term));
+    EXPECT_AP(1, index.idf(term));
+
+    EXPECT_EQ(0.25, index.tf(term, 0));
+    EXPECT_AP(0.25, index.tf_idf(term, 0));
+
+    EXPECT_EQ(0, index.tf(term, 1));
+    EXPECT_AP(0, index.tf_idf(term, 1));
   }
 
   {
     auto term = U"orange";
-    EXPECT_TRUE(close_enough(0, index.tf_idf(term, 0)));
-    EXPECT_TRUE(close_enough(0, index.tf_idf(term, 1)));
+
+    EXPECT_EQ(2, index.df(term));
+    EXPECT_EQ(0, index.idf(term));
+
+    EXPECT_EQ(0.5, index.tf(term, 0));
+    EXPECT_AP(0, index.tf_idf(term, 0));
+
+    EXPECT_EQ(0.2, index.tf(term, 1));
+    EXPECT_AP(0, index.tf_idf(term, 1));
   }
 
   {
     auto term = U"banana";
-    EXPECT_TRUE(close_enough(0, index.tf_idf(term, 0)));
-    EXPECT_TRUE(close_enough(0, index.tf_idf(term, 1)));
+
+    EXPECT_EQ(2, index.df(term));
+    EXPECT_EQ(0, index.idf(term));
+
+    EXPECT_EQ(0.25, index.tf(term, 0));
+    EXPECT_AP(0, index.tf_idf(term, 0));
+
+    EXPECT_EQ(0.2, index.tf(term, 1));
+    EXPECT_AP(0, index.tf_idf(term, 1));
   }
 
   {
     auto term = U"strawberry";
-    EXPECT_TRUE(close_enough(0, index.tf_idf(term, 0)));
-    EXPECT_TRUE(close_enough(0.4, index.tf_idf(term, 1)));
+
+    EXPECT_EQ(1, index.df(term));
+    EXPECT_AP(1, index.idf(term));
+
+    EXPECT_EQ(0, index.tf(term, 0));
+    EXPECT_AP(0, index.tf_idf(term, 0));
+
+    EXPECT_EQ(0.4, index.tf(term, 1));
+    EXPECT_AP(0.4, index.tf_idf(term, 1));
   }
 
   {
     auto term = U"grape";
-    EXPECT_TRUE(close_enough(0, index.tf_idf(term, 0)));
-    EXPECT_TRUE(close_enough(0.2, index.tf_idf(term, 1)));
+
+    EXPECT_EQ(1, index.df(term));
+    EXPECT_AP(1, index.idf(term));
+
+    EXPECT_EQ(0, index.tf(term, 0));
+    EXPECT_AP(0, index.tf_idf(term, 0));
+
+    EXPECT_EQ(0.2, index.tf(term, 1));
+    EXPECT_AP(0.2, index.tf_idf(term, 1));
   }
 }

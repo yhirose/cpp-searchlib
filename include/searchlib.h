@@ -46,6 +46,9 @@ class IInvertedIndex {
   virtual bool term_exists(const std::u32string &str) const = 0;
   virtual size_t term_occurrences(const std::u32string &str) const = 0;
 
+  virtual size_t df(const std::u32string &str) const = 0;
+  virtual double idf(const std::u32string &str) const = 0;
+  virtual double tf(const std::u32string &str, size_t document_id) const = 0;
   virtual double tf_idf(const std::u32string &str,
                         size_t document_id) const = 0;
 
@@ -100,6 +103,9 @@ class InvertedIndex : public IInvertedIndex {
   bool term_exists(const std::u32string &str) const override;
   size_t term_occurrences(const std::u32string &str) const override;
 
+  size_t df(const std::u32string &str) const override;
+  double idf(const std::u32string &str) const override;
+  double tf(const std::u32string &str, size_t document_id) const override;
   double tf_idf(const std::u32string &str, size_t document_id) const override;
 
   const IPostings &postings(const std::u32string &str) const override;
@@ -137,10 +143,6 @@ class InvertedIndex : public IInvertedIndex {
     size_t term_occurrences;
     Postings postings;
   };
-
-  size_t df(const std::u32string &str) const;
-  double tf(const std::u32string &str, size_t document_id) const;
-  double idf(const std::u32string &str) const;
 
   std::function<std::u32string(const std::u32string &str)> normalizer_;
   std::unordered_map<size_t /*document_id*/, Document> documents_;

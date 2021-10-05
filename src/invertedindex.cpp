@@ -72,6 +72,12 @@ size_t InvertedIndex::df(const std::u32string &str) const {
   return postings(str).size();
 }
 
+double InvertedIndex::idf(const std::u32string &str) const {
+  auto adjustment = 0.001;
+  return std::log2(static_cast<double>(documents_.size() + adjustment) /
+                   (static_cast<double>(df(str) + adjustment)));
+}
+
 double InvertedIndex::tf(const std::u32string &str, size_t document_id) const {
   const auto &p = postings(str);
   for (size_t i = 0; i < p.size(); i++) {
@@ -81,12 +87,6 @@ double InvertedIndex::tf(const std::u32string &str, size_t document_id) const {
     }
   }
   return 0.0;
-}
-
-double InvertedIndex::idf(const std::u32string &str) const {
-  auto adjustment = 0.001;
-  return std::log2(static_cast<double>(documents_.size() + adjustment) /
-                   (static_cast<double>(df(str) + adjustment)));
 }
 
 double InvertedIndex::tf_idf(const std::u32string &str,
