@@ -13,27 +13,27 @@ namespace searchlib {
 ITokenizer::~ITokenizer() = default;
 
 void Indexer::set_normalizer(
-    InvertedIndex &index,
+    InvertedIndex &invidx,
     std::function<std::u32string(const std::u32string &str)> normalizer) {
-  index.normalizer_ = normalizer;
+  invidx.normalizer_ = normalizer;
 }
 
-void Indexer::indexing(InvertedIndex &index, size_t document_id,
+void Indexer::indexing(InvertedIndex &invidx, size_t document_id,
                        ITokenizer &tokenizer) {
   size_t term_count = 0;
-  tokenizer.tokenize(index.normalizer_, [&](const auto &str, auto term_pos) {
-    if (!contains(index.term_dictionary_, str)) {
-      index.term_dictionary_[str] = {str, 0};
+  tokenizer.tokenize(invidx.normalizer_, [&](const auto &str, auto term_pos) {
+    if (!contains(invidx.term_dictionary_, str)) {
+      invidx.term_dictionary_[str] = {str, 0};
     }
 
-    auto &term = index.term_dictionary_.at(str);
+    auto &term = invidx.term_dictionary_.at(str);
     term.term_occurrences++;
     term.postings.add_term_position(document_id, term_pos);
 
     term_count++;
   });
 
-  index.documents_[document_id] = {term_count};
+  invidx.documents_[document_id] = {term_count};
 }
 
 }  // namespace searchlib

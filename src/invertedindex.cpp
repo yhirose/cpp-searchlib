@@ -80,6 +80,7 @@ double InvertedIndex::idf(const std::u32string &str) const {
 
 double InvertedIndex::tf(const std::u32string &str, size_t document_id) const {
   const auto &p = postings(str);
+  // TODO: use binary search...
   for (size_t i = 0; i < p.size(); i++) {
     if (p.document_id(i) == document_id) {
       return static_cast<double>(p.search_hit_count(i)) /
