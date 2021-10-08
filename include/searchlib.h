@@ -80,9 +80,6 @@ std::shared_ptr<IPostings> perform_search(const IInvertedIndex &invidx,
 size_t term_count_score(const IInvertedIndex &invidx, const Expression &expr,
                         const IPostings &postings, size_t index);
 
-double tf_score(const IInvertedIndex &invidx, const Expression &expr,
-                const IPostings &postings, size_t index);
-
 double tf_idf_score(const IInvertedIndex &invidx, const Expression &expr,
                     const IPostings &postings, size_t index);
 

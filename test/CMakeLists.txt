@@ -16,6 +16,7 @@ add_executable(
   test-main
   test.cc
   test_kjv.cc
+  test_kjv_chapters.cc
   ../src/utils.cpp
   ../src/indexer.cpp
   ../src/invertedindex.cpp

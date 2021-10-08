@@ -122,7 +122,7 @@ double InvertedIndex::tf(const std::u32string &str, size_t document_id) const {
   auto i = find_postings_index_for_document_id_(p, document_id);
   if (i < p.size()) {
     return static_cast<double>(p.search_hit_count(i)) /
-           static_cast<double>(documents_.at(document_id).term_count);
+           static_cast<double>(document_term_count(document_id));
   }
   return 0.0;
 }

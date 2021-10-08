@@ -517,15 +517,6 @@ size_t term_count_score(const IInvertedIndex &invidx, const Expression &expr,
   return score;
 }
 
-double tf_score(const IInvertedIndex &invidx, const Expression &expr,
-                const IPostings &postings, size_t index) {
-  auto document_id = postings.document_id(index);
-  double score = 0.0;
-  enumerate_terms(
-      expr, [&](const auto &term) { score += invidx.tf(term, document_id); });
-  return score;
-}
-
 double tf_idf_score(const IInvertedIndex &invidx, const Expression &expr,
                     const IPostings &postings, size_t index) {
   auto document_id = postings.document_id(index);

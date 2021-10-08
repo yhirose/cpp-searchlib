@@ -8,24 +8,26 @@
 
 const auto KJV_PATH = "../../test/t_kjv.tsv";
 
-void kjv_index(searchlib::InvertedIndex &invidx,
-               searchlib::TextRangeList &text_range_list) {
+static void kjv_index(searchlib::InvertedIndex &invidx,
+                      searchlib::TextRangeList &text_range_list) {
   searchlib::Indexer::set_normalizer(
       invidx, [](auto sv) { return unicode::to_lowercase(sv); });
 
   std::ifstream fs(KJV_PATH);
-  std::string line;
-  while (std::getline(fs, line)) {
-    auto fields = split(line, '\t');
-    auto document_id = std::stoi(fields[0]);
-    const auto &s = fields[4];
+  if (fs) {
+    std::string line;
+    while (std::getline(fs, line)) {
+      auto fields = split(line, '\t');
+      auto document_id = std::stoi(fields[0]);
+      const auto &s = fields[4];
 
-    std::vector<searchlib::TextRange> text_ranges;
-    searchlib::UTF8PlainTextTokenizer tokenizer(s, &text_ranges);
+      std::vector<searchlib::TextRange> text_ranges;
+      searchlib::UTF8PlainTextTokenizer tokenizer(s, &text_ranges);
 
-    searchlib::Indexer::indexing(invidx, document_id, tokenizer);
+      searchlib::Indexer::indexing(invidx, document_id, tokenizer);
 
-    text_range_list.emplace(document_id, std::move(text_ranges));
+      text_range_list.emplace(document_id, std::move(text_ranges));
+    }
   }
 }
 
@@ -37,8 +39,11 @@ TEST(KJVTest, SimpleTest) {
 
   {
     auto expr = parse_query(invidx, R"( apple )");
+    ASSERT_TRUE(expr);
+
     auto postings = perform_search(invidx, *expr);
-    EXPECT_EQ(8, postings->size());
+    ASSERT_TRUE(postings);
+    ASSERT_EQ(8, postings->size());
 
     auto term = U"apple";
     EXPECT_EQ(8, invidx.df(term));
@@ -51,25 +56,32 @@ TEST(KJVTest, SimpleTest) {
     EXPECT_AP(0.341, searchlib::tf_idf_score(invidx, *expr, *postings, 5));
     EXPECT_AP(0.298, searchlib::tf_idf_score(invidx, *expr, *postings, 6));
     EXPECT_AP(0.385, searchlib::tf_idf_score(invidx, *expr, *postings, 7));
+
+    EXPECT_AP(0.660, searchlib::bm25_score(invidx, *expr, *postings, 0));
+    EXPECT_AP(1.753, searchlib::bm25_score(invidx, *expr, *postings, 1));
+    EXPECT_AP(2.146, searchlib::bm25_score(invidx, *expr, *postings, 2));
+    EXPECT_AP(0.500, searchlib::bm25_score(invidx, *expr, *postings, 3));
+    EXPECT_AP(0.475, searchlib::bm25_score(invidx, *expr, *postings, 4));
+    EXPECT_AP(0.475, searchlib::bm25_score(invidx, *expr, *postings, 5));
+    EXPECT_AP(0.374, searchlib::bm25_score(invidx, *expr, *postings, 6));
+    EXPECT_AP(0.588, searchlib::bm25_score(invidx, *expr, *postings, 7));
   }
 
   {
     auto expr = parse_query(invidx, R"( "apple tree" )");
-    auto postings = perform_search(invidx, *expr);
-    EXPECT_EQ(3, postings->size());
+    ASSERT_TRUE(expr);
 
-    // for (size_t i = 0; i < postings->size(); i++) {
-    //   auto score = bm25_score(invidx, *expr, *postings, i);
-    //   std::cout << i << ": score: " << score << std::endl;
-    // }
+    auto postings = perform_search(invidx, *expr);
+    ASSERT_TRUE(postings);
+    ASSERT_EQ(3, postings->size());
+
+    EXPECT_EQ(1, postings->search_hit_count(0));
+    EXPECT_EQ(1, postings->search_hit_count(1));
+    EXPECT_EQ(1, postings->search_hit_count(2));
 
     EXPECT_EQ(2, searchlib::term_count_score(invidx, *expr, *postings, 0));
     EXPECT_EQ(2, searchlib::term_count_score(invidx, *expr, *postings, 1));
     EXPECT_EQ(5, searchlib::term_count_score(invidx, *expr, *postings, 2));
-
-    EXPECT_AP(0.059, searchlib::tf_score(invidx, *expr, *postings, 0));
-    EXPECT_AP(0.057, searchlib::tf_score(invidx, *expr, *postings, 1));
-    EXPECT_AP(0.125, searchlib::tf_score(invidx, *expr, *postings, 2));
 
     EXPECT_AP(0.572, searchlib::tf_idf_score(invidx, *expr, *postings, 0));
     EXPECT_AP(0.556, searchlib::tf_idf_score(invidx, *expr, *postings, 1));
