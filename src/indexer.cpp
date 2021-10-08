@@ -27,7 +27,7 @@ void Indexer::indexing(InvertedIndex &invidx, size_t document_id,
     }
 
     auto &term = invidx.term_dictionary_.at(str);
-    term.term_occurrences++;
+    term.term_count++;
     term.postings.add_term_position(document_id, term_pos);
 
     term_count++;

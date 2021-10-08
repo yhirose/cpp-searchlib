@@ -31,8 +31,8 @@ size_t InvertedIndex::Postings::term_position(size_t index,
   return find_positions_map(index)->second[search_hit_index];
 }
 
-size_t InvertedIndex::Postings::term_count(size_t index,
-                                           size_t search_hit_index) const {
+size_t InvertedIndex::Postings::term_length(size_t index,
+                                            size_t search_hit_index) const {
   return 1;
 }
 
@@ -58,41 +58,73 @@ InvertedIndex::Postings::find_positions_map(size_t index) const {
 
 //-----------------------------------------------------------------------------
 
+size_t find_postings_index_for_document_id_(const IPostings &p,
+                                            size_t document_id) {
+  // TODO: use binary search and cache...
+  for (size_t i = 0; i < p.size(); i++) {
+    if (p.document_id(i) == document_id) {
+      return i;
+    }
+  }
+  return p.size();
+}
+
 size_t InvertedIndex::document_count() const { return documents_.size(); }
+
+size_t InvertedIndex::document_term_count(size_t document_id) const {
+  return documents_.at(document_id).term_count;
+}
+
+double InvertedIndex::average_document_term_count() const {
+  auto buffs = std::vector<std::pair<size_t, size_t>>{{0.0, 0}};
+  for (const auto &[_, document] : documents_) {
+    if (document.term_count <
+        std::numeric_limits<size_t>::max() - buffs.back().first) {
+      buffs.back().first += document.term_count;
+      buffs.back().second += 1;
+    } else {
+      buffs.push_back({document.term_count, 1});
+    }
+  }
+
+  double avg = 0.0;
+  for (const auto [term_count, document_count] : buffs) {
+    avg +=
+        static_cast<double>(term_count) / static_cast<double>(document_count);
+  }
+  return avg;
+}
 
 bool InvertedIndex::term_exists(const std::u32string &str) const {
   return contains(term_dictionary_, str);
 }
 
-size_t InvertedIndex::term_occurrences(const std::u32string &str) const {
-  return term_dictionary_.at(str).term_occurrences;
+size_t InvertedIndex::term_count(const std::u32string &str) const {
+  return term_dictionary_.at(str).term_count;
+}
+
+size_t InvertedIndex::term_count(const std::u32string &str,
+                                 size_t document_id) const {
+  const auto &p = postings(str);
+  auto i = find_postings_index_for_document_id_(p, document_id);
+  if (i < p.size()) {
+    return p.search_hit_count(i);
+  }
+  return 0;
 }
 
 size_t InvertedIndex::df(const std::u32string &str) const {
   return postings(str).size();
 }
 
-double InvertedIndex::idf(const std::u32string &str) const {
-  auto adjustment = 0.001;
-  return std::log2(static_cast<double>(documents_.size() + adjustment) /
-                   (static_cast<double>(df(str) + adjustment)));
-}
-
 double InvertedIndex::tf(const std::u32string &str, size_t document_id) const {
   const auto &p = postings(str);
-  // TODO: use binary search...
-  for (size_t i = 0; i < p.size(); i++) {
-    if (p.document_id(i) == document_id) {
-      return static_cast<double>(p.search_hit_count(i)) /
-             static_cast<double>(documents_.at(document_id).term_count);
-    }
+  auto i = find_postings_index_for_document_id_(p, document_id);
+  if (i < p.size()) {
+    return static_cast<double>(p.search_hit_count(i)) /
+           static_cast<double>(documents_.at(document_id).term_count);
   }
   return 0.0;
-}
-
-double InvertedIndex::tf_idf(const std::u32string &str,
-                             size_t document_id) const {
-  return tf(str, document_id) * idf(str);
 }
 
 const IPostings &InvertedIndex::postings(const std::u32string &str) const {

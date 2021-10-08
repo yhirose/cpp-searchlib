@@ -32,8 +32,7 @@ class IPostings {
   virtual size_t search_hit_count(size_t index) const = 0;
 
   virtual size_t term_position(size_t index, size_t search_hit_index) const = 0;
-  virtual size_t term_count(size_t index, size_t search_hit_index) const = 0;
-
+  virtual size_t term_length(size_t index, size_t search_hit_index) const = 0;
   virtual bool is_term_position(size_t index, size_t term_pos) const = 0;
 };
 
@@ -43,15 +42,16 @@ class IInvertedIndex {
 
   virtual size_t document_count() const = 0;
 
+  virtual size_t document_term_count(size_t document_id) const = 0;
+  virtual double average_document_term_count() const = 0;
+
   virtual bool term_exists(const std::u32string &str) const = 0;
-  virtual size_t term_occurrences(const std::u32string &str) const = 0;
+  virtual size_t term_count(const std::u32string &str) const = 0;
+  virtual size_t term_count(const std::u32string &str,
+                            size_t document_id) const = 0;
 
   virtual size_t df(const std::u32string &str) const = 0;
-  virtual double idf(const std::u32string &str) const = 0;
   virtual double tf(const std::u32string &str, size_t document_id) const = 0;
-
-  virtual double tf_idf(const std::u32string &str,
-                        size_t document_id) const = 0;
 
   virtual const IPostings &postings(const std::u32string &str) const = 0;
 
@@ -77,6 +77,19 @@ std::optional<Expression> parse_query(const IInvertedIndex &invidx,
 std::shared_ptr<IPostings> perform_search(const IInvertedIndex &invidx,
                                           const Expression &expr);
 
+size_t term_count_score(const IInvertedIndex &invidx, const Expression &expr,
+                        const IPostings &postings, size_t index);
+
+double tf_score(const IInvertedIndex &invidx, const Expression &expr,
+                const IPostings &postings, size_t index);
+
+double tf_idf_score(const IInvertedIndex &invidx, const Expression &expr,
+                    const IPostings &postings, size_t index);
+
+double bm25_score(const IInvertedIndex &invidx, const Expression &expr,
+                  const IPostings &postings, size_t index, double k1 = 1.2,
+                  double b = 0.75);
+
 //-----------------------------------------------------------------------------
 // Text Range
 //-----------------------------------------------------------------------------
@@ -101,14 +114,16 @@ class InvertedIndex : public IInvertedIndex {
  public:
   size_t document_count() const override;
 
+  size_t document_term_count(size_t document_id) const override;
+  double average_document_term_count() const override;
+
   bool term_exists(const std::u32string &str) const override;
-  size_t term_occurrences(const std::u32string &str) const override;
+  size_t term_count(const std::u32string &str) const override;
+  size_t term_count(const std::u32string &str,
+                    size_t document_id) const override;
 
   size_t df(const std::u32string &str) const override;
-  double idf(const std::u32string &str) const override;
   double tf(const std::u32string &str, size_t document_id) const override;
-
-  double tf_idf(const std::u32string &str, size_t document_id) const override;
 
   const IPostings &postings(const std::u32string &str) const override;
 
@@ -120,10 +135,12 @@ class InvertedIndex : public IInvertedIndex {
   class Postings : public IPostings {
    public:
     size_t size() const override;
+
     size_t document_id(size_t index) const override;
     size_t search_hit_count(size_t index) const override;
+
     size_t term_position(size_t index, size_t search_hit_index) const override;
-    size_t term_count(size_t index, size_t search_hit_index) const override;
+    size_t term_length(size_t index, size_t search_hit_index) const override;
     bool is_term_position(size_t index, size_t term_pos) const override;
 
     void add_term_position(size_t document_id, size_t term_pos);
@@ -142,7 +159,7 @@ class InvertedIndex : public IInvertedIndex {
 
   struct Term {
     std::u32string str;
-    size_t term_occurrences;
+    size_t term_count;
     Postings postings;
   };
 

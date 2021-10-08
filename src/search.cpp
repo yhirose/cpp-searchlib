@@ -37,7 +37,7 @@ class TermSearchResult : public IPostings {
     return postings_.term_position(index, search_hit_index);
   }
 
-  size_t term_count(size_t index, size_t search_hit_index) const override {
+  size_t term_length(size_t index, size_t search_hit_index) const override {
     return 1;
   }
 
@@ -54,10 +54,10 @@ class TermSearchResult : public IPostings {
 class Position {
  public:
   Position(size_t document_id, std::vector<size_t> &&term_positions,
-           std::vector<size_t> &&term_counts)
+           std::vector<size_t> &&term_lengths)
       : document_id_(document_id),
         term_positions_(term_positions),
-        term_counts_(term_counts) {}
+        term_lengths(term_lengths) {}
 
   ~Position() = default;
 
@@ -69,8 +69,8 @@ class Position {
     return term_positions_[search_hit_index];
   }
 
-  size_t term_count(size_t search_hit_index) const {
-    return term_counts_[search_hit_index];
+  size_t term_length(size_t search_hit_index) const {
+    return term_lengths[search_hit_index];
   }
 
   bool is_term_position(size_t term_pos) const {
@@ -81,7 +81,7 @@ class Position {
  private:
   size_t document_id_;
   std::vector<size_t> term_positions_;
-  std::vector<size_t> term_counts_;
+  std::vector<size_t> term_lengths;
 };
 
 class SearchResult : public IPostings {
@@ -102,8 +102,8 @@ class SearchResult : public IPostings {
     return positions_[index]->term_position(search_hit_index);
   }
 
-  size_t term_count(size_t index, size_t search_hit_index) const override {
-    return positions_[index]->term_count(search_hit_index);
+  size_t term_length(size_t index, size_t search_hit_index) const override {
+    return positions_[index]->term_length(search_hit_index);
   }
 
   bool is_term_position(size_t index, size_t term_pos) const override {
@@ -270,13 +270,13 @@ static std::shared_ptr<IPostings> intersect_postings(
 static void merge_term_positions(
     const std::vector<std::shared_ptr<IPostings>> &positings_list,
     const std::vector<size_t> &cursors, const std::vector<size_t> &slots,
-    std::vector<size_t> &term_positions, std::vector<size_t> &term_counts) {
+    std::vector<size_t> &term_positions, std::vector<size_t> &term_lengths) {
   std::vector<size_t> search_hit_cursors(positings_list.size(), 0);
 
   while (true) {
     size_t min_slot = -1;
     size_t min_term_pos = -1;
-    size_t min_term_count = -1;
+    size_t min_term_length = -1;
 
     // TODO: improve performance by reducing slots
     for (auto slot : slots) {
@@ -286,12 +286,12 @@ static void merge_term_positions(
 
       if (hit_index < p->search_hit_count(index)) {
         auto term_pos = p->term_position(index, hit_index);
-        auto term_count = p->term_count(index, hit_index);
+        auto term_length = p->term_length(index, hit_index);
 
         if (term_pos < min_term_pos) {
           min_slot = slot;
           min_term_pos = term_pos;
-          min_term_count = term_count;
+          min_term_length = term_length;
         }
       }
     }
@@ -301,7 +301,7 @@ static void merge_term_positions(
     }
 
     term_positions.push_back(min_term_pos);
-    term_counts.push_back(min_term_count);
+    term_lengths.push_back(min_term_length);
     search_hit_cursors[min_slot]++;
   }
 }
@@ -315,13 +315,13 @@ static std::shared_ptr<IPostings> union_postings(
     auto slots = min_slots(positings_list, cursors);
 
     std::vector<size_t> term_positions;
-    std::vector<size_t> term_counts;
+    std::vector<size_t> term_lengths;
     merge_term_positions(positings_list, cursors, slots, term_positions,
-                         term_counts);
+                         term_lengths);
 
     result->push_back(std::make_shared<Position>(
         positings_list[slots[0]]->document_id(cursors[slots[0]]),
-        std::move(term_positions), std::move(term_counts)));
+        std::move(term_positions), std::move(term_lengths)));
 
     increment_cursors(positings_list, cursors, slots);
     assert(positings_list.size() == cursors.size());
@@ -346,13 +346,13 @@ static std::shared_ptr<IPostings> perform_and_operation(
         std::iota(slots.begin(), slots.end(), 0);
 
         std::vector<size_t> term_positions;
-        std::vector<size_t> term_counts;
+        std::vector<size_t> term_lengths;
         merge_term_positions(positings_list, cursors, slots, term_positions,
-                             term_counts);
+                             term_lengths);
 
         return std::make_shared<Position>(
             positings_list[0]->document_id(cursors[0]),
-            std::move(term_positions), std::move(term_counts));
+            std::move(term_positions), std::move(term_lengths));
       });
 }
 
@@ -362,7 +362,7 @@ static std::shared_ptr<IPostings> perform_adjacent_operation(
       positings_list(inverted_index, expr.nodes),
       [](const auto &positings_list, const auto &cursors) {
         std::vector<size_t> term_positions;
-        std::vector<size_t> term_counts;
+        std::vector<size_t> term_lengths;
 
         auto target_slot = shortest_slot(positings_list, cursors);
 
@@ -375,7 +375,7 @@ static std::shared_ptr<IPostings> perform_adjacent_operation(
           if (is_adjacent(positings_list, cursors, target_slot, term_pos)) {
             auto start_term_pos = term_pos - target_slot;
             term_positions.push_back(start_term_pos);
-            term_counts.push_back(positings_list.size());
+            term_lengths.push_back(positings_list.size());
           }
         }
 
@@ -384,7 +384,7 @@ static std::shared_ptr<IPostings> perform_adjacent_operation(
         } else {
           return std::make_shared<Position>(
               positings_list[0]->document_id(cursors[0]),
-              std::move(term_positions), std::move(term_counts));
+              std::move(term_positions), std::move(term_lengths));
         }
       });
 }
@@ -400,7 +400,7 @@ static std::shared_ptr<IPostings> perform_near_operation(
       positings_list(inverted_index, expr.nodes),
       [&](const auto &positings_list, const auto &cursors) {
         std::vector<size_t> term_positions;
-        std::vector<size_t> term_counts;
+        std::vector<size_t> term_lengths;
         std::vector<size_t> search_hit_cursors(positings_list.size(), 0);
 
         auto done = false;
@@ -408,7 +408,7 @@ static std::shared_ptr<IPostings> perform_near_operation(
           // TODO: performance improvement by resusing values as many as
           // possible
           std::map<size_t /*term_pos*/,
-                   std::pair<size_t /*slot*/, size_t /*term_count*/>>
+                   std::pair<size_t /*slot*/, size_t /*term_length*/>>
               slots_by_term_pos;
           {
             auto slot = 0;
@@ -416,8 +416,8 @@ static std::shared_ptr<IPostings> perform_near_operation(
               auto index = cursors[slot];
               auto hit_index = search_hit_cursors[slot];
               auto term_pos = p->term_position(index, hit_index);
-              auto term_count = p->term_count(index, hit_index);
-              slots_by_term_pos[term_pos] = std::pair(slot, term_count);
+              auto term_length = p->term_length(index, hit_index);
+              slots_by_term_pos[term_pos] = std::pair(slot, term_length);
               slot++;
             }
           }
@@ -444,9 +444,9 @@ static std::shared_ptr<IPostings> perform_near_operation(
           if (near) {
             // Skip all search hit cursors
             for (auto [term_pos, item] : slots_by_term_pos) {
-              auto [slot, term_count] = item;
+              auto [slot, term_length] = item;
               term_positions.push_back(term_pos);
-              term_counts.push_back(term_count);
+              term_lengths.push_back(term_length);
               search_hit_cursors[slot]++;
 
               if (search_hit_cursors[slot] ==
@@ -471,7 +471,7 @@ static std::shared_ptr<IPostings> perform_near_operation(
         } else {
           return std::make_shared<Position>(
               positings_list[0]->document_id(cursors[0]),
-              std::move(term_positions), std::move(term_counts));
+              std::move(term_positions), std::move(term_lengths));
         }
       });
 }
@@ -494,6 +494,69 @@ std::shared_ptr<IPostings> perform_search(const IInvertedIndex &inverted_index,
     default:
       return nullptr;
   }
+}
+
+template <typename T>
+void enumerate_terms(const Expression &expr, T fn) {
+  if (expr.operation == Operation::Term) {
+    fn(expr.term_str);
+  } else {
+    for (const auto &node : expr.nodes) {
+      enumerate_terms(node, fn);
+    }
+  }
+}
+
+size_t term_count_score(const IInvertedIndex &invidx, const Expression &expr,
+                        const IPostings &postings, size_t index) {
+  auto document_id = postings.document_id(index);
+  size_t score = 0;
+  enumerate_terms(expr, [&](const auto &term) {
+    score += invidx.term_count(term, document_id);
+  });
+  return score;
+}
+
+double tf_score(const IInvertedIndex &invidx, const Expression &expr,
+                const IPostings &postings, size_t index) {
+  auto document_id = postings.document_id(index);
+  double score = 0.0;
+  enumerate_terms(
+      expr, [&](const auto &term) { score += invidx.tf(term, document_id); });
+  return score;
+}
+
+double tf_idf_score(const IInvertedIndex &invidx, const Expression &expr,
+                    const IPostings &postings, size_t index) {
+  auto document_id = postings.document_id(index);
+  auto N = static_cast<double>(invidx.document_count());
+  double score = 0.0;
+  enumerate_terms(expr, [&](const auto &term) {
+    auto n = static_cast<double>(invidx.df(term));
+    auto idf = std::log2((N + 0.001) / (n + 0.001));
+    score += invidx.tf(term, document_id) * idf;
+  });
+  return score;
+}
+
+double bm25_score(const IInvertedIndex &invidx, const Expression &expr,
+                  const IPostings &postings, size_t index, double k1,
+                  double b) {
+  auto document_id = postings.document_id(index);
+  auto N = static_cast<double>(invidx.document_count());
+  auto dl = invidx.document_term_count(document_id);
+  auto avgdl = invidx.average_document_term_count();
+
+  double score = 0.0;
+  enumerate_terms(expr, [&](const auto &term) {
+    auto n = static_cast<double>(invidx.df(term));
+    auto idf = std::log2((N - n + 0.5) / (n + 0.5));
+    auto tf = invidx.tf(term, document_id);
+
+    score +=
+        idf * ((tf * (k1 + 1.0)) / (tf + k1 * (1.0 - b + b * (dl / avgdl))));
+  });
+  return score;
 }
 
 }  // namespace searchlib

@@ -3,7 +3,6 @@
 C++17 full-text search engine library (WIP. Far from release...)
 
 TODO:
-- [ ] TF-IDF scoring and ranking
 - [ ] Save/load index to/from storage
 - [ ] Posting list compression
 - [ ] Search scope (document, section, paragraph)
@@ -47,7 +46,7 @@ result->search_hit_count(0); // 1
 
   // 'the second sentence'
   result->term_position(0, 1); // 7
-  result->term_count(0, 1); // 3
+  result->term_length(0, 1); // 3
   auto rng = searchlib::text_range(text_range_list, *result, 0, 1);
   rng.position; // 36
   rng.length; // 19
@@ -57,14 +56,14 @@ result->search_hit_count(1); // 2
 
   // 'not'
   result->term_position(1, 0); // 2
-  result->term_count(1, 0); // 1
+  result->term_length(1, 0); // 1
   auto rng = searchlib::text_range(text_range_list, *result, 1, 0);
   rng.position; // 8
   rng.length; // 3
 
   // 'first'
   result->term_position(1, 1); // 4
-  result->term_count(1, 1); // 1
+  result->term_length(1, 1); // 1
   auto rng = searchlib::text_range(text_range_list, *result, 1, 1);
   rng.position; // 16
   rng.length; // 5

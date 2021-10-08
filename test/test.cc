@@ -30,7 +30,7 @@ void sample_index(searchlib::InvertedIndex &invidx,
   EXPECT_EQ(sample_documents.size(), invidx.document_count());
 
   auto term = U"the";
-  EXPECT_EQ(5, invidx.term_occurrences(term));
+  EXPECT_EQ(5, invidx.term_count(term));
 }
 
 TEST(TokenizerTest, UTF8PlainTextTokenizer) {
@@ -91,7 +91,7 @@ TEST(TermTest, TermSearch) {
       EXPECT_EQ(1, postings->search_hit_count(invidx));
 
       EXPECT_EQ(2, postings->term_position(invidx, 0));
-      EXPECT_EQ(1, postings->term_count(invidx, 0));
+      EXPECT_EQ(1, postings->term_length(invidx, 0));
 
       auto rng = searchlib::text_range(text_range_list, *postings, invidx, 0);
       EXPECT_EQ(8, rng.position);
@@ -104,13 +104,13 @@ TEST(TermTest, TermSearch) {
       EXPECT_EQ(3, postings->search_hit_count(invidx));
 
       EXPECT_EQ(2, postings->term_position(invidx, 0));
-      EXPECT_EQ(1, postings->term_count(invidx, 0));
+      EXPECT_EQ(1, postings->term_length(invidx, 0));
 
       EXPECT_EQ(7, postings->term_position(invidx, 1));
-      EXPECT_EQ(1, postings->term_count(invidx, 1));
+      EXPECT_EQ(1, postings->term_length(invidx, 1));
 
       EXPECT_EQ(11, postings->term_position(invidx, 2));
-      EXPECT_EQ(1, postings->term_count(invidx, 2));
+      EXPECT_EQ(1, postings->term_length(invidx, 2));
 
       auto rng = searchlib::text_range(text_range_list, *postings, invidx, 2);
       EXPECT_EQ(59, rng.position);
@@ -130,7 +130,7 @@ TEST(TermTest, TermSearch) {
       EXPECT_EQ(1, postings->search_hit_count(invidx));
 
       EXPECT_EQ(3, postings->term_position(invidx, 0));
-      EXPECT_EQ(1, postings->term_count(invidx, 0));
+      EXPECT_EQ(1, postings->term_length(invidx, 0));
 
       auto rng = searchlib::text_range(text_range_list, *postings, invidx, 0);
       EXPECT_EQ(12, rng.position);
@@ -143,7 +143,7 @@ TEST(TermTest, TermSearch) {
       EXPECT_EQ(1, postings->search_hit_count(invidx));
 
       EXPECT_EQ(8, postings->term_position(invidx, 0));
-      EXPECT_EQ(1, postings->term_count(invidx, 0));
+      EXPECT_EQ(1, postings->term_length(invidx, 0));
 
       auto rng = searchlib::text_range(text_range_list, *postings, invidx, 0);
       EXPECT_EQ(40, rng.position);
@@ -175,7 +175,7 @@ TEST(AndTest, AndSearch) {
       {
         auto hit_index = 1;
         EXPECT_EQ(3, postings->term_position(invidx, hit_index));
-        EXPECT_EQ(1, postings->term_count(invidx, hit_index));
+        EXPECT_EQ(1, postings->term_length(invidx, hit_index));
 
         auto rng =
             searchlib::text_range(text_range_list, *postings, invidx, hit_index);
@@ -186,7 +186,7 @@ TEST(AndTest, AndSearch) {
       {
         auto hit_index = 3;
         EXPECT_EQ(8, postings->term_position(invidx, hit_index));
-        EXPECT_EQ(1, postings->term_count(invidx, hit_index));
+        EXPECT_EQ(1, postings->term_length(invidx, hit_index));
 
         auto rng =
             searchlib::text_range(text_range_list, *postings, invidx, hit_index);
@@ -197,7 +197,7 @@ TEST(AndTest, AndSearch) {
       {
         auto hit_index = 5;
         EXPECT_EQ(12, postings->term_position(invidx, hit_index));
-        EXPECT_EQ(1, postings->term_count(invidx, hit_index));
+        EXPECT_EQ(1, postings->term_length(invidx, hit_index));
 
         auto rng =
             searchlib::text_range(text_range_list, *postings, invidx, hit_index);
@@ -231,7 +231,7 @@ TEST(OrTest, OrSearch) {
       {
         auto hit_index = 0;
         EXPECT_EQ(3, postings->term_position(invidx, hit_index));
-        EXPECT_EQ(1, postings->term_count(invidx, hit_index));
+        EXPECT_EQ(1, postings->term_length(invidx, hit_index));
 
         auto rng =
             searchlib::text_range(text_range_list, *postings, invidx, hit_index);
@@ -248,7 +248,7 @@ TEST(OrTest, OrSearch) {
       {
         auto hit_index = 0;
         EXPECT_EQ(3, postings->term_position(invidx, hit_index));
-        EXPECT_EQ(1, postings->term_count(invidx, hit_index));
+        EXPECT_EQ(1, postings->term_length(invidx, hit_index));
 
         auto rng =
             searchlib::text_range(text_range_list, *postings, invidx, hit_index);
@@ -259,7 +259,7 @@ TEST(OrTest, OrSearch) {
       {
         auto hit_index = 1;
         EXPECT_EQ(8, postings->term_position(invidx, hit_index));
-        EXPECT_EQ(1, postings->term_count(invidx, hit_index));
+        EXPECT_EQ(1, postings->term_length(invidx, hit_index));
 
         auto rng =
             searchlib::text_range(text_range_list, *postings, invidx, hit_index);
@@ -270,7 +270,7 @@ TEST(OrTest, OrSearch) {
       {
         auto hit_index = 2;
         EXPECT_EQ(12, postings->term_position(invidx, hit_index));
-        EXPECT_EQ(1, postings->term_count(invidx, hit_index));
+        EXPECT_EQ(1, postings->term_length(invidx, hit_index));
 
         auto rng =
             searchlib::text_range(text_range_list, *postings, invidx, hit_index);
@@ -287,7 +287,7 @@ TEST(OrTest, OrSearch) {
       {
         auto hit_index = 0;
         EXPECT_EQ(0, postings->term_position(invidx, hit_index));
-        EXPECT_EQ(1, postings->term_count(invidx, hit_index));
+        EXPECT_EQ(1, postings->term_length(invidx, hit_index));
 
         auto rng =
             searchlib::text_range(text_range_list, *postings, invidx, hit_index);
@@ -321,7 +321,7 @@ TEST(AdjacentTest, AdjacentSearch) {
       {
         auto hit_index = 0;
         EXPECT_EQ(1, postings->term_position(invidx, hit_index));
-        EXPECT_EQ(2, postings->term_count(invidx, hit_index));
+        EXPECT_EQ(2, postings->term_length(invidx, hit_index));
 
         auto rng =
             searchlib::text_range(text_range_list, *postings, invidx, hit_index);
@@ -338,7 +338,7 @@ TEST(AdjacentTest, AdjacentSearch) {
       {
         auto hit_index = 0;
         EXPECT_EQ(1, postings->term_position(invidx, hit_index));
-        EXPECT_EQ(2, postings->term_count(invidx, hit_index));
+        EXPECT_EQ(2, postings->term_length(invidx, hit_index));
 
         auto rng =
             searchlib::text_range(text_range_list, *postings, invidx, hit_index);
@@ -355,7 +355,7 @@ TEST(AdjacentTest, AdjacentSearch) {
       {
         auto hit_index = 0;
         EXPECT_EQ(1, postings->term_position(invidx, hit_index));
-        EXPECT_EQ(2, postings->term_count(invidx, hit_index));
+        EXPECT_EQ(2, postings->term_length(invidx, hit_index));
 
         auto rng =
             searchlib::text_range(text_range_list, *postings, invidx, hit_index);
@@ -366,7 +366,7 @@ TEST(AdjacentTest, AdjacentSearch) {
       {
         auto hit_index = 1;
         EXPECT_EQ(6, postings->term_position(invidx, hit_index));
-        EXPECT_EQ(2, postings->term_count(invidx, hit_index));
+        EXPECT_EQ(2, postings->term_length(invidx, hit_index));
 
         auto rng =
             searchlib::text_range(text_range_list, *postings, invidx, hit_index);
@@ -400,7 +400,7 @@ TEST(AdjacentTest, AdjacentSearchWith3Words) {
       {
         auto hit_index = 0;
         EXPECT_EQ(7, postings->term_position(invidx, hit_index));
-        EXPECT_EQ(3, postings->term_count(invidx, hit_index));
+        EXPECT_EQ(3, postings->term_length(invidx, hit_index));
 
         auto rng =
             searchlib::text_range(text_range_list, *postings, invidx, hit_index);
@@ -434,7 +434,7 @@ TEST(NearTest, NearSearch) {
       {
         auto hit_index = 0;
         EXPECT_EQ(3, postings->term_position(invidx, hit_index));
-        EXPECT_EQ(1, postings->term_count(invidx, hit_index));
+        EXPECT_EQ(1, postings->term_length(invidx, hit_index));
 
         auto rng =
             searchlib::text_range(text_range_list, *postings, invidx, hit_index);
@@ -445,7 +445,7 @@ TEST(NearTest, NearSearch) {
       {
         auto hit_index = 1;
         EXPECT_EQ(4, postings->term_position(invidx, hit_index));
-        EXPECT_EQ(1, postings->term_count(invidx, hit_index));
+        EXPECT_EQ(1, postings->term_length(invidx, hit_index));
 
         auto rng =
             searchlib::text_range(text_range_list, *postings, invidx, hit_index);
@@ -462,7 +462,7 @@ TEST(NearTest, NearSearch) {
       {
         auto hit_index = 0;
         EXPECT_EQ(4, postings->term_position(invidx, hit_index));
-        EXPECT_EQ(1, postings->term_count(invidx, hit_index));
+        EXPECT_EQ(1, postings->term_length(invidx, hit_index));
 
         auto rng =
             searchlib::text_range(text_range_list, *postings, invidx, hit_index);
@@ -473,7 +473,7 @@ TEST(NearTest, NearSearch) {
       {
         auto hit_index = 1;
         EXPECT_EQ(8, postings->term_position(invidx, hit_index));
-        EXPECT_EQ(1, postings->term_count(invidx, hit_index));
+        EXPECT_EQ(1, postings->term_length(invidx, hit_index));
 
         auto rng =
             searchlib::text_range(text_range_list, *postings, invidx, hit_index);
@@ -507,7 +507,7 @@ TEST(NearTest, NearSearchWithPhrase) {
       {
         auto hit_index = 0;
         EXPECT_EQ(6, postings->term_position(invidx, hit_index));
-        EXPECT_EQ(2, postings->term_count(invidx, hit_index));
+        EXPECT_EQ(2, postings->term_length(invidx, hit_index));
 
         auto rng =
             searchlib::text_range(text_range_list, *postings, invidx, hit_index);
@@ -518,7 +518,7 @@ TEST(NearTest, NearSearchWithPhrase) {
       {
         auto hit_index = 1;
         EXPECT_EQ(9, postings->term_position(invidx, hit_index));
-        EXPECT_EQ(1, postings->term_count(invidx, hit_index));
+        EXPECT_EQ(1, postings->term_length(invidx, hit_index));
 
         auto rng =
             searchlib::text_range(text_range_list, *postings, invidx, hit_index);
@@ -548,64 +548,44 @@ TEST(TF_IDF_Test, TF_IDF) {
     auto term = U"apple";
 
     EXPECT_EQ(1, invidx.df(term));
-    EXPECT_AP(1, invidx.idf(term));
 
     EXPECT_EQ(0.25, invidx.tf(term, 0));
-    EXPECT_AP(0.25, invidx.tf_idf(term, 0));
-
     EXPECT_EQ(0, invidx.tf(term, 1));
-    EXPECT_AP(0, invidx.tf_idf(term, 1));
   }
 
   {
     auto term = U"orange";
 
     EXPECT_EQ(2, invidx.df(term));
-    EXPECT_EQ(0, invidx.idf(term));
 
     EXPECT_EQ(0.5, invidx.tf(term, 0));
-    EXPECT_AP(0, invidx.tf_idf(term, 0));
-
     EXPECT_EQ(0.2, invidx.tf(term, 1));
-    EXPECT_AP(0, invidx.tf_idf(term, 1));
   }
 
   {
     auto term = U"banana";
 
     EXPECT_EQ(2, invidx.df(term));
-    EXPECT_EQ(0, invidx.idf(term));
 
     EXPECT_EQ(0.25, invidx.tf(term, 0));
-    EXPECT_AP(0, invidx.tf_idf(term, 0));
-
     EXPECT_EQ(0.2, invidx.tf(term, 1));
-    EXPECT_AP(0, invidx.tf_idf(term, 1));
   }
 
   {
     auto term = U"strawberry";
 
     EXPECT_EQ(1, invidx.df(term));
-    EXPECT_AP(1, invidx.idf(term));
 
     EXPECT_EQ(0, invidx.tf(term, 0));
-    EXPECT_AP(0, invidx.tf_idf(term, 0));
-
     EXPECT_EQ(0.4, invidx.tf(term, 1));
-    EXPECT_AP(0.4, invidx.tf_idf(term, 1));
   }
 
   {
     auto term = U"grape";
 
     EXPECT_EQ(1, invidx.df(term));
-    EXPECT_AP(1, invidx.idf(term));
 
     EXPECT_EQ(0, invidx.tf(term, 0));
-    EXPECT_AP(0, invidx.tf_idf(term, 0));
-
     EXPECT_EQ(0.2, invidx.tf(term, 1));
-    EXPECT_AP(0.2, invidx.tf_idf(term, 1));
   }
 }
