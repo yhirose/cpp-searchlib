@@ -6,39 +6,34 @@
 
 #include "test_utils.h"
 
+using namespace searchlib;
+
 const auto KJV_PATH = "../../test/t_kjv_chapters.tsv";
 
-static void kjv_index(searchlib::InvertedIndex &invidx,
-                      searchlib::TextRangeList &text_range_list) {
-  searchlib::Indexer::set_normalizer(
-      invidx, [](auto sv) { return unicode::to_lowercase(sv); });
+auto normalizer = [](auto sv) { return unicode::to_lowercase(sv); };
 
-  std::ifstream fs(KJV_PATH);
-  if (fs) {
-    std::string line;
-    while (std::getline(fs, line)) {
-      auto fields = split(line, '\t');
-      auto document_id = std::stoi(fields[0]);
-      const auto &s = fields[1];
+static auto kjv_index() {
+  return make_in_memory_index<TextRange>(normalizer, [&](auto &indexer) {
+    std::ifstream fs(KJV_PATH);
+    if (fs) {
+      std::string line;
+      while (std::getline(fs, line)) {
+        auto fields = split(line, '\t');
+        auto document_id = std::stoi(fields[0]);
+        const auto &s = fields[1];
 
-      std::vector<searchlib::TextRange> text_ranges;
-      searchlib::UTF8PlainTextTokenizer tokenizer(s, text_ranges);
-
-      searchlib::Indexer::indexing(invidx, document_id, tokenizer);
-
-      text_range_list.emplace(document_id, std::move(text_ranges));
+        indexer.index_document(document_id, UTF8PlainTextTokenizer(s));
+      }
     }
-  }
+  });
 }
 
 TEST(KJVChapterTest, SimpleTest) {
-  searchlib::InvertedIndex invidx;
-  searchlib::TextRangeList text_range_list;
-
-  kjv_index(invidx, text_range_list);
+  auto p = kjv_index();
+  const auto &invidx = *p;
 
   {
-    auto expr = parse_query(invidx, R"( apple )");
+    auto expr = parse_query(invidx, normalizer, R"( apple )");
     ASSERT_TRUE(expr);
 
     auto postings = perform_search(invidx, *expr);
@@ -66,27 +61,27 @@ TEST(KJVChapterTest, SimpleTest) {
     EXPECT_EQ(1, postings->search_hit_count(6));
     EXPECT_EQ(1, postings->search_hit_count(7));
 
-    EXPECT_AP(0.00549139, searchlib::tf_idf_score(invidx, *expr, *postings, 0));
-    EXPECT_AP(0.0230779, searchlib::tf_idf_score(invidx, *expr, *postings, 1));
-    EXPECT_AP(0.0174205, searchlib::tf_idf_score(invidx, *expr, *postings, 2));
-    EXPECT_AP(0.020448, searchlib::tf_idf_score(invidx, *expr, *postings, 3));
-    EXPECT_AP(0.0198816, searchlib::tf_idf_score(invidx, *expr, *postings, 4));
-    EXPECT_AP(0.00811905, searchlib::tf_idf_score(invidx, *expr, *postings, 5));
-    EXPECT_AP(0.0141007, searchlib::tf_idf_score(invidx, *expr, *postings, 6));
-    EXPECT_AP(0.0226411, searchlib::tf_idf_score(invidx, *expr, *postings, 7));
+    EXPECT_AP(0.00549139, tf_idf_score(invidx, *expr, *postings, 0));
+    EXPECT_AP(0.0230779, tf_idf_score(invidx, *expr, *postings, 1));
+    EXPECT_AP(0.0174205, tf_idf_score(invidx, *expr, *postings, 2));
+    EXPECT_AP(0.020448, tf_idf_score(invidx, *expr, *postings, 3));
+    EXPECT_AP(0.0198816, tf_idf_score(invidx, *expr, *postings, 4));
+    EXPECT_AP(0.00811905, tf_idf_score(invidx, *expr, *postings, 5));
+    EXPECT_AP(0.0141007, tf_idf_score(invidx, *expr, *postings, 6));
+    EXPECT_AP(0.0226411, tf_idf_score(invidx, *expr, *postings, 7));
 
-    EXPECT_AP(0.00583253, searchlib::bm25_score(invidx, *expr, *postings, 0));
-    EXPECT_AP(0.0697716, searchlib::bm25_score(invidx, *expr, *postings, 1));
-    EXPECT_AP(0.0443892, searchlib::bm25_score(invidx, *expr, *postings, 2));
-    EXPECT_AP(0.0575726, searchlib::bm25_score(invidx, *expr, *postings, 3));
-    EXPECT_AP(0.0550316, searchlib::bm25_score(invidx, *expr, *postings, 4));
-    EXPECT_AP(0.011908, searchlib::bm25_score(invidx, *expr, *postings, 5));
-    EXPECT_AP(0.0312082, searchlib::bm25_score(invidx, *expr, *postings, 6));
-    EXPECT_AP(0.0677023, searchlib::bm25_score(invidx, *expr, *postings, 7));
+    EXPECT_AP(0.00583253, bm25_score(invidx, *expr, *postings, 0));
+    EXPECT_AP(0.0697716, bm25_score(invidx, *expr, *postings, 1));
+    EXPECT_AP(0.0443892, bm25_score(invidx, *expr, *postings, 2));
+    EXPECT_AP(0.0575726, bm25_score(invidx, *expr, *postings, 3));
+    EXPECT_AP(0.0550316, bm25_score(invidx, *expr, *postings, 4));
+    EXPECT_AP(0.011908, bm25_score(invidx, *expr, *postings, 5));
+    EXPECT_AP(0.0312082, bm25_score(invidx, *expr, *postings, 6));
+    EXPECT_AP(0.0677023, bm25_score(invidx, *expr, *postings, 7));
   }
 
   {
-    auto expr = parse_query(invidx, R"( apple tree )");
+    auto expr = parse_query(invidx, normalizer, R"( apple tree )");
     ASSERT_TRUE(expr);
 
     auto postings = perform_search(invidx, *expr);
@@ -101,17 +96,17 @@ TEST(KJVChapterTest, SimpleTest) {
     EXPECT_EQ(2, postings->search_hit_count(1));
     EXPECT_EQ(6, postings->search_hit_count(2));
 
-    EXPECT_AP(0.0391522, searchlib::tf_idf_score(invidx, *expr, *postings, 0));
-    EXPECT_AP(0.0289746, searchlib::tf_idf_score(invidx, *expr, *postings, 1));
-    EXPECT_AP(0.0463462, searchlib::tf_idf_score(invidx, *expr, *postings, 2));
+    EXPECT_AP(0.0391522, tf_idf_score(invidx, *expr, *postings, 0));
+    EXPECT_AP(0.0289746, tf_idf_score(invidx, *expr, *postings, 1));
+    EXPECT_AP(0.0463462, tf_idf_score(invidx, *expr, *postings, 2));
 
-    EXPECT_AP(0.108137, searchlib::bm25_score(invidx, *expr, *postings, 0));
-    EXPECT_AP(0.079287, searchlib::bm25_score(invidx, *expr, *postings, 1));
-    EXPECT_AP(0.0994374, searchlib::bm25_score(invidx, *expr, *postings, 2));
+    EXPECT_AP(0.108137, bm25_score(invidx, *expr, *postings, 0));
+    EXPECT_AP(0.079287, bm25_score(invidx, *expr, *postings, 1));
+    EXPECT_AP(0.0994374, bm25_score(invidx, *expr, *postings, 2));
   }
 
   {
-    auto expr = parse_query(invidx, R"( Joshua Jericho )");
+    auto expr = parse_query(invidx, normalizer, R"( Joshua Jericho )");
     ASSERT_TRUE(expr);
 
     auto postings = perform_search(invidx, *expr);
@@ -143,8 +138,7 @@ TEST(KJVChapterTest, SimpleTest) {
             0.10183, 0.077544, 0.0654762, 0.0724664, 0.0583369, 0.103775,
             0.0289974, 0.0114411, 0.0426484, 0.0306458, 0.0671168,
             0.00910212}) {
-        EXPECT_AP(expected,
-                  searchlib::tf_idf_score(invidx, *expr, *postings, i));
+        EXPECT_AP(expected, tf_idf_score(invidx, *expr, *postings, i));
         i++;
       }
     }
@@ -155,7 +149,7 @@ TEST(KJVChapterTest, SimpleTest) {
            {0.00955058, 0.0284355, 0.131614, 0.059746, 0.117627, 0.148535,
             0.209976, 0.110549, 0.0916737, 0.0807503, 0.091753, 0.103232,
             0.066022, 0.017691, 0.0693532, 0.0930067, 0.0853508, 0.0117135}) {
-        EXPECT_AP(expected, searchlib::bm25_score(invidx, *expr, *postings, i));
+        EXPECT_AP(expected, bm25_score(invidx, *expr, *postings, i));
         i++;
       }
     }

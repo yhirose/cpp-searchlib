@@ -1,5 +1,5 @@
 //
-//  plain_utf8_tokenizer.cpp
+//  tokenizer.cpp
 //
 //  Copyright (c) 2021 Yuji Hirose. All rights reserved.
 //  MIT License
@@ -13,18 +13,32 @@ using namespace unicode;
 
 namespace searchlib {
 
+TextRange text_range(const TextRangeList<TextRange> &text_range_list,
+                     const IPostings &positions, size_t index,
+                     size_t search_hit_index) {
+  auto document_id = positions.document_id(index);
+  auto term_pos = positions.term_position(index, search_hit_index);
+  auto term_length = positions.term_length(index, search_hit_index);
+  if (term_length == 1) {
+    return text_range_list.at(document_id)[term_pos];
+  } else {
+    auto beg = text_range_list.at(document_id)[term_pos];
+    auto end = text_range_list.at(document_id)[term_pos + term_length - 1];
+    auto length = end.position + end.length - beg.position;
+    return TextRange{beg.position, length};
+  }
+}
+
 //-----------------------------------------------------------------------------
 
 UTF8PlainTextTokenizer::UTF8PlainTextTokenizer(std::string_view text)
     : text_(text) {}
 
-UTF8PlainTextTokenizer::UTF8PlainTextTokenizer(
-    std::string_view text, std::vector<TextRange> &text_ranges)
-    : text_(text), text_ranges_(&text_ranges) {}
-
-void UTF8PlainTextTokenizer::tokenize(
-    std::function<std::u32string(const std::u32string &str)> normalizer,
-    std::function<void(const std::u32string &str, size_t term_pos)> callback) {
+void UTF8PlainTextTokenizer::operator()(
+    Normalizer normalizer,
+    std::function<void(const std::u32string &str, size_t term_pos,
+                       TextRange text_range)>
+        callback) {
   size_t pos = 0;
   size_t term_pos = 0;
   while (pos < text_.size()) {
@@ -53,13 +67,11 @@ void UTF8PlainTextTokenizer::tokenize(
     }
 
     if (!str.empty()) {
-      callback((normalizer ? normalizer(str) : str), term_pos);
-      if (text_ranges_) {
-        text_ranges_->push_back({beg, pos - beg});
-      }
+      callback((normalizer ? normalizer(str) : str), term_pos,
+               {beg, pos - beg});
       term_pos++;
     }
   }
 }
 
-}  // namespace searchlib
+} // namespace searchlib

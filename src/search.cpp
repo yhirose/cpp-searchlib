@@ -16,7 +16,7 @@
 namespace searchlib {
 
 class TermSearchResult : public IPostings {
- public:
+public:
   TermSearchResult(const IInvertedIndex &inverted_index,
                    const std::u32string &str)
       : postings_(inverted_index.postings(str)) {}
@@ -45,18 +45,17 @@ class TermSearchResult : public IPostings {
     return postings_.is_term_position(index, term_pos);
   }
 
- private:
+private:
   const IPostings &postings_;
 };
 
 //-----------------------------------------------------------------------------
 
 class Position {
- public:
+public:
   Position(size_t document_id, std::vector<size_t> &&term_positions,
            std::vector<size_t> &&term_lengths)
-      : document_id_(document_id),
-        term_positions_(term_positions),
+      : document_id_(document_id), term_positions_(term_positions),
         term_lengths(term_lengths) {}
 
   ~Position() = default;
@@ -78,14 +77,14 @@ class Position {
                               term_pos);
   }
 
- private:
+private:
   size_t document_id_;
   std::vector<size_t> term_positions_;
   std::vector<size_t> term_lengths;
 };
 
 class SearchResult : public IPostings {
- public:
+public:
   ~SearchResult() override = default;
 
   size_t size() const override { return positions_.size(); }
@@ -110,9 +109,11 @@ class SearchResult : public IPostings {
     return positions_[index]->is_term_position(term_pos);
   }
 
-  void push_back(std::shared_ptr<Position> info) { positions_.push_back(std::move(info)); }
+  void push_back(std::shared_ptr<Position> info) {
+    positions_.push_back(std::move(info));
+  }
 
- private:
+private:
   std::vector<std::shared_ptr<Position>> positions_;
 };
 
@@ -127,9 +128,9 @@ static auto positings_list(const IInvertedIndex &inverted_index,
   return positings_list;
 }
 
-static std::vector<size_t /*slot*/> min_slots(
-    const std::vector<std::shared_ptr<IPostings>> &positings_list,
-    const std::vector<size_t> &cursors) {
+static std::vector<size_t /*slot*/>
+min_slots(const std::vector<std::shared_ptr<IPostings>> &positings_list,
+          const std::vector<size_t> &cursors) {
   std::vector<size_t> slots = {0};
 
   for (size_t slot = 1; slot < positings_list.size(); slot++) {
@@ -147,9 +148,9 @@ static std::vector<size_t /*slot*/> min_slots(
   return slots;
 }
 
-static std::pair<size_t /*min*/, size_t /*max*/> min_max_slots(
-    const std::vector<std::shared_ptr<IPostings>> &positings_list,
-    const std::vector<size_t> &cursors) {
+static std::pair<size_t /*min*/, size_t /*max*/>
+min_max_slots(const std::vector<std::shared_ptr<IPostings>> &positings_list,
+              const std::vector<size_t> &cursors) {
   auto min = positings_list[0]->document_id(cursors[0]);
   auto max = min;
 
@@ -165,9 +166,9 @@ static std::pair<size_t /*min*/, size_t /*max*/> min_max_slots(
   return std::make_pair(min, max);
 }
 
-static bool skip_cursors(
-    const std::vector<std::shared_ptr<IPostings>> &positings_list,
-    std::vector<size_t> &cursors, size_t document_id) {
+static bool
+skip_cursors(const std::vector<std::shared_ptr<IPostings>> &positings_list,
+             std::vector<size_t> &cursors, size_t document_id) {
   for (size_t slot = 0; slot < positings_list.size(); slot++) {
     // TODO: skip list support
     while (cursors[slot] < positings_list[slot]->size()) {
@@ -196,9 +197,10 @@ static bool increment_all_cursors(
   return false;
 }
 
-static void increment_cursors(
-    std::vector<std::shared_ptr<IPostings>> &positings_list,
-    std::vector<size_t> &cursors, const std::vector<size_t> &slots) {
+static void
+increment_cursors(std::vector<std::shared_ptr<IPostings>> &positings_list,
+                  std::vector<size_t> &cursors,
+                  const std::vector<size_t> &slots) {
   for (int i = slots.size() - 1; i >= 0; i--) {
     auto slot = slots[i];
     cursors[slot]++;
@@ -209,9 +211,9 @@ static void increment_cursors(
   }
 }
 
-static size_t shortest_slot(
-    const std::vector<std::shared_ptr<IPostings>> &positings_list,
-    const std::vector<size_t> &cursors) {
+static size_t
+shortest_slot(const std::vector<std::shared_ptr<IPostings>> &positings_list,
+              const std::vector<size_t> &cursors) {
   size_t shortest_slot = 0;
   auto shortest_count =
       positings_list[shortest_slot]->search_hit_count(cursors[shortest_slot]);
@@ -225,9 +227,10 @@ static size_t shortest_slot(
   return shortest_slot;
 }
 
-static bool is_adjacent(
-    const std::vector<std::shared_ptr<IPostings>> &positings_list,
-    const std::vector<size_t> &cursors, size_t target_slot, size_t term_pos) {
+static bool
+is_adjacent(const std::vector<std::shared_ptr<IPostings>> &positings_list,
+            const std::vector<size_t> &cursors, size_t target_slot,
+            size_t term_pos) {
   auto ret = true;
 
   for (size_t slot = 0; ret && slot < positings_list.size(); slot++) {
@@ -306,8 +309,8 @@ static void merge_term_positions(
   }
 }
 
-static std::shared_ptr<IPostings> union_postings(
-    std::vector<std::shared_ptr<IPostings>> &&positings_list) {
+static std::shared_ptr<IPostings>
+union_postings(std::vector<std::shared_ptr<IPostings>> &&positings_list) {
   auto result = std::make_shared<SearchResult>();
   std::vector<size_t> cursors(positings_list.size(), 0);
 
@@ -332,13 +335,15 @@ static std::shared_ptr<IPostings> union_postings(
 
 //-----------------------------------------------------------------------------
 
-static std::shared_ptr<IPostings> perform_term_operation(
-    const IInvertedIndex &inverted_index, const Expression &expr) {
+static std::shared_ptr<IPostings>
+perform_term_operation(const IInvertedIndex &inverted_index,
+                       const Expression &expr) {
   return std::make_shared<TermSearchResult>(inverted_index, expr.term_str);
 }
 
-static std::shared_ptr<IPostings> perform_and_operation(
-    const IInvertedIndex &inverted_index, const Expression &expr) {
+static std::shared_ptr<IPostings>
+perform_and_operation(const IInvertedIndex &inverted_index,
+                      const Expression &expr) {
   return intersect_postings(
       positings_list(inverted_index, expr.nodes),
       [](const auto &positings_list, const auto &cursors) {
@@ -356,8 +361,9 @@ static std::shared_ptr<IPostings> perform_and_operation(
       });
 }
 
-static std::shared_ptr<IPostings> perform_adjacent_operation(
-    const IInvertedIndex &inverted_index, const Expression &expr) {
+static std::shared_ptr<IPostings>
+perform_adjacent_operation(const IInvertedIndex &inverted_index,
+                           const Expression &expr) {
   return intersect_postings(
       positings_list(inverted_index, expr.nodes),
       [](const auto &positings_list, const auto &cursors) {
@@ -389,13 +395,15 @@ static std::shared_ptr<IPostings> perform_adjacent_operation(
       });
 }
 
-static std::shared_ptr<IPostings> perform_or_operation(
-    const IInvertedIndex &inverted_index, const Expression &expr) {
+static std::shared_ptr<IPostings>
+perform_or_operation(const IInvertedIndex &inverted_index,
+                     const Expression &expr) {
   return union_postings(positings_list(inverted_index, expr.nodes));
 }
 
-static std::shared_ptr<IPostings> perform_near_operation(
-    const IInvertedIndex &inverted_index, const Expression &expr) {
+static std::shared_ptr<IPostings>
+perform_near_operation(const IInvertedIndex &inverted_index,
+                       const Expression &expr) {
   return intersect_postings(
       positings_list(inverted_index, expr.nodes),
       [&](const auto &positings_list, const auto &cursors) {
@@ -481,23 +489,22 @@ static std::shared_ptr<IPostings> perform_near_operation(
 std::shared_ptr<IPostings> perform_search(const IInvertedIndex &inverted_index,
                                           const Expression &expr) {
   switch (expr.operation) {
-    case Operation::Term:
-      return perform_term_operation(inverted_index, expr);
-    case Operation::And:
-      return perform_and_operation(inverted_index, expr);
-    case Operation::Adjacent:
-      return perform_adjacent_operation(inverted_index, expr);
-    case Operation::Or:
-      return perform_or_operation(inverted_index, expr);
-    case Operation::Near:
-      return perform_near_operation(inverted_index, expr);
-    default:
-      return nullptr;
+  case Operation::Term:
+    return perform_term_operation(inverted_index, expr);
+  case Operation::And:
+    return perform_and_operation(inverted_index, expr);
+  case Operation::Adjacent:
+    return perform_adjacent_operation(inverted_index, expr);
+  case Operation::Or:
+    return perform_or_operation(inverted_index, expr);
+  case Operation::Near:
+    return perform_near_operation(inverted_index, expr);
+  default:
+    return nullptr;
   }
 }
 
-template <typename T>
-void enumerate_terms(const Expression &expr, T fn) {
+template <typename T> void enumerate_terms(const Expression &expr, T fn) {
   if (expr.operation == Operation::Term) {
     fn(expr.term_str);
   } else {
@@ -550,4 +557,4 @@ double bm25_score(const IInvertedIndex &invidx, const Expression &expr,
   return score;
 }
 
-}  // namespace searchlib
+} // namespace searchlib

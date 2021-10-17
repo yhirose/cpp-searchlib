@@ -8,6 +8,8 @@ TODO:
 - [ ] Search scope (document, section, paragraph)
 
 ```cpp
+using namespace searchlib;
+
 std::vector<std::string> documents = {
   "This is the first document.",
   "This is the second document.",
@@ -16,29 +18,20 @@ std::vector<std::string> documents = {
 };
 
 // Indexing...
-searchlib::InvertedIndex index;
-searchlib::TextRangeList text_range_list;
+auto normalizer = [](auto str) { return unicode::to_lowercase(str); };
 
-{
-  searchlib::Indexer::set_normalizer(
-    index, [](auto str) { return unicode::to_lowercase(str); });
-
+auto index = make_in_memory_index<TextRange>(normalizer, [&](auto &indexer) {
   size_t document_id = 0;
   for (const auto &doc : documents) {
-    std::vector<searchlib::TextRange> text_ranges;
-    searchlib::UTF8PlainTextTokenizer tokenizer(doc, text_ranges);
-
-    searchlib::Indexer::indexing(index, tokenizer, document_id);
-
-    text_range_list.emplace(document_id, std::move(text_ranges));
+    indexer.index_document(document_id, UTF8PlainTextTokenizer(doc));
     document_id++;
   }
-}
+};
 
 // Search...
-auto expr = searchlib::parse_query(index, R"( first not | "the second sentence" )");
+auto expr = parse_query(*index, normalizer, R"( first not | "the second sentence" )");
 
-auto result = searchlib::perform_search(index, *expr);
+auto result = perform_search(*index, *expr);
 result->size(); // 2
 
 result->document_id(0); // 2
@@ -47,9 +40,7 @@ result->search_hit_count(0); // 1
   // 'the second sentence'
   result->term_position(0, 1); // 7
   result->term_length(0, 1); // 3
-  auto rng = searchlib::text_range(text_range_list, *result, 0, 1);
-  rng.position; // 36
-  rng.length; // 19
+  auto [pos, len] = index->text_range(*result, 0, 1); // 36, 19
 
 result->document_id(1); // 3
 result->search_hit_count(1); // 2
@@ -57,14 +48,10 @@ result->search_hit_count(1); // 2
   // 'not'
   result->term_position(1, 0); // 2
   result->term_length(1, 0); // 1
-  auto rng = searchlib::text_range(text_range_list, *result, 1, 0);
-  rng.position; // 8
-  rng.length; // 3
+  auto [pos, len] = index->text_range(*result, 1, 0); // 8, 3
 
   // 'first'
   result->term_position(1, 1); // 4
   result->term_length(1, 1); // 1
-  auto rng = searchlib::text_range(text_range_list, *result, 1, 1);
-  rng.position; // 16
-  rng.length; // 5
+  auto [pos, len] = index->text_range(*result, 1, 1); // 16, 5
 ```

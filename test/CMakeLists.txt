@@ -18,11 +18,9 @@ add_executable(
   test_kjv.cc
   test_kjv_chapters.cc
   ../src/utils.cpp
-  ../src/indexer.cpp
   ../src/invertedindex.cpp
   ../src/search.cpp
   ../src/query.cpp
-  ../src/textrange.cpp
   ../src/tokenizer.cpp
 )
 
