@@ -19,7 +19,7 @@ void sample_index(searchlib::InvertedIndex &invidx,
   size_t document_id = 0;
   for (const auto &doc : sample_documents) {
     std::vector<searchlib::TextRange> text_ranges;
-    searchlib::UTF8PlainTextTokenizer tokenizer(doc, &text_ranges);
+    searchlib::UTF8PlainTextTokenizer tokenizer(doc, text_ranges);
 
     searchlib::Indexer::indexing(invidx, document_id, tokenizer);
 
@@ -46,7 +46,7 @@ TEST(TokenizerTest, UTF8PlainTextTokenizer) {
   size_t document_id = 0;
   for (const auto &doc : sample_documents) {
     std::vector<searchlib::TextRange> text_ranges;
-    searchlib::UTF8PlainTextTokenizer tokenizer(doc, &text_ranges);
+    searchlib::UTF8PlainTextTokenizer tokenizer(doc, text_ranges);
     std::vector<std::string> actual;
     tokenizer.tokenize(
         [](auto sv) { return unicode::to_lowercase(sv); },

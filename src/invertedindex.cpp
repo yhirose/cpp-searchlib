@@ -83,7 +83,7 @@ double InvertedIndex::average_document_term_count() const {
       buffs.back().first += document.term_count;
       buffs.back().second += 1;
     } else {
-      buffs.push_back({document.term_count, 1});
+      buffs.emplace_back(std::pair(document.term_count, 1));
     }
   }
 

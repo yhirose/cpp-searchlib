@@ -110,7 +110,7 @@ class SearchResult : public IPostings {
     return positions_[index]->is_term_position(term_pos);
   }
 
-  void push_back(std::shared_ptr<Position> info) { positions_.push_back(info); }
+  void push_back(std::shared_ptr<Position> info) { positions_.push_back(std::move(info)); }
 
  private:
   std::vector<std::shared_ptr<Position>> positions_;
@@ -169,7 +169,7 @@ static bool skip_cursors(
     const std::vector<std::shared_ptr<IPostings>> &positings_list,
     std::vector<size_t> &cursors, size_t document_id) {
   for (size_t slot = 0; slot < positings_list.size(); slot++) {
-    // TODO: skip list suport
+    // TODO: skip list support
     while (cursors[slot] < positings_list[slot]->size()) {
       if (positings_list[slot]->document_id(cursors[slot]) >= document_id) {
         break;
@@ -405,7 +405,7 @@ static std::shared_ptr<IPostings> perform_near_operation(
 
         auto done = false;
         while (!done) {
-          // TODO: performance improvement by resusing values as many as
+          // TODO: performance improvement by reusing values as many as
           // possible
           std::map<size_t /*term_pos*/,
                    std::pair<size_t /*slot*/, size_t /*term_length*/>>
@@ -535,8 +535,8 @@ double bm25_score(const IInvertedIndex &invidx, const Expression &expr,
                   double b) {
   auto document_id = postings.document_id(index);
   auto N = static_cast<double>(invidx.document_count());
-  auto dl = invidx.document_term_count(document_id);
-  auto avgdl = invidx.average_document_term_count();
+  auto dl = static_cast<double>(invidx.document_term_count(document_id));
+  auto avgdl = static_cast<double>(invidx.average_document_term_count());
 
   double score = 0.0;
   enumerate_terms(expr, [&](const auto &term) {

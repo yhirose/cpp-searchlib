@@ -10,11 +10,11 @@
 namespace searchlib {
 
 TextRange text_range(const TextRangeList &text_range_list,
-                     const IPostings &postions, size_t index,
+                     const IPostings &positions, size_t index,
                      size_t search_hit_index) {
-  auto document_id = postions.document_id(index);
-  auto term_pos = postions.term_position(index, search_hit_index);
-  auto term_length = postions.term_length(index, search_hit_index);
+  auto document_id = positions.document_id(index);
+  auto term_pos = positions.term_position(index, search_hit_index);
+  auto term_length = positions.term_length(index, search_hit_index);
   if (term_length == 1) {
     return text_range_list.at(document_id)[term_pos];
   } else {

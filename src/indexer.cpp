@@ -15,7 +15,7 @@ ITokenizer::~ITokenizer() = default;
 void Indexer::set_normalizer(
     InvertedIndex &invidx,
     std::function<std::u32string(const std::u32string &str)> normalizer) {
-  invidx.normalizer_ = normalizer;
+  invidx.normalizer_ = std::move(normalizer);
 }
 
 void Indexer::indexing(InvertedIndex &invidx, size_t document_id,

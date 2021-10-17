@@ -8,7 +8,6 @@
 #include "lib/unicodelib.h"
 #include "lib/unicodelib_encodings.h"
 #include "searchlib.h"
-#include "utils.h"
 
 using namespace unicode;
 
@@ -16,9 +15,12 @@ namespace searchlib {
 
 //-----------------------------------------------------------------------------
 
+UTF8PlainTextTokenizer::UTF8PlainTextTokenizer(std::string_view text)
+    : text_(text) {}
+
 UTF8PlainTextTokenizer::UTF8PlainTextTokenizer(
-    std::string_view text, std::vector<TextRange> *text_ranges)
-    : text_(text), text_ranges_(text_ranges) {}
+    std::string_view text, std::vector<TextRange> &text_ranges)
+    : text_(text), text_ranges_(&text_ranges) {}
 
 void UTF8PlainTextTokenizer::tokenize(
     std::function<std::u32string(const std::u32string &str)> normalizer,

@@ -22,7 +22,7 @@ static void kjv_index(searchlib::InvertedIndex &invidx,
       const auto &s = fields[1];
 
       std::vector<searchlib::TextRange> text_ranges;
-      searchlib::UTF8PlainTextTokenizer tokenizer(s, &text_ranges);
+      searchlib::UTF8PlainTextTokenizer tokenizer(s, text_ranges);
 
       searchlib::Indexer::indexing(invidx, document_id, tokenizer);
 

@@ -100,7 +100,7 @@ using TextRangeList =
     std::unordered_map<size_t /*document_id*/, std::vector<TextRange>>;
 
 TextRange text_range(const TextRangeList &text_range_list,
-                     const IPostings &postions, size_t index,
+                     const IPostings &positions, size_t index,
                      size_t search_hit_index);
 
 //-----------------------------------------------------------------------------
@@ -197,8 +197,10 @@ class Indexer {
 
 class UTF8PlainTextTokenizer : public ITokenizer {
  public:
+  explicit UTF8PlainTextTokenizer(std::string_view text);
+
   UTF8PlainTextTokenizer(std::string_view text,
-                         std::vector<TextRange> *text_ranges = nullptr);
+                         std::vector<TextRange> &text_ranges);
 
   void tokenize(
       std::function<std::u32string(const std::u32string &str)> normalizer,
@@ -207,7 +209,7 @@ class UTF8PlainTextTokenizer : public ITokenizer {
 
  private:
   std::string_view text_;
-  std::vector<TextRange> *text_ranges_;
+  std::vector<TextRange> *text_ranges_ = nullptr;
 };
 
 }  // namespace searchlib
