@@ -5,6 +5,8 @@
 //  MIT License
 //
 
+#include <cassert>
+
 #include "searchlib.h"
 #include "utils.h"
 

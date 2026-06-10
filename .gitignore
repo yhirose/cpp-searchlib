@@ -31,6 +31,10 @@
 *.out
 *.app
 
+.DS_Store
+*.swp
+
+corpus/
 build*/
 cmake-build-*/
 .idea/
