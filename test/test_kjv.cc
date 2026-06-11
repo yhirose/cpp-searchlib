@@ -33,7 +33,7 @@ TEST(KJVTest, SimpleTest) {
   const auto &invidx = kjv_index();
 
   {
-    auto expr = parse_query(invidx, normalizer, R"( apple )");
+    auto expr = parse_query(normalizer, R"( apple )");
     ASSERT_TRUE(expr);
 
     auto postings = perform_search(invidx, *expr);
@@ -63,7 +63,7 @@ TEST(KJVTest, SimpleTest) {
   }
 
   {
-    auto expr = parse_query(invidx, normalizer, R"( "apple tree" )");
+    auto expr = parse_query(normalizer, R"( "apple tree" )");
     ASSERT_TRUE(expr);
 
     auto postings = perform_search(invidx, *expr);

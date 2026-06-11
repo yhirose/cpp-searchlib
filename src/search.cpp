@@ -251,6 +251,18 @@ static std::shared_ptr<IPostings> intersect_postings(
     const std::vector<std::shared_ptr<IPostings>> &positings_list,
     T make_positions) {
   auto result = std::make_shared<SearchResult>();
+
+  if (positings_list.empty()) {
+    return result;
+  }
+
+  // An empty postings list never intersects with others.
+  for (const auto &postings : positings_list) {
+    if (postings->size() == 0) {
+      return result;
+    }
+  }
+
   std::vector<size_t> cursors(positings_list.size(), 0);
 
   auto done = false;
@@ -311,6 +323,11 @@ static void merge_term_positions(
 
 static std::shared_ptr<IPostings>
 union_postings(std::vector<std::shared_ptr<IPostings>> &&positings_list) {
+  positings_list.erase(
+      std::remove_if(positings_list.begin(), positings_list.end(),
+                     [](const auto &postings) { return postings->size() == 0; }),
+      positings_list.end());
+
   auto result = std::make_shared<SearchResult>();
   std::vector<size_t> cursors(positings_list.size(), 0);
 

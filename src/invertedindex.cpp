@@ -108,7 +108,8 @@ bool InMemoryInvertedIndexBase::term_exists(const std::u32string &str) const {
 }
 
 size_t InMemoryInvertedIndexBase::term_count(const std::u32string &str) const {
-  return term_dictionary_.at(str).term_count;
+  auto it = term_dictionary_.find(str);
+  return it != term_dictionary_.end() ? it->second.term_count : 0;
 }
 
 size_t InMemoryInvertedIndexBase::term_count(const std::u32string &str,
@@ -138,7 +139,9 @@ double InMemoryInvertedIndexBase::tf(const std::u32string &str,
 
 const IPostings &
 InMemoryInvertedIndexBase::postings(const std::u32string &str) const {
-  return term_dictionary_.at(str).postings;
+  static const Postings empty_postings;
+  auto it = term_dictionary_.find(str);
+  return it != term_dictionary_.end() ? it->second.postings : empty_postings;
 }
 
 } // namespace searchlib

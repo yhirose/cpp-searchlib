@@ -96,8 +96,7 @@ struct Expression {
   std::vector<Expression> nodes;
 };
 
-std::optional<Expression> parse_query(const IInvertedIndex &invidx,
-                                      Normalizer normalizer,
+std::optional<Expression> parse_query(Normalizer normalizer,
                                       std::string_view query);
 
 std::shared_ptr<IPostings> perform_search(const IInvertedIndex &invidx,

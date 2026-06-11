@@ -38,7 +38,7 @@ TEST(KJVChapterTest, SimpleTest) {
   const auto &invidx = *p;
 
   {
-    auto expr = parse_query(invidx, normalizer, R"( apple )");
+    auto expr = parse_query(normalizer, R"( apple )");
     ASSERT_TRUE(expr);
 
     auto postings = perform_search(invidx, *expr);
@@ -86,7 +86,7 @@ TEST(KJVChapterTest, SimpleTest) {
   }
 
   {
-    auto expr = parse_query(invidx, normalizer, R"( apple tree )");
+    auto expr = parse_query(normalizer, R"( apple tree )");
     ASSERT_TRUE(expr);
 
     auto postings = perform_search(invidx, *expr);
@@ -111,7 +111,7 @@ TEST(KJVChapterTest, SimpleTest) {
   }
 
   {
-    auto expr = parse_query(invidx, normalizer, R"( Joshua Jericho )");
+    auto expr = parse_query(normalizer, R"( Joshua Jericho )");
     ASSERT_TRUE(expr);
 
     auto postings = perform_search(invidx, *expr);

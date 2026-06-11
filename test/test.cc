@@ -58,15 +58,51 @@ TEST(QueryTest, ParsingQuery) {
   const auto &invidx = sample_index();
 
   {
-    auto expr = parse_query(invidx, normalizer, " The ");
+    auto expr = parse_query(normalizer, " The ");
     EXPECT_NE(std::nullopt, expr);
     EXPECT_EQ(Operation::Term, (*expr).operation);
     EXPECT_EQ(U"the", (*expr).term_str);
   }
 
   {
-    auto expr = parse_query(invidx, normalizer, " nothing ");
-    EXPECT_EQ(std::nullopt, expr);
+    auto expr = parse_query(normalizer, " nothing ");
+    EXPECT_NE(std::nullopt, expr);
+    EXPECT_EQ(Operation::Term, (*expr).operation);
+    EXPECT_EQ(U"nothing", (*expr).term_str);
+  }
+}
+
+TEST(QueryTest, UnknownTerm) {
+  const auto &invidx = sample_index();
+
+  {
+    auto expr = parse_query(normalizer, " nothing ");
+    auto postings = perform_search(invidx, *expr);
+    EXPECT_EQ(0, postings->size());
+  }
+
+  {
+    auto expr = parse_query(normalizer, " second | nothing ");
+    auto postings = perform_search(invidx, *expr);
+    EXPECT_EQ(2, postings->size());
+  }
+
+  {
+    auto expr = parse_query(normalizer, " second nothing ");
+    auto postings = perform_search(invidx, *expr);
+    EXPECT_EQ(0, postings->size());
+  }
+
+  {
+    auto expr = parse_query(normalizer, R"( "second nothing" )");
+    auto postings = perform_search(invidx, *expr);
+    EXPECT_EQ(0, postings->size());
+  }
+
+  {
+    auto expr = parse_query(normalizer, " second ~ nothing ");
+    auto postings = perform_search(invidx, *expr);
+    EXPECT_EQ(0, postings->size());
   }
 }
 
@@ -74,7 +110,7 @@ TEST(TermTest, TermSearch) {
   const auto &invidx = sample_index();
 
   {
-    auto expr = parse_query(invidx, normalizer, " The ");
+    auto expr = parse_query(normalizer, " The ");
     auto postings = perform_search(invidx, *expr);
 
     EXPECT_EQ(3, postings->size());
@@ -113,7 +149,7 @@ TEST(TermTest, TermSearch) {
   }
 
   {
-    auto expr = parse_query(invidx, normalizer, " second ");
+    auto expr = parse_query(normalizer, " second ");
     auto postings = perform_search(invidx, *expr);
 
     EXPECT_EQ(2, postings->size());
@@ -150,7 +186,7 @@ TEST(AndTest, AndSearch) {
   const auto &invidx = sample_index();
 
   {
-    auto expr = parse_query(invidx, normalizer, " the second third ");
+    auto expr = parse_query(normalizer, " the second third ");
 
     EXPECT_EQ(Operation::And, expr->operation);
     EXPECT_EQ(3, expr->nodes.size());
@@ -201,7 +237,7 @@ TEST(OrTest, OrSearch) {
   const auto &invidx = sample_index();
 
   {
-    auto expr = parse_query(invidx, normalizer, " third | HELLO | second ");
+    auto expr = parse_query(normalizer, " third | HELLO | second ");
 
     EXPECT_EQ(Operation::Or, expr->operation);
     EXPECT_EQ(3, expr->nodes.size());
@@ -284,7 +320,7 @@ TEST(AdjacentTest, AdjacentSearch) {
   const auto &invidx = sample_index();
 
   {
-    auto expr = parse_query(invidx, normalizer, R"( "is the" )");
+    auto expr = parse_query(normalizer, R"( "is the" )");
 
     EXPECT_EQ(Operation::Adjacent, expr->operation);
     EXPECT_EQ(2, expr->nodes.size());
@@ -357,7 +393,7 @@ TEST(AdjacentTest, AdjacentSearchWith3Words) {
   const auto &invidx = sample_index();
 
   {
-    auto expr = parse_query(invidx, normalizer, R"( "the second sentence" )");
+    auto expr = parse_query(normalizer, R"( "the second sentence" )");
 
     EXPECT_EQ(Operation::Adjacent, expr->operation);
     EXPECT_EQ(3, expr->nodes.size());
@@ -388,7 +424,7 @@ TEST(NearTest, NearSearch) {
   const auto &invidx = sample_index();
 
   {
-    auto expr = parse_query(invidx, normalizer, R"( second ~ document )");
+    auto expr = parse_query(normalizer, R"( second ~ document )");
 
     EXPECT_EQ(Operation::Near, expr->operation);
     EXPECT_EQ(2, expr->nodes.size());
@@ -455,7 +491,7 @@ TEST(NearTest, NearSearchWithPhrase) {
   const auto &invidx = sample_index();
 
   {
-    auto expr = parse_query(invidx, normalizer, R"( sentence ~ "is the" )");
+    auto expr = parse_query(normalizer, R"( sentence ~ "is the" )");
 
     EXPECT_EQ(Operation::Near, expr->operation);
     EXPECT_EQ(2, expr->nodes.size());
