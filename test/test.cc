@@ -11,6 +11,8 @@ std::vector<std::string> sample_documents = {
     "This is the third document. This is the second sentence in the third.",
     "Fourth document",
     "Hello World!",
+    "東京 タワー 港区",
+    "A well-known example.",
 };
 
 auto normalizer = [](auto sv) { return unicode::to_lowercase(sv); };
@@ -41,6 +43,8 @@ TEST(TokenizerTest, UTF8PlainTextTokenizer) {
        "sentence", "in", "the", "third"},
       {"fourth", "document"},
       {"hello", "world"},
+      {"東京", "タワー", "港区"},
+      {"a", "well", "known", "example"},
   };
 
   size_t document_id = 0;
@@ -525,6 +529,80 @@ TEST(NearTest, NearSearchWithPhrase) {
         EXPECT_EQ(8, rng.length);
       }
     }
+  }
+}
+
+TEST(QueryTest, UnicodeTerm) {
+  const auto &invidx = sample_index();
+
+  {
+    auto expr = parse_query(normalizer, " 東京 ");
+    ASSERT_NE(std::nullopt, expr);
+    EXPECT_EQ(Operation::Term, expr->operation);
+    EXPECT_EQ(U"東京", expr->term_str);
+
+    auto postings = perform_search(invidx, *expr);
+    EXPECT_EQ(1, postings->size());
+    EXPECT_EQ(5, postings->document_id(0));
+  }
+
+  {
+    auto expr = parse_query(normalizer, " 東京 港区 ");
+    auto postings = perform_search(invidx, *expr);
+    EXPECT_EQ(1, postings->size());
+    EXPECT_EQ(2, postings->search_hit_count(0));
+  }
+
+  {
+    auto expr = parse_query(normalizer, R"( "東京 タワー" )");
+    auto postings = perform_search(invidx, *expr);
+    EXPECT_EQ(1, postings->size());
+    EXPECT_EQ(0, postings->term_position(0, 0));
+    EXPECT_EQ(2, postings->term_length(0, 0));
+  }
+
+  {
+    auto expr = parse_query(normalizer, " 東京 -港区 ");
+    auto postings = perform_search(invidx, *expr);
+    EXPECT_EQ(0, postings->size());
+  }
+}
+
+TEST(QueryTest, ImplicitPhrase) {
+  const auto &invidx = sample_index();
+
+  {
+    auto expr = parse_query(normalizer, " well-known ");
+    ASSERT_NE(std::nullopt, expr);
+    EXPECT_EQ(Operation::Adjacent, expr->operation);
+    EXPECT_EQ(2, expr->nodes.size());
+
+    auto postings = perform_search(invidx, *expr);
+    EXPECT_EQ(1, postings->size());
+    EXPECT_EQ(6, postings->document_id(0));
+    EXPECT_EQ(1, postings->term_position(0, 0));
+    EXPECT_EQ(2, postings->term_length(0, 0));
+  }
+
+  {
+    // An implicit phrase is flattened into the surrounding quoted phrase.
+    auto expr = parse_query(normalizer, R"( "a well-known example" )");
+    ASSERT_NE(std::nullopt, expr);
+    EXPECT_EQ(Operation::Adjacent, expr->operation);
+    EXPECT_EQ(4, expr->nodes.size());
+
+    auto postings = perform_search(invidx, *expr);
+    EXPECT_EQ(1, postings->size());
+    EXPECT_EQ(6, postings->document_id(0));
+    EXPECT_EQ(4, postings->term_length(0, 0));
+  }
+
+  {
+    // A token without letters can never match.
+    auto expr = parse_query(normalizer, " 2021 ");
+    ASSERT_NE(std::nullopt, expr);
+    auto postings = perform_search(invidx, *expr);
+    EXPECT_EQ(0, postings->size());
   }
 }
 

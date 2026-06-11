@@ -55,7 +55,7 @@ std::optional<Expression> parse_query(Normalizer normalizer,
     NEAR        <- PRIMARY ('~' PRIMARY)*
     PRIMARY     <- PHRASE / TERM / '(' OR ')'
     PHRASE      <- '"' TERM+ '"'
-    TERM        <- < [a-zA-Z0-9] [a-zA-Z0-9-]* >
+    TERM        <- < (![-"|~() \t\r\n] .) (!["|~() \t\r\n] .)* >
     %whitespace <- [ \t]*
   )");
 
@@ -81,7 +81,24 @@ std::optional<Expression> parse_query(Normalizer normalizer,
   parser["OR"] = list_handler(Operation::Or);
   parser["AND"] = list_handler(Operation::And);
   parser["NEAR"] = list_handler(Operation::Near);
-  parser["PHRASE"] = list_handler(Operation::Adjacent);
+
+  parser["PHRASE"] = [=](const peg::SemanticValues &vs) {
+    // Flatten implicit phrases made from a single token (e.g. `well-known`).
+    std::vector<Expression> nodes;
+    for (const auto &v : vs) {
+      auto expr = std::any_cast<Expression>(v);
+      if (expr.operation == Operation::Adjacent) {
+        nodes.insert(nodes.end(), expr.nodes.begin(), expr.nodes.end());
+      } else {
+        nodes.push_back(expr);
+      }
+    }
+    if (nodes.size() == 1) {
+      return nodes[0];
+    }
+    return Expression{Operation::Adjacent, std::u32string(), DEFAULT_NEAR_SIZE,
+                      std::move(nodes)};
+  };
 
   parser["NOT"] = [](const peg::SemanticValues &vs) {
     if (vs.choice() == 0) {
@@ -92,8 +109,27 @@ std::optional<Expression> parse_query(Normalizer normalizer,
   };
 
   parser["TERM"] = [&](const peg::SemanticValues &vs) {
-    auto term = normalizer(u32(vs.token()));
-    return Expression{Operation::Term, term};
+    // Tokenize the query token with the same logic as documents, so that
+    // index side and query side always agree on term boundaries.
+    std::vector<Expression> nodes;
+    UTF8PlainTextTokenizer tokenizer(vs.token());
+    tokenizer(normalizer, [&](const auto &str, auto, auto) {
+      nodes.push_back(Expression{Operation::Term, str});
+    });
+
+    if (nodes.empty()) {
+      // No letter sequence in the token (e.g. digits only); such a term can
+      // never exist in the index and matches nothing.
+      auto term = normalizer ? normalizer(u32(vs.token())) : u32(vs.token());
+      return Expression{Operation::Term, term};
+    }
+    if (nodes.size() == 1) {
+      return nodes[0];
+    }
+    // A token split into multiple terms (e.g. `well-known`) is an implicit
+    // phrase.
+    return Expression{Operation::Adjacent, std::u32string(), DEFAULT_NEAR_SIZE,
+                      std::move(nodes)};
   };
 
   // parser.log = [](size_t line, size_t col, const std::string& msg) {
