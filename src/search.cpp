@@ -361,9 +361,38 @@ perform_term_operation(const IInvertedIndex &inverted_index,
 static std::shared_ptr<IPostings>
 perform_and_operation(const IInvertedIndex &inverted_index,
                       const Expression &expr) {
+  std::vector<Expression> positive_nodes;
+  std::vector<Expression> negative_nodes;
+  for (const auto &node : expr.nodes) {
+    if (node.operation == Operation::Not) {
+      negative_nodes.push_back(node.nodes[0]);
+    } else {
+      positive_nodes.push_back(node);
+    }
+  }
+
+  auto negative_postings_list = positings_list(inverted_index, negative_nodes);
+  std::vector<size_t> negative_cursors(negative_postings_list.size(), 0);
+
   return intersect_postings(
-      positings_list(inverted_index, expr.nodes),
-      [](const auto &positings_list, const auto &cursors) {
+      positings_list(inverted_index, positive_nodes),
+      [&](const auto &positings_list,
+          const auto &cursors) -> std::shared_ptr<Position> {
+        auto document_id = positings_list[0]->document_id(cursors[0]);
+
+        // Exclude documents that appear in any negative postings. Both sides
+        // are iterated in ascending document id order.
+        for (size_t slot = 0; slot < negative_postings_list.size(); slot++) {
+          const auto &p = negative_postings_list[slot];
+          auto &cursor = negative_cursors[slot];
+          while (cursor < p->size() && p->document_id(cursor) < document_id) {
+            cursor++;
+          }
+          if (cursor < p->size() && p->document_id(cursor) == document_id) {
+            return nullptr;
+          }
+        }
+
         std::vector<size_t> slots(positings_list.size(), 0);
         std::iota(slots.begin(), slots.end(), 0);
 
@@ -372,9 +401,9 @@ perform_and_operation(const IInvertedIndex &inverted_index,
         merge_term_positions(positings_list, cursors, slots, term_positions,
                              term_lengths);
 
-        return std::make_shared<Position>(
-            positings_list[0]->document_id(cursors[0]),
-            std::move(term_positions), std::move(term_lengths));
+        return std::make_shared<Position>(document_id,
+                                          std::move(term_positions),
+                                          std::move(term_lengths));
       });
 }
 
@@ -524,6 +553,8 @@ std::shared_ptr<IPostings> perform_search(const IInvertedIndex &inverted_index,
 template <typename T> void enumerate_terms(const Expression &expr, T fn) {
   if (expr.operation == Operation::Term) {
     fn(expr.term_str);
+  } else if (expr.operation == Operation::Not) {
+    // Excluded terms do not contribute to scores.
   } else {
     for (const auto &node : expr.nodes) {
       enumerate_terms(node, fn);

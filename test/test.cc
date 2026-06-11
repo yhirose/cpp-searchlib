@@ -528,6 +528,69 @@ TEST(NearTest, NearSearchWithPhrase) {
   }
 }
 
+TEST(NotTest, NotSearch) {
+  const auto &invidx = sample_index();
+
+  {
+    auto expr = parse_query(normalizer, " document -second ");
+
+    EXPECT_EQ(Operation::And, expr->operation);
+    EXPECT_EQ(2, expr->nodes.size());
+    EXPECT_EQ(Operation::Not, expr->nodes[1].operation);
+
+    auto postings = perform_search(invidx, *expr);
+
+    EXPECT_EQ(2, postings->size());
+
+    EXPECT_EQ(0, postings->document_id(0));
+    EXPECT_EQ(1, postings->search_hit_count(0));
+
+    EXPECT_EQ(3, postings->document_id(1));
+    EXPECT_EQ(1, postings->search_hit_count(1));
+  }
+
+  {
+    auto expr = parse_query(normalizer, R"( document -"the second sentence" )");
+    auto postings = perform_search(invidx, *expr);
+
+    EXPECT_EQ(3, postings->size());
+    EXPECT_EQ(0, postings->document_id(0));
+    EXPECT_EQ(1, postings->document_id(1));
+    EXPECT_EQ(3, postings->document_id(2));
+  }
+
+  {
+    auto expr = parse_query(normalizer, " the -(second | fourth) ");
+    auto postings = perform_search(invidx, *expr);
+
+    EXPECT_EQ(1, postings->size());
+    EXPECT_EQ(0, postings->document_id(0));
+  }
+
+  {
+    // Excluding an unknown term excludes nothing.
+    auto expr = parse_query(normalizer, " document -nothing ");
+    auto postings = perform_search(invidx, *expr);
+
+    EXPECT_EQ(4, postings->size());
+  }
+
+  {
+    auto expr = parse_query(normalizer, " second -second ");
+    auto postings = perform_search(invidx, *expr);
+
+    EXPECT_EQ(0, postings->size());
+  }
+}
+
+TEST(NotTest, InvalidNotQuery) {
+  // NOT requires at least one positive operand within the same AND.
+  EXPECT_EQ(std::nullopt, parse_query(normalizer, " -second "));
+  EXPECT_EQ(std::nullopt, parse_query(normalizer, " -first -second "));
+  EXPECT_EQ(std::nullopt, parse_query(normalizer, " first | -second "));
+  EXPECT_EQ(std::nullopt, parse_query(normalizer, " first ~ -second "));
+}
+
 TEST(TF_IDF_Test, TF_IDF) {
   const std::vector<std::string> documents = {
       "apple orange orange banana",

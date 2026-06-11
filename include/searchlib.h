@@ -87,7 +87,7 @@ public:
 // Search
 //-----------------------------------------------------------------------------
 
-enum class Operation { Term, And, Adjacent, Or, Near };
+enum class Operation { Term, And, Adjacent, Or, Near, Not };
 
 struct Expression {
   Operation operation;

@@ -11,16 +11,51 @@
 
 namespace searchlib {
 
+// `Not` is allowed only as a direct child of `And`, and `And` must have at
+// least one positive child, since the index cannot enumerate all documents.
+static bool is_valid_expression(const Expression &expr) {
+  switch (expr.operation) {
+  case Operation::Term:
+    return true;
+  case Operation::Not:
+    return false;
+  case Operation::And: {
+    size_t positive_count = 0;
+    for (const auto &node : expr.nodes) {
+      if (node.operation == Operation::Not) {
+        if (!is_valid_expression(node.nodes[0])) {
+          return false;
+        }
+      } else {
+        if (!is_valid_expression(node)) {
+          return false;
+        }
+        positive_count++;
+      }
+    }
+    return positive_count > 0;
+  }
+  default:
+    for (const auto &node : expr.nodes) {
+      if (!is_valid_expression(node)) {
+        return false;
+      }
+    }
+    return true;
+  }
+}
+
 std::optional<Expression> parse_query(Normalizer normalizer,
                                       std::string_view query) {
   static peg::parser parser(R"(
     ROOT        <- OR?
     OR          <- AND ('|' AND)*
-    AND         <- NEAR+
+    AND         <- NOT+
+    NOT         <- '-' PRIMARY / NEAR
     NEAR        <- PRIMARY ('~' PRIMARY)*
     PRIMARY     <- PHRASE / TERM / '(' OR ')'
     PHRASE      <- '"' TERM+ '"'
-    TERM        <- < [a-zA-Z0-9-]+ >
+    TERM        <- < [a-zA-Z0-9] [a-zA-Z0-9-]* >
     %whitespace <- [ \t]*
   )");
 
@@ -48,6 +83,14 @@ std::optional<Expression> parse_query(Normalizer normalizer,
   parser["NEAR"] = list_handler(Operation::Near);
   parser["PHRASE"] = list_handler(Operation::Adjacent);
 
+  parser["NOT"] = [](const peg::SemanticValues &vs) {
+    if (vs.choice() == 0) {
+      return Expression{Operation::Not, std::u32string(), 0,
+                        {std::any_cast<Expression>(vs[0])}};
+    }
+    return std::any_cast<Expression>(vs[0]);
+  };
+
   parser["TERM"] = [&](const peg::SemanticValues &vs) {
     auto term = normalizer(u32(vs.token()));
     return Expression{Operation::Term, term};
@@ -59,6 +102,10 @@ std::optional<Expression> parse_query(Normalizer normalizer,
 
   std::optional<Expression> expr;
   if (!parser.parse(query, expr)) {
+    return std::nullopt;
+  }
+
+  if (expr && !is_valid_expression(*expr)) {
     return std::nullopt;
   }
 
