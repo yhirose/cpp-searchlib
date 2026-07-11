@@ -841,3 +841,93 @@ TEST(PersistenceTest, RejectsInvalidData) {
   InMemoryInvertedIndex<TextRange> loaded;
   EXPECT_THROW(loaded.load(ss), std::runtime_error);
 }
+
+TEST(RemoveDocumentTest, ExcludedFromTermSearch) {
+  auto invidx = sample_index();
+
+  auto expr = parse_query(normalizer, "the");
+  EXPECT_EQ(3, perform_search(invidx, *expr)->size()); // docs 0, 1, 2
+
+  EXPECT_FALSE(invidx.has_removed_documents());
+  invidx.remove_document(1);
+  EXPECT_TRUE(invidx.has_removed_documents());
+  EXPECT_TRUE(invidx.is_document_removed(1));
+
+  auto postings = perform_search(invidx, *expr);
+  ASSERT_EQ(2, postings->size());
+  EXPECT_EQ(0, postings->document_id(0));
+  EXPECT_EQ(2, postings->document_id(1));
+
+  // The surviving entries' hits and text ranges stay addressable after the
+  // index positions have been renumbered by the filter.
+  auto rng = invidx.text_range(*postings, 1, 0);
+  EXPECT_LT(0u, rng.length);
+}
+
+TEST(RemoveDocumentTest, ExcludedFromOrSearch) {
+  auto invidx = sample_index();
+
+  auto expr = parse_query(normalizer, " third | HELLO | second ");
+  EXPECT_EQ(3, perform_search(invidx, *expr)->size()); // docs 1, 2, 4
+
+  invidx.remove_document(2);
+
+  auto postings = perform_search(invidx, *expr);
+  ASSERT_EQ(2, postings->size());
+  EXPECT_EQ(1, postings->document_id(0));
+  EXPECT_EQ(4, postings->document_id(1));
+}
+
+TEST(RemoveDocumentTest, ReindexClearsTombstone) {
+  auto invidx = sample_index();
+  InMemoryIndexer indexer(invidx, normalizer);
+
+  auto expr = parse_query(normalizer, "first"); // only doc 0
+  ASSERT_EQ(1, perform_search(invidx, *expr)->size());
+
+  invidx.remove_document(0);
+  EXPECT_EQ(0, perform_search(invidx, *expr)->size());
+
+  // Re-indexing the same document_id clears the tombstone (update = remove +
+  // re-index), so the document becomes searchable again.
+  indexer.index_document(0, UTF8PlainTextTokenizer(sample_documents[0]));
+  EXPECT_FALSE(invidx.is_document_removed(0));
+  auto postings = perform_search(invidx, *expr);
+  ASSERT_EQ(1, postings->size());
+  EXPECT_EQ(0, postings->document_id(0));
+}
+
+TEST(RemoveDocumentTest, MutableInterface) {
+  auto invidx = sample_index();
+
+  // Removal is reachable through the IMutableInvertedIndex interface, as a
+  // FederationMember's mutable_index would be.
+  IMutableInvertedIndex &mutable_index = invidx;
+  mutable_index.remove_document(0);
+
+  auto expr = parse_query(normalizer, "the");
+  auto postings = perform_search(invidx, *expr);
+  ASSERT_EQ(2, postings->size());
+  EXPECT_EQ(1, postings->document_id(0));
+  EXPECT_EQ(2, postings->document_id(1));
+}
+
+TEST(PersistenceTest, RemovedDocumentsSurvive) {
+  auto invidx = sample_index();
+  invidx.remove_document(1);
+
+  std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+  invidx.save(ss);
+
+  InMemoryInvertedIndex<TextRange> loaded;
+  loaded.load(ss);
+
+  EXPECT_TRUE(loaded.has_removed_documents());
+  EXPECT_TRUE(loaded.is_document_removed(1));
+
+  auto expr = parse_query(normalizer, "the");
+  auto postings = perform_search(loaded, *expr);
+  ASSERT_EQ(2, postings->size());
+  EXPECT_EQ(0, postings->document_id(0));
+  EXPECT_EQ(2, postings->document_id(1));
+}

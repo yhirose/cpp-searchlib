@@ -183,6 +183,18 @@ InMemoryInvertedIndexBase::postings(const std::u32string &str) const {
   return empty_postings;
 }
 
+bool InMemoryInvertedIndexBase::has_removed_documents() const {
+  return !removed_document_ids_.empty();
+}
+
+bool InMemoryInvertedIndexBase::is_document_removed(size_t document_id) const {
+  return removed_document_ids_.find(document_id) != removed_document_ids_.end();
+}
+
+void InMemoryInvertedIndexBase::remove_document(size_t document_id) {
+  removed_document_ids_.insert(document_id);
+}
+
 void InMemoryInvertedIndexBase::save(std::ostream &os) const {
   // Documents section, ordered by document_id for deterministic output.
   detail::write_scalar<uint64_t>(os, documents_.size());
@@ -211,6 +223,15 @@ void InMemoryInvertedIndexBase::save(std::ostream &os) const {
     detail::write_scalar<uint64_t>(os, term->term_count);
     term->postings.save(os);
   }
+
+  // Removed-documents (tombstone) section, sorted for deterministic output.
+  detail::write_scalar<uint64_t>(os, removed_document_ids_.size());
+  std::vector<size_t> removed_ids(removed_document_ids_.begin(),
+                                  removed_document_ids_.end());
+  std::sort(removed_ids.begin(), removed_ids.end());
+  for (auto document_id : removed_ids) {
+    detail::write_scalar<uint64_t>(os, document_id);
+  }
 }
 
 void InMemoryInvertedIndexBase::load(std::istream &is) {
@@ -233,6 +254,14 @@ void InMemoryInvertedIndexBase::load(std::istream &is) {
     term.str = str;
     term.term_count = count;
     term.postings.load(is);
+  }
+
+  removed_document_ids_.clear();
+  auto removed_count = detail::read_scalar<uint64_t>(is);
+  removed_document_ids_.reserve(static_cast<size_t>(removed_count));
+  for (uint64_t i = 0; i < removed_count; i++) {
+    removed_document_ids_.insert(
+        static_cast<size_t>(detail::read_scalar<uint64_t>(is)));
   }
 }
 

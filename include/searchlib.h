@@ -23,6 +23,7 @@
 #include <string_view>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace searchlib {
@@ -43,7 +44,7 @@ namespace detail {
 // disturbing this one.
 inline constexpr char kIndexMagic[4] = {'S', 'I', 'D', 'X'};
 inline constexpr uint32_t kFormatTypePlain = 0;
-inline constexpr uint32_t kSchemaVersion = 1;
+inline constexpr uint32_t kSchemaVersion = 2;
 
 template <typename T> inline void write_scalar(std::ostream &os, T value) {
   static_assert(std::is_trivially_copyable_v<T>);
@@ -123,6 +124,12 @@ public:
 
   virtual std::shared_ptr<const IPostings>
   postings(const std::u32string &str) const = 0;
+
+  // Logical (tombstone) deletion support. Read-only indexes report no
+  // removals; searches filter out removed document_ids via these hooks.
+  // Overridden by indexes that support IMutableInvertedIndex::remove_document.
+  virtual bool has_removed_documents() const { return false; }
+  virtual bool is_document_removed(size_t document_id) const { return false; }
 };
 
 using Normalizer = std::function<std::u32string(const std::u32string &str)>;
@@ -308,6 +315,15 @@ public:
   std::shared_ptr<const IPostings>
   postings(const std::u32string &str) const override;
 
+  bool has_removed_documents() const override;
+  bool is_document_removed(size_t document_id) const override;
+
+  // Logical deletion: mark a document_id as removed. The postings and term
+  // statistics are left intact (no physical compaction); searches exclude
+  // removed document_ids at their output. Re-indexing the same document_id
+  // via InMemoryIndexer clears the tombstone.
+  void remove_document(size_t document_id);
+
   // Serialize/deserialize the T-independent part of the index (documents_
   // and term_dictionary_, including postings). The templated
   // InMemoryInvertedIndex<T> wraps this with the file header and the
@@ -351,10 +367,12 @@ public:
 
   std::unordered_map<size_t /*document_id*/, Document> documents_;
   std::unordered_map<std::u32string /*str*/, Term> term_dictionary_;
+  std::unordered_set<size_t /*document_id*/> removed_document_ids_;
 };
 
 template <typename T>
-class InMemoryInvertedIndex : public IInvertedIndexWithTextRange<T> {
+class InMemoryInvertedIndex : public IInvertedIndexWithTextRange<T>,
+                             public IMutableInvertedIndex {
 public:
   size_t document_count() const override { return base_.document_count(); }
 
@@ -388,6 +406,18 @@ public:
   std::shared_ptr<const IPostings>
   postings(const std::u32string &str) const override {
     return base_.postings(str);
+  }
+
+  bool has_removed_documents() const override {
+    return base_.has_removed_documents();
+  }
+
+  bool is_document_removed(size_t document_id) const override {
+    return base_.is_document_removed(document_id);
+  }
+
+  void remove_document(size_t document_id) override {
+    base_.remove_document(document_id);
   }
 
   T text_range(const IPostings &positions, size_t index,
@@ -526,6 +556,10 @@ public:
       : index_(index), normalizer_(normalizer) {}
 
   void index_document(size_t document_id, Tokenizer<T> tokenizer) override {
+    // (Re)indexing a document clears any prior logical-deletion tombstone,
+    // so that the "update = remove + re-index (same id)" pattern works.
+    index_.base_.removed_document_ids_.erase(document_id);
+
     size_t term_count = 0;
     tokenizer(normalizer_, [&](const auto &str, auto term_pos,
                                auto text_range) {

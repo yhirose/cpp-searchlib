@@ -51,6 +51,55 @@ private:
 
 //-----------------------------------------------------------------------------
 
+// Decorator that hides logically-deleted (tombstoned) documents from a search
+// result. It maps external indices to the underlying result's indices, skipping
+// any entry whose document_id was removed from the index. Applied once at the
+// top of perform_search, so it uniformly covers Term/And/Or/Adjacent/Near.
+class FilteredPostings : public IPostings {
+public:
+  FilteredPostings(const IInvertedIndex &inverted_index,
+                   std::shared_ptr<IPostings> postings)
+      : postings_(std::move(postings)) {
+    auto count = postings_->size();
+    live_indices_.reserve(count);
+    for (size_t i = 0; i < count; i++) {
+      if (!inverted_index.is_document_removed(postings_->document_id(i))) {
+        live_indices_.push_back(i);
+      }
+    }
+  }
+
+  ~FilteredPostings() override = default;
+
+  size_t size() const override { return live_indices_.size(); }
+
+  size_t document_id(size_t index) const override {
+    return postings_->document_id(live_indices_[index]);
+  }
+
+  size_t search_hit_count(size_t index) const override {
+    return postings_->search_hit_count(live_indices_[index]);
+  }
+
+  size_t term_position(size_t index, size_t search_hit_index) const override {
+    return postings_->term_position(live_indices_[index], search_hit_index);
+  }
+
+  size_t term_length(size_t index, size_t search_hit_index) const override {
+    return postings_->term_length(live_indices_[index], search_hit_index);
+  }
+
+  bool is_term_position(size_t index, size_t term_pos) const override {
+    return postings_->is_term_position(live_indices_[index], term_pos);
+  }
+
+private:
+  std::shared_ptr<IPostings> postings_;
+  std::vector<size_t> live_indices_;
+};
+
+//-----------------------------------------------------------------------------
+
 class Position {
 public:
   Position(size_t document_id, std::vector<size_t> &&term_positions,
@@ -119,11 +168,18 @@ private:
 
 //-----------------------------------------------------------------------------
 
+// Dispatches an expression to its operation handler without applying the
+// tombstone filter. Used internally (including for recursive sub-expressions)
+// so that removed documents are filtered exactly once, at the public entry.
+static std::shared_ptr<IPostings>
+perform_search_operation(const IInvertedIndex &inverted_index,
+                         const Expression &expr);
+
 static auto positings_list(const IInvertedIndex &inverted_index,
                            const std::vector<Expression> &nodes) {
   std::vector<std::shared_ptr<IPostings>> positings_list;
   for (const auto &expr : nodes) {
-    positings_list.push_back(perform_search(inverted_index, expr));
+    positings_list.push_back(perform_search_operation(inverted_index, expr));
   }
   return positings_list;
 }
@@ -532,8 +588,9 @@ perform_near_operation(const IInvertedIndex &inverted_index,
 
 //-----------------------------------------------------------------------------
 
-std::shared_ptr<IPostings> perform_search(const IInvertedIndex &inverted_index,
-                                          const Expression &expr) {
+static std::shared_ptr<IPostings>
+perform_search_operation(const IInvertedIndex &inverted_index,
+                         const Expression &expr) {
   switch (expr.operation) {
   case Operation::Term:
     return perform_term_operation(inverted_index, expr);
@@ -548,6 +605,18 @@ std::shared_ptr<IPostings> perform_search(const IInvertedIndex &inverted_index,
   default:
     return nullptr;
   }
+}
+
+std::shared_ptr<IPostings> perform_search(const IInvertedIndex &inverted_index,
+                                          const Expression &expr) {
+  auto result = perform_search_operation(inverted_index, expr);
+  // Exclude logically-deleted documents from the final result. Skipped
+  // entirely when the index has no tombstones, so the common path is free.
+  if (result && inverted_index.has_removed_documents()) {
+    return std::make_shared<FilteredPostings>(inverted_index,
+                                              std::move(result));
+  }
+  return result;
 }
 
 template <typename T> void enumerate_terms(const Expression &expr, T fn) {
