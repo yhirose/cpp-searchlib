@@ -1,8 +1,10 @@
 ﻿#include <gtest/gtest.h>
 #include <searchlib.h>
 
+#include <atomic>
 #include <filesystem>
 #include <sstream>
+#include <thread>
 
 #include "test_utils.h"
 
@@ -930,4 +932,107 @@ TEST(PersistenceTest, RemovedDocumentsSurvive) {
   ASSERT_EQ(2, postings->size());
   EXPECT_EQ(0, postings->document_id(0));
   EXPECT_EQ(2, postings->document_id(1));
+}
+
+TEST(ThreadSafetyTest, ReadWriteBasics) {
+  ThreadSafeInvertedIndex<TextRange> index;
+
+  index.write([&](auto &idx) {
+    InMemoryIndexer indexer(idx, normalizer);
+    size_t document_id = 0;
+    for (const auto &doc : sample_documents) {
+      indexer.index_document(document_id, UTF8PlainTextTokenizer(doc));
+      document_id++;
+    }
+  });
+
+  // A read operation runs the query and fully materializes its results inside
+  // the shared lock, returning only plain values.
+  auto search_the = [&] {
+    return index.read([&](const auto &idx) {
+      auto expr = parse_query(normalizer, "the");
+      auto postings = perform_search(idx, *expr);
+      std::vector<size_t> ids;
+      for (size_t i = 0; i < postings->size(); i++) {
+        ids.push_back(postings->document_id(i));
+      }
+      return ids;
+    });
+  };
+
+  EXPECT_EQ((std::vector<size_t>{0, 1, 2}), search_the());
+
+  index.write([&](auto &idx) { idx.remove_document(1); });
+
+  EXPECT_EQ((std::vector<size_t>{0, 2}), search_the());
+}
+
+// Stresses the exact hazard the locking guards against: a writer keeps
+// inserting fresh terms (rehashing term_dictionary_, whose entries a bare-term
+// search result aliases) and mutating postings vectors, while readers run
+// queries and consume their results concurrently. Must complete without data
+// races or crashes (run under -fsanitize=thread to actually catch races) and
+// every result must stay internally consistent.
+TEST(ThreadSafetyTest, ConcurrentReadersAndWriter) {
+  ThreadSafeInvertedIndex<TextRange> index;
+  index.write([&](auto &idx) {
+    InMemoryIndexer indexer(idx, normalizer);
+    indexer.index_document(0, UTF8PlainTextTokenizer("document zero"));
+  });
+
+  constexpr int kWriterIterations = 300;
+  std::atomic<bool> writer_done{false};
+
+  // Parse once and share the read-only Expression across threads. Query parsing
+  // (peglib) is not itself thread-safe and is orthogonal to index locking; the
+  // realistic pattern is to parse before searching.
+  auto expr = parse_query(normalizer, "document");
+  ASSERT_TRUE(expr.has_value());
+
+  std::thread writer([&] {
+    for (int i = 1; i <= kWriterIterations; i++) {
+      index.write([&](auto &idx) {
+        InMemoryIndexer indexer(idx, normalizer);
+        // Each doc introduces a unique term ("term<i>") to force rehashing,
+        // plus the shared term "document".
+        auto text = "document term" + std::to_string(i);
+        indexer.index_document(static_cast<size_t>(i),
+                               UTF8PlainTextTokenizer(text));
+        if (i % 5 == 0) {
+          idx.remove_document(static_cast<size_t>(i - 1));
+        }
+      });
+    }
+    writer_done.store(true);
+  });
+
+  auto reader_body = [&] {
+    while (!writer_done.load()) {
+      auto ok = index.read([&](const auto &idx) {
+        auto postings = perform_search(idx, *expr);
+        // Consume every entry (document_id, hits, text_range) under the lock.
+        for (size_t i = 0; i < postings->size(); i++) {
+          if (postings->search_hit_count(i) == 0) {
+            return false;
+          }
+          (void)idx.text_range(*postings, i, 0);
+        }
+        return true;
+      });
+      EXPECT_TRUE(ok);
+    }
+  };
+
+  std::thread reader1(reader_body);
+  std::thread reader2(reader_body);
+
+  writer.join();
+  reader1.join();
+  reader2.join();
+
+  // The writer removed every 5th prior document; the rest plus doc 0 remain
+  // searchable under "document".
+  auto count = index.read(
+      [&](const auto &idx) { return perform_search(idx, *expr)->size(); });
+  EXPECT_GT(count, 0u);
 }

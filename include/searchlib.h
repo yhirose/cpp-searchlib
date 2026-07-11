@@ -18,6 +18,7 @@
 #include <mutex>
 #include <optional>
 #include <ostream>
+#include <shared_mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -583,6 +584,62 @@ public:
 private:
   InMemoryInvertedIndex<T> &index_;
   Normalizer normalizer_;
+};
+
+// A minimal thread-safe wrapper around an InMemoryInvertedIndex<T> for the
+// typical embedded pattern: a single background writer indexing/removing
+// documents while UI/query threads search concurrently.
+//
+// Locking is coarse-grained and per-operation, not per-method. This matters
+// because search results reference the index: perform_search returns IPostings
+// (a bare-term result aliases the term dictionary), and bm25_score / text_range
+// read the index during result consumption. A concurrent writer that rehashes
+// an unordered_map or mutates a postings vector would then invalidate those
+// references. So a whole read operation -- running the query AND consuming its
+// results -- must stay inside one shared-lock scope, and a whole write
+// operation inside one unique-lock scope.
+//
+// The read/write callbacks enforce this: run everything that touches the index
+// inside the callback and return only materialized values. Do NOT let a
+// reference, an IPostings, or an InMemoryIndexer escape the callback -- using
+// it afterwards runs outside the lock and is undefined behavior.
+//
+//   ThreadSafeInvertedIndex<TextRange> index;
+//
+//   index.write([&](auto &idx) {
+//     InMemoryIndexer indexer(idx, normalizer);
+//     indexer.index_document(0, UTF8PlainTextTokenizer(text));
+//   });
+//
+//   auto hits = index.read([&](const auto &idx) {
+//     auto postings = perform_search(idx, *expr);
+//     std::vector<size_t> document_ids;
+//     for (size_t i = 0; i < postings->size(); i++) {
+//       document_ids.push_back(postings->document_id(i));
+//     }
+//     return document_ids;  // materialized: safe to use after the lock
+//   });
+template <typename T> class ThreadSafeInvertedIndex {
+public:
+  // Run a read-only operation under a shared lock. fn receives
+  // `const InMemoryInvertedIndex<T> &`. Multiple readers may proceed
+  // concurrently; a writer blocks until they finish.
+  template <typename Fn> auto read(Fn &&fn) const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    return fn(index_);
+  }
+
+  // Run a mutating operation under an exclusive lock. fn receives
+  // `InMemoryInvertedIndex<T> &`. Use for index_document (via InMemoryIndexer),
+  // remove_document, and load. Blocks all readers and other writers.
+  template <typename Fn> auto write(Fn &&fn) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    return fn(index_);
+  }
+
+private:
+  InMemoryInvertedIndex<T> index_;
+  mutable std::shared_mutex mutex_;
 };
 
 } // namespace searchlib
