@@ -263,11 +263,11 @@ public:
     void add_term_position(size_t document_id, size_t term_pos);
 
   private:
-    using PositionsMap =
-        std::map<size_t /*document_id*/, std::vector<size_t /*position*/>>;
-
-    PositionsMap::const_iterator find_positions_map(size_t index) const;
-    PositionsMap positions_map_;
+    // Kept sorted by document_id ascending so that document_id(index) is
+    // O(1) and lookups by document_id can binary-search.
+    using Entry =
+        std::pair<size_t /*document_id*/, std::vector<size_t /*position*/>>;
+    std::vector<Entry> positions_;
   };
 
   struct Document {

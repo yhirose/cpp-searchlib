@@ -5,8 +5,6 @@
 //  MIT License
 //
 
-#include <cassert>
-
 #include "searchlib.h"
 #include "utils.h"
 
@@ -21,21 +19,21 @@ IMutableInvertedIndex::~IMutableInvertedIndex() = default;
 //-----------------------------------------------------------------------------
 
 size_t InMemoryInvertedIndexBase::Postings::size() const {
-  return positions_map_.size();
+  return positions_.size();
 }
 
 size_t InMemoryInvertedIndexBase::Postings::document_id(size_t index) const {
-  return find_positions_map(index)->first;
+  return positions_[index].first;
 }
 
 size_t
 InMemoryInvertedIndexBase::Postings::search_hit_count(size_t index) const {
-  return find_positions_map(index)->second.size();
+  return positions_[index].second.size();
 }
 
 size_t InMemoryInvertedIndexBase::Postings::term_position(
     size_t index, size_t search_hit_index) const {
-  return find_positions_map(index)->second[search_hit_index];
+  return positions_[index].second[search_hit_index];
 }
 
 size_t InMemoryInvertedIndexBase::Postings::term_length(
@@ -45,33 +43,41 @@ size_t InMemoryInvertedIndexBase::Postings::term_length(
 
 bool InMemoryInvertedIndexBase::Postings::is_term_position(
     size_t index, size_t term_pos) const {
-  const auto &positions = find_positions_map(index)->second;
+  const auto &positions = positions_[index].second;
   return std::binary_search(positions.begin(), positions.end(), term_pos);
 }
 
 void InMemoryInvertedIndexBase::Postings::add_term_position(size_t document_id,
                                                             size_t term_pos) {
-  return positions_map_[document_id].push_back(term_pos);
-}
-
-InMemoryInvertedIndexBase::Postings::PositionsMap::const_iterator
-InMemoryInvertedIndexBase::Postings::find_positions_map(size_t index) const {
-  assert(index < positions_map_.size());
-  // TODO: performance improvement with caching the last access value
-  auto it = positions_map_.begin();
-  std::advance(it, index);
-  return it;
+  auto it = std::lower_bound(
+      positions_.begin(), positions_.end(), document_id,
+      [](const auto &entry, size_t doc_id) { return entry.first < doc_id; });
+  if (it != positions_.end() && it->first == document_id) {
+    it->second.push_back(term_pos);
+  } else {
+    positions_.insert(it, Entry{document_id, {term_pos}});
+  }
 }
 
 //-----------------------------------------------------------------------------
 
+// Assumes document_id(index) is monotonically increasing in index, which
+// holds for every IPostings this library produces: Postings keeps entries
+// sorted by document_id, and SearchResult (search.cpp) only ever appends
+// documents in ascending order via its cursor-merge algorithms.
 size_t find_postings_index_for_document_id_(const IPostings &p,
                                             size_t document_id) {
-  // TODO: use binary search and cache...
-  for (size_t i = 0; i < p.size(); i++) {
-    if (p.document_id(i) == document_id) {
-      return i;
+  size_t lo = 0, hi = p.size();
+  while (lo < hi) {
+    size_t mid = lo + (hi - lo) / 2;
+    if (p.document_id(mid) < document_id) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
     }
+  }
+  if (lo < p.size() && p.document_id(lo) == document_id) {
+    return lo;
   }
   return p.size();
 }

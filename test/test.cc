@@ -186,6 +186,37 @@ TEST(TermTest, TermSearch) {
   }
 }
 
+TEST(TermTest, OutOfOrderDocumentIds) {
+  // Postings keeps entries sorted by document_id internally; this indexes
+  // documents in descending order to verify that add_term_position's sorted
+  // insertion (not just append) keeps lookups and result ordering correct.
+  InMemoryInvertedIndex<TextRange> invidx;
+  InMemoryIndexer indexer(invidx, normalizer);
+
+  std::vector<std::string> documents = {
+      "third document here",
+      "second document here",
+      "first document here",
+  };
+  for (size_t i = 0; i < documents.size(); i++) {
+    size_t document_id = documents.size() - 1 - i;
+    indexer.index_document(document_id, UTF8PlainTextTokenizer(documents[i]));
+  }
+
+  EXPECT_EQ(3, invidx.document_count());
+  EXPECT_EQ(3, invidx.df(U"document"));
+  EXPECT_EQ(1, invidx.term_count(U"document", 0));
+  EXPECT_EQ(1, invidx.term_count(U"document", 1));
+  EXPECT_EQ(1, invidx.term_count(U"document", 2));
+
+  auto expr = parse_query(normalizer, "document");
+  auto postings = perform_search(invidx, *expr);
+  ASSERT_EQ(3, postings->size());
+  EXPECT_EQ(0, postings->document_id(0));
+  EXPECT_EQ(1, postings->document_id(1));
+  EXPECT_EQ(2, postings->document_id(2));
+}
+
 TEST(AndTest, AndSearch) {
   const auto &invidx = sample_index();
 
