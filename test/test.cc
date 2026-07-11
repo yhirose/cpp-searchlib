@@ -1,6 +1,9 @@
 ﻿#include <gtest/gtest.h>
 #include <searchlib.h>
 
+#include <filesystem>
+#include <sstream>
+
 #include "test_utils.h"
 
 using namespace searchlib;
@@ -762,4 +765,79 @@ TEST(TF_IDF_Test, TF_IDF) {
     EXPECT_EQ(0, invidx.tf(term, 0));
     EXPECT_EQ(0.2, invidx.tf(term, 1));
   }
+}
+
+TEST(PersistenceTest, RoundTrip) {
+  auto invidx = sample_index();
+
+  std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+  invidx.save(ss);
+
+  InMemoryInvertedIndex<TextRange> loaded;
+  loaded.load(ss);
+
+  // Index-level metadata.
+  EXPECT_EQ(invidx.document_count(), loaded.document_count());
+  EXPECT_EQ(invidx.average_document_term_count(),
+            loaded.average_document_term_count());
+
+  // Term-level statistics.
+  for (auto term : {U"the", U"document", U"second"}) {
+    EXPECT_EQ(invidx.term_count(term), loaded.term_count(term));
+    EXPECT_EQ(invidx.df(term), loaded.df(term));
+  }
+
+  // Searching the loaded index yields the same hits and text ranges.
+  auto expr = parse_query(normalizer, "the");
+  auto expected = perform_search(invidx, *expr);
+  auto actual = perform_search(loaded, *expr);
+  ASSERT_EQ(expected->size(), actual->size());
+  for (size_t i = 0; i < expected->size(); i++) {
+    EXPECT_EQ(expected->document_id(i), actual->document_id(i));
+    ASSERT_EQ(expected->search_hit_count(i), actual->search_hit_count(i));
+    for (size_t h = 0; h < expected->search_hit_count(i); h++) {
+      auto a = invidx.text_range(*expected, i, h);
+      auto b = loaded.text_range(*actual, i, h);
+      EXPECT_EQ(a.position, b.position);
+      EXPECT_EQ(a.length, b.length);
+    }
+  }
+}
+
+TEST(PersistenceTest, UnicodeTermSurvives) {
+  auto invidx = sample_index();
+
+  std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+  invidx.save(ss);
+
+  InMemoryInvertedIndex<TextRange> loaded;
+  loaded.load(ss);
+
+  auto expr = parse_query(normalizer, "東京");
+  auto postings = perform_search(loaded, *expr);
+  ASSERT_EQ(1, postings->size());
+  EXPECT_EQ(5, postings->document_id(0));
+}
+
+TEST(PersistenceTest, FileRoundTrip) {
+  auto invidx = sample_index();
+
+  auto path =
+      (std::filesystem::temp_directory_path() / "searchlib_test.idx").string();
+  invidx.save(path);
+
+  InMemoryInvertedIndex<TextRange> loaded;
+  loaded.load(path);
+  std::filesystem::remove(path);
+
+  EXPECT_EQ(invidx.document_count(), loaded.document_count());
+  EXPECT_EQ(invidx.term_count(U"the"), loaded.term_count(U"the"));
+}
+
+TEST(PersistenceTest, RejectsInvalidData) {
+  std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+  ss << "this is not a searchlib index file";
+
+  InMemoryInvertedIndex<TextRange> loaded;
+  EXPECT_THROW(loaded.load(ss), std::runtime_error);
 }

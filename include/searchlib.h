@@ -8,17 +8,76 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdint>
+#include <cstring>
+#include <fstream>
 #include <functional>
+#include <istream>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <ostream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
 namespace searchlib {
+
+//-----------------------------------------------------------------------------
+// Serialization primitives (shared by the index save/load implementations)
+//-----------------------------------------------------------------------------
+
+namespace detail {
+
+// The on-disk "plain" format (format_type 0) is a host-endian dump of
+// fixed-width fields, as designed in docs/embedded_minimal_roadmap.ja.md 9.1.
+// Every integer is normalized to a fixed 64-bit (or 32-bit for the header
+// tags) width so that a 32-bit and a 64-bit build agree on layout; endianness
+// is left host-native, which is acceptable because a plain-format index is
+// expected to be loaded on the same platform that wrote it. A future
+// format_type can add an endian-neutral or compressed layout without
+// disturbing this one.
+inline constexpr char kIndexMagic[4] = {'S', 'I', 'D', 'X'};
+inline constexpr uint32_t kFormatTypePlain = 0;
+inline constexpr uint32_t kSchemaVersion = 1;
+
+template <typename T> inline void write_scalar(std::ostream &os, T value) {
+  static_assert(std::is_trivially_copyable_v<T>);
+  os.write(reinterpret_cast<const char *>(&value), sizeof(T));
+}
+
+template <typename T> inline T read_scalar(std::istream &is) {
+  static_assert(std::is_trivially_copyable_v<T>);
+  T value{};
+  is.read(reinterpret_cast<char *>(&value), sizeof(T));
+  if (!is) {
+    throw std::runtime_error("searchlib: unexpected end of index stream");
+  }
+  return value;
+}
+
+inline void write_u32string(std::ostream &os, const std::u32string &s) {
+  write_scalar<uint64_t>(os, s.size());
+  for (char32_t c : s) {
+    write_scalar<uint32_t>(os, static_cast<uint32_t>(c));
+  }
+}
+
+inline std::u32string read_u32string(std::istream &is) {
+  auto n = read_scalar<uint64_t>(is);
+  std::u32string s;
+  s.reserve(static_cast<size_t>(n));
+  for (uint64_t i = 0; i < n; i++) {
+    s.push_back(static_cast<char32_t>(read_scalar<uint32_t>(is)));
+  }
+  return s;
+}
+
+} // namespace detail
 
 //-----------------------------------------------------------------------------
 // Interface
@@ -249,6 +308,13 @@ public:
   std::shared_ptr<const IPostings>
   postings(const std::u32string &str) const override;
 
+  // Serialize/deserialize the T-independent part of the index (documents_
+  // and term_dictionary_, including postings). The templated
+  // InMemoryInvertedIndex<T> wraps this with the file header and the
+  // T-dependent text-range section.
+  void save(std::ostream &os) const;
+  void load(std::istream &is);
+
   class Postings : public IPostings {
   public:
     size_t size() const override;
@@ -261,6 +327,9 @@ public:
     bool is_term_position(size_t index, size_t term_pos) const override;
 
     void add_term_position(size_t document_id, size_t term_pos);
+
+    void save(std::ostream &os) const;
+    void load(std::istream &is);
 
   private:
     // Kept sorted by document_id ascending so that document_id(index) is
@@ -327,8 +396,125 @@ public:
                                  search_hit_index);
   }
 
+  // Callbacks for serializing the text-range value type T. When T is
+  // trivially copyable (e.g. the built-in TextRange), these may be left
+  // empty and a raw byte copy is used automatically; otherwise the caller
+  // must supply both.
+  using TextRangeSerializer = std::function<void(std::ostream &, const T &)>;
+  using TextRangeDeserializer = std::function<T(std::istream &)>;
+
+  void save(std::ostream &os,
+            const TextRangeSerializer &serialize_value = {}) const {
+    os.write(detail::kIndexMagic, sizeof(detail::kIndexMagic));
+    detail::write_scalar<uint32_t>(os, detail::kFormatTypePlain);
+    detail::write_scalar<uint32_t>(os, detail::kSchemaVersion);
+
+    base_.save(os);
+
+    // Text-range section, ordered by document_id for deterministic output.
+    detail::write_scalar<uint64_t>(os, text_range_list_.size());
+    std::vector<size_t> document_ids;
+    document_ids.reserve(text_range_list_.size());
+    for (const auto &[document_id, _] : text_range_list_) {
+      document_ids.push_back(document_id);
+    }
+    std::sort(document_ids.begin(), document_ids.end());
+    for (auto document_id : document_ids) {
+      const auto &values = text_range_list_.at(document_id);
+      detail::write_scalar<uint64_t>(os, document_id);
+      detail::write_scalar<uint64_t>(os, values.size());
+      for (const auto &value : values) {
+        save_value_(os, value, serialize_value);
+      }
+    }
+  }
+
+  void load(std::istream &is,
+            const TextRangeDeserializer &deserialize_value = {}) {
+    char magic[sizeof(detail::kIndexMagic)];
+    is.read(magic, sizeof(magic));
+    if (!is || std::memcmp(magic, detail::kIndexMagic, sizeof(magic)) != 0) {
+      throw std::runtime_error("searchlib: not a valid index file (bad magic)");
+    }
+    auto format_type = detail::read_scalar<uint32_t>(is);
+    if (format_type != detail::kFormatTypePlain) {
+      throw std::runtime_error("searchlib: unsupported index format_type");
+    }
+    auto schema_version = detail::read_scalar<uint32_t>(is);
+    if (schema_version != detail::kSchemaVersion) {
+      throw std::runtime_error("searchlib: unsupported index schema_version");
+    }
+
+    base_.load(is);
+
+    text_range_list_.clear();
+    auto document_count = detail::read_scalar<uint64_t>(is);
+    for (uint64_t i = 0; i < document_count; i++) {
+      auto document_id = static_cast<size_t>(detail::read_scalar<uint64_t>(is));
+      auto value_count = detail::read_scalar<uint64_t>(is);
+      std::vector<T> values;
+      values.reserve(static_cast<size_t>(value_count));
+      for (uint64_t j = 0; j < value_count; j++) {
+        values.push_back(load_value_(is, deserialize_value));
+      }
+      text_range_list_[document_id] = std::move(values);
+    }
+  }
+
+  void save(const std::string &path,
+            const TextRangeSerializer &serialize_value = {}) const {
+    std::ofstream os(path, std::ios::binary);
+    if (!os) {
+      throw std::runtime_error(
+          "searchlib: cannot open index file for writing: " + path);
+    }
+    save(os, serialize_value);
+  }
+
+  void load(const std::string &path,
+            const TextRangeDeserializer &deserialize_value = {}) {
+    std::ifstream is(path, std::ios::binary);
+    if (!is) {
+      throw std::runtime_error(
+          "searchlib: cannot open index file for reading: " + path);
+    }
+    load(is, deserialize_value);
+  }
+
 private:
   template <typename> friend class InMemoryIndexer;
+
+  static void save_value_(std::ostream &os, const T &value,
+                          const TextRangeSerializer &serialize_value) {
+    if (serialize_value) {
+      serialize_value(os, value);
+      return;
+    }
+    if constexpr (std::is_trivially_copyable_v<T>) {
+      os.write(reinterpret_cast<const char *>(&value), sizeof(T));
+    } else {
+      throw std::runtime_error("searchlib: a text-range serializer is "
+                               "required for this value type");
+    }
+  }
+
+  static T load_value_(std::istream &is,
+                       const TextRangeDeserializer &deserialize_value) {
+    if (deserialize_value) {
+      return deserialize_value(is);
+    }
+    if constexpr (std::is_trivially_copyable_v<T>) {
+      T value{};
+      is.read(reinterpret_cast<char *>(&value), sizeof(T));
+      if (!is) {
+        throw std::runtime_error("searchlib: unexpected end of index stream");
+      }
+      return value;
+    } else {
+      throw std::runtime_error("searchlib: a text-range deserializer is "
+                               "required for this value type");
+    }
+  }
 
   InMemoryInvertedIndexBase base_;
   TextRangeList<T> text_range_list_;

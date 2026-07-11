@@ -59,6 +59,33 @@ void InMemoryInvertedIndexBase::Postings::add_term_position(size_t document_id,
   }
 }
 
+void InMemoryInvertedIndexBase::Postings::save(std::ostream &os) const {
+  detail::write_scalar<uint64_t>(os, positions_.size());
+  for (const auto &[document_id, positions] : positions_) {
+    detail::write_scalar<uint64_t>(os, document_id);
+    detail::write_scalar<uint64_t>(os, positions.size());
+    for (auto position : positions) {
+      detail::write_scalar<uint64_t>(os, position);
+    }
+  }
+}
+
+void InMemoryInvertedIndexBase::Postings::load(std::istream &is) {
+  auto entry_count = detail::read_scalar<uint64_t>(is);
+  positions_.clear();
+  positions_.reserve(static_cast<size_t>(entry_count));
+  for (uint64_t i = 0; i < entry_count; i++) {
+    auto document_id = static_cast<size_t>(detail::read_scalar<uint64_t>(is));
+    auto position_count = detail::read_scalar<uint64_t>(is);
+    std::vector<size_t> positions;
+    positions.reserve(static_cast<size_t>(position_count));
+    for (uint64_t j = 0; j < position_count; j++) {
+      positions.push_back(static_cast<size_t>(detail::read_scalar<uint64_t>(is)));
+    }
+    positions_.emplace_back(document_id, std::move(positions));
+  }
+}
+
 //-----------------------------------------------------------------------------
 
 // Assumes document_id(index) is monotonically increasing in index, which
@@ -154,6 +181,59 @@ InMemoryInvertedIndexBase::postings(const std::u32string &str) const {
         std::shared_ptr<void>(), &it->second.postings);
   }
   return empty_postings;
+}
+
+void InMemoryInvertedIndexBase::save(std::ostream &os) const {
+  // Documents section, ordered by document_id for deterministic output.
+  detail::write_scalar<uint64_t>(os, documents_.size());
+  std::vector<size_t> document_ids;
+  document_ids.reserve(documents_.size());
+  for (const auto &[document_id, _] : documents_) {
+    document_ids.push_back(document_id);
+  }
+  std::sort(document_ids.begin(), document_ids.end());
+  for (auto document_id : document_ids) {
+    detail::write_scalar<uint64_t>(os, document_id);
+    detail::write_scalar<uint64_t>(os, documents_.at(document_id).term_count);
+  }
+
+  // Term dictionary section, ordered by term string for deterministic output.
+  detail::write_scalar<uint64_t>(os, term_dictionary_.size());
+  std::vector<const Term *> terms;
+  terms.reserve(term_dictionary_.size());
+  for (const auto &[_, term] : term_dictionary_) {
+    terms.push_back(&term);
+  }
+  std::sort(terms.begin(), terms.end(),
+            [](const Term *a, const Term *b) { return a->str < b->str; });
+  for (const auto *term : terms) {
+    detail::write_u32string(os, term->str);
+    detail::write_scalar<uint64_t>(os, term->term_count);
+    term->postings.save(os);
+  }
+}
+
+void InMemoryInvertedIndexBase::load(std::istream &is) {
+  documents_.clear();
+  auto document_count = detail::read_scalar<uint64_t>(is);
+  documents_.reserve(static_cast<size_t>(document_count));
+  for (uint64_t i = 0; i < document_count; i++) {
+    auto document_id = static_cast<size_t>(detail::read_scalar<uint64_t>(is));
+    auto term_count = static_cast<size_t>(detail::read_scalar<uint64_t>(is));
+    documents_[document_id] = Document{term_count};
+  }
+
+  term_dictionary_.clear();
+  auto term_count = detail::read_scalar<uint64_t>(is);
+  term_dictionary_.reserve(static_cast<size_t>(term_count));
+  for (uint64_t i = 0; i < term_count; i++) {
+    auto str = detail::read_u32string(is);
+    auto count = static_cast<size_t>(detail::read_scalar<uint64_t>(is));
+    auto &term = term_dictionary_[str];
+    term.str = str;
+    term.term_count = count;
+    term.postings.load(is);
+  }
 }
 
 } // namespace searchlib

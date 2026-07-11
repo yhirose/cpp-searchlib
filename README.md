@@ -3,7 +3,7 @@
 C++17 full-text search engine library (WIP. Far from release...)
 
 TODO:
-- [ ] Save/load index to/from storage
+- [x] Save/load index to/from storage
 - [ ] Posting list compression
 - [ ] Search scope (document, section, paragraph)
 
@@ -66,3 +66,33 @@ only valid along with at least one positive term.
 
 `term_count_score`, `tf_idf_score` and `bm25_score` are available to score
 each search result. Ranking is up to the caller.
+
+## Persistence
+
+An index can be saved to and loaded from disk, so it does not have to be
+rebuilt on every startup.
+
+```cpp
+// Save...
+InMemoryInvertedIndex<TextRange> invidx;
+// ... index documents ...
+invidx.save("index.bin");
+
+// Load...
+InMemoryInvertedIndex<TextRange> loaded;
+loaded.load("index.bin");
+```
+
+`save`/`load` also have `std::ostream`/`std::istream` overloads. The built-in
+`TextRange` value type is serialized automatically; for a custom text-range
+type `T`, pass a serializer/deserializer pair:
+
+```cpp
+invidx.save(os, [](std::ostream &os, const T &v) { /* write v */ });
+loaded.load(is, [](std::istream &is) -> T { /* read and return a T */ });
+```
+
+The on-disk format is a "plain" host-native dump (`format_type` 0) tagged with
+a `format_type`/`schema_version` header, leaving room for compressed or
+mmap-friendly backends later. It is intended to be loaded on the same platform
+that wrote it.
