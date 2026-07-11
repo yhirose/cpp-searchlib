@@ -17,11 +17,13 @@ add_executable(
   test.cc
   test_kjv.cc
   test_kjv_chapters.cc
+  test_federated.cc
   ../src/utils.cpp
   ../src/invertedindex.cpp
   ../src/search.cpp
   ../src/query.cpp
   ../src/tokenizer.cpp
+  ../src/federatedindex.cpp
 )
 
 target_include_directories(test-main PRIVATE ../include ../src)

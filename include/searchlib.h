@@ -11,6 +11,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -120,6 +121,69 @@ double tf_idf_score(const IInvertedIndex &invidx, const Expression &expr,
 double bm25_score(const IInvertedIndex &invidx, const Expression &expr,
                   const IPostings &postings, size_t index, double k1 = 1.2,
                   double b = 0.75);
+
+//-----------------------------------------------------------------------------
+// Federated Search
+//-----------------------------------------------------------------------------
+
+// A mutable counterpart to IInvertedIndex. Kept as a separate interface
+// (rather than discovered via dynamic_pointer_cast<IMutableInvertedIndex>)
+// so that callers who already know an index is writable at registration
+// time can pass that fact along explicitly, with no RTTI involved.
+class IMutableInvertedIndex {
+public:
+  virtual ~IMutableInvertedIndex() = 0;
+
+  // document_id is local to the corresponding IInvertedIndex; see the note
+  // on IPostings::document_id.
+  virtual void remove_document(size_t document_id) = 0;
+};
+
+// One entry in a FederatedIndex. mutable_index is null for read-only
+// members (e.g. an installed book) and non-null for members that support
+// removal (e.g. a notes index), decided by the caller at registration time.
+struct FederationMember {
+  std::shared_ptr<IInvertedIndex> index;
+  std::shared_ptr<IMutableInvertedIndex> mutable_index;
+};
+
+// One hit produced by perform_federated_search. document ids are only
+// meaningful together with `index`, since each member has its own local id
+// space (see the note on IPostings::document_id).
+struct FederatedHit {
+  std::shared_ptr<IInvertedIndex> index;
+  std::shared_ptr<IPostings> postings;
+  size_t index_in_postings;
+};
+
+// A dynamic collection of independently-built IInvertedIndex instances that
+// can be searched as one. Members are added/removed by shared_ptr identity;
+// snapshot() returns a copy of the member list so that a search in
+// progress is unaffected by concurrent add()/remove() calls (the
+// underlying indexes are kept alive by the shared_ptr in the snapshot).
+//
+// This class only guards its own member list; it does not make any
+// individual IInvertedIndex/IMutableInvertedIndex thread-safe on its own.
+class FederatedIndex {
+public:
+  void add(std::shared_ptr<IInvertedIndex> index,
+           std::shared_ptr<IMutableInvertedIndex> mutable_index = nullptr);
+  void remove(const std::shared_ptr<IInvertedIndex> &index);
+
+  std::vector<FederationMember> snapshot() const;
+
+private:
+  mutable std::mutex mutex_;
+  std::vector<FederationMember> members_;
+};
+
+// Evaluates `expr` independently against every member of `federation`
+// (each member resolves its own And/Or/Near/Not cursors internally, see
+// perform_search) and concatenates the results, tagged with the
+// originating member. No cross-member score normalization or sorting is
+// performed; callers that need a combined ranking must do so themselves.
+std::vector<FederatedHit> perform_federated_search(const FederatedIndex &federation,
+                                                   const Expression &expr);
 
 //-----------------------------------------------------------------------------
 // Indexers

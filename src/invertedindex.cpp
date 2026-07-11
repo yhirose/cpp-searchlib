@@ -16,6 +16,8 @@ IPostings::~IPostings() = default;
 
 IInvertedIndex::~IInvertedIndex() = default;
 
+IMutableInvertedIndex::~IMutableInvertedIndex() = default;
+
 //-----------------------------------------------------------------------------
 
 size_t InMemoryInvertedIndexBase::Postings::size() const {
