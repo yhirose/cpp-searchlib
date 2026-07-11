@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <functional>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -28,6 +29,11 @@ public:
 
   virtual size_t size() const = 0;
 
+  // document_id is scoped to the IInvertedIndex instance that produced this
+  // IPostings; it is not a globally unique identifier across indexes. Code
+  // that fans out across multiple indexes (e.g. a future federated search
+  // layer) must tag results with their originating index rather than
+  // assuming document_id alone is enough to disambiguate them.
   virtual size_t document_id(size_t index) const = 0;
   virtual size_t search_hit_count(size_t index) const = 0;
 
@@ -42,6 +48,8 @@ public:
 
   virtual size_t document_count() const = 0;
 
+  // document_id here (and everywhere else in this interface) is local to
+  // this IInvertedIndex instance; see the note on IPostings::document_id.
   virtual size_t document_term_count(size_t document_id) const = 0;
   virtual double average_document_term_count() const = 0;
 
@@ -53,7 +61,8 @@ public:
   virtual size_t df(const std::u32string &str) const = 0;
   virtual double tf(const std::u32string &str, size_t document_id) const = 0;
 
-  virtual const IPostings &postings(const std::u32string &str) const = 0;
+  virtual std::shared_ptr<const IPostings>
+  postings(const std::u32string &str) const = 0;
 };
 
 using Normalizer = std::function<std::u32string(const std::u32string &str)>;
@@ -119,6 +128,10 @@ double bm25_score(const IInvertedIndex &invidx, const Expression &expr,
 template <typename T> class IIndexer {
 public:
   virtual ~IIndexer(){};
+
+  // document_id is chosen by the caller and is only meaningful within the
+  // IInvertedIndex this indexer writes to; see the note on
+  // IPostings::document_id.
   virtual void index_document(size_t document_id, Tokenizer<T> tokenizer) = 0;
 };
 
@@ -169,7 +182,8 @@ public:
   size_t df(const std::u32string &str) const override;
   double tf(const std::u32string &str, size_t document_id) const override;
 
-  const IPostings &postings(const std::u32string &str) const override;
+  std::shared_ptr<const IPostings>
+  postings(const std::u32string &str) const override;
 
   class Postings : public IPostings {
   public:
@@ -238,7 +252,8 @@ public:
     return base_.tf(str, document_id);
   }
 
-  const IPostings &postings(const std::u32string &str) const override {
+  std::shared_ptr<const IPostings>
+  postings(const std::u32string &str) const override {
     return base_.postings(str);
   }
 

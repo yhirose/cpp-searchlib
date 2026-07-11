@@ -114,34 +114,38 @@ size_t InMemoryInvertedIndexBase::term_count(const std::u32string &str) const {
 
 size_t InMemoryInvertedIndexBase::term_count(const std::u32string &str,
                                              size_t document_id) const {
-  const auto &p = postings(str);
-  auto i = find_postings_index_for_document_id_(p, document_id);
-  if (i < p.size()) {
-    return p.search_hit_count(i);
+  auto p = postings(str);
+  auto i = find_postings_index_for_document_id_(*p, document_id);
+  if (i < p->size()) {
+    return p->search_hit_count(i);
   }
   return 0;
 }
 
 size_t InMemoryInvertedIndexBase::df(const std::u32string &str) const {
-  return postings(str).size();
+  return postings(str)->size();
 }
 
 double InMemoryInvertedIndexBase::tf(const std::u32string &str,
                                      size_t document_id) const {
-  const auto &p = postings(str);
-  auto i = find_postings_index_for_document_id_(p, document_id);
-  if (i < p.size()) {
-    return static_cast<double>(p.search_hit_count(i)) /
+  auto p = postings(str);
+  auto i = find_postings_index_for_document_id_(*p, document_id);
+  if (i < p->size()) {
+    return static_cast<double>(p->search_hit_count(i)) /
            static_cast<double>(document_term_count(document_id));
   }
   return 0.0;
 }
 
-const IPostings &
+std::shared_ptr<const IPostings>
 InMemoryInvertedIndexBase::postings(const std::u32string &str) const {
-  static const Postings empty_postings;
+  static const auto empty_postings = std::make_shared<const Postings>();
   auto it = term_dictionary_.find(str);
-  return it != term_dictionary_.end() ? it->second.postings : empty_postings;
+  if (it != term_dictionary_.end()) {
+    return std::shared_ptr<const IPostings>(
+        std::shared_ptr<void>(), &it->second.postings);
+  }
+  return empty_postings;
 }
 
 } // namespace searchlib

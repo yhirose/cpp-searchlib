@@ -23,18 +23,18 @@ public:
 
   ~TermSearchResult() override = default;
 
-  size_t size() const override { return postings_.size(); }
+  size_t size() const override { return postings_->size(); }
 
   size_t document_id(size_t index) const override {
-    return postings_.document_id(index);
+    return postings_->document_id(index);
   }
 
   size_t search_hit_count(size_t index) const override {
-    return postings_.search_hit_count(index);
+    return postings_->search_hit_count(index);
   }
 
   size_t term_position(size_t index, size_t search_hit_index) const override {
-    return postings_.term_position(index, search_hit_index);
+    return postings_->term_position(index, search_hit_index);
   }
 
   size_t term_length(size_t index, size_t search_hit_index) const override {
@@ -42,11 +42,11 @@ public:
   }
 
   bool is_term_position(size_t index, size_t term_pos) const override {
-    return postings_.is_term_position(index, term_pos);
+    return postings_->is_term_position(index, term_pos);
   }
 
 private:
-  const IPostings &postings_;
+  std::shared_ptr<const IPostings> postings_;
 };
 
 //-----------------------------------------------------------------------------
