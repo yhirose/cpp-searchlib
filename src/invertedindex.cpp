@@ -97,29 +97,40 @@ void InMemoryInvertedIndexBase::Postings::load(std::istream &is) {
 
 void InMemoryInvertedIndexBase::Postings::save_compressed(
     std::ostream &os) const {
+  // Everything becomes a monotone sequence and is Elias-Fano coded:
   // document_ids and the end offsets of each entry's slice in the
-  // concatenated position array are both strictly increasing, so each is
-  // one Elias-Fano sequence. The concatenated positions stay fixed-width
-  // for now (design doc section 3); their count is implied by the last
-  // end offset.
+  // concatenated position array are strictly increasing as-is. The
+  // positions themselves restart at every document, so each entry's
+  // positions get a per-entry base added (base = previous base + previous
+  // entry's last position + 1), which makes the concatenation strictly
+  // increasing too; the bases form a fourth monotone sequence so that a
+  // slice can be decoded (or randomly accessed later) by subtracting its
+  // base.
   std::vector<uint64_t> document_ids;
   std::vector<uint64_t> end_offsets;
+  std::vector<uint64_t> bases;
+  std::vector<uint64_t> monotonized_positions;
   document_ids.reserve(positions_.size());
   end_offsets.reserve(positions_.size());
+  bases.reserve(positions_.size());
   uint64_t total_positions = 0;
+  uint64_t base = 0;
   for (const auto &[document_id, positions] : positions_) {
     document_ids.push_back(document_id);
     total_positions += positions.size();
     end_offsets.push_back(total_positions);
+    bases.push_back(base);
+    for (auto position : positions) {
+      monotonized_positions.push_back(base + position);
+    }
+    base = monotonized_positions.back() + 1;
   }
 
   detail::EliasFano(document_ids, document_ids.back() + 1).save(os);
   detail::EliasFano(end_offsets, total_positions + 1).save(os);
-  for (const auto &[_, positions] : positions_) {
-    for (auto position : positions) {
-      detail::write_scalar<uint64_t>(os, position);
-    }
-  }
+  detail::EliasFano(bases, bases.back() + 1).save(os);
+  detail::EliasFano(monotonized_positions, monotonized_positions.back() + 1)
+      .save(os);
 }
 
 void InMemoryInvertedIndexBase::Postings::load_compressed(std::istream &is) {
@@ -127,7 +138,15 @@ void InMemoryInvertedIndexBase::Postings::load_compressed(std::istream &is) {
   document_ids.load(is);
   detail::EliasFano end_offsets;
   end_offsets.load(is);
-  if (end_offsets.size() != document_ids.size()) {
+  detail::EliasFano bases;
+  bases.load(is);
+  detail::EliasFano monotonized_positions;
+  monotonized_positions.load(is);
+  if (end_offsets.size() != document_ids.size() ||
+      bases.size() != document_ids.size() ||
+      (document_ids.size() > 0 &&
+       monotonized_positions.size() !=
+           end_offsets.access(end_offsets.size() - 1))) {
     throw std::runtime_error("searchlib: corrupt compressed postings");
   }
 
@@ -136,14 +155,18 @@ void InMemoryInvertedIndexBase::Postings::load_compressed(std::istream &is) {
   uint64_t begin = 0;
   for (size_t i = 0; i < document_ids.size(); i++) {
     auto end = end_offsets.access(i);
+    auto base = bases.access(i);
     if (end < begin) {
       throw std::runtime_error("searchlib: corrupt compressed postings");
     }
     std::vector<size_t> positions;
     positions.reserve(static_cast<size_t>(end - begin));
     for (auto j = begin; j < end; j++) {
-      positions.push_back(
-          static_cast<size_t>(detail::read_scalar<uint64_t>(is)));
+      auto value = monotonized_positions.access(static_cast<size_t>(j));
+      if (value < base) {
+        throw std::runtime_error("searchlib: corrupt compressed postings");
+      }
+      positions.push_back(static_cast<size_t>(value - base));
     }
     positions_.emplace_back(static_cast<size_t>(document_ids.access(i)),
                             std::move(positions));

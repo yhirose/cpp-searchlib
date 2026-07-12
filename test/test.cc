@@ -934,14 +934,15 @@ TEST(PersistenceTest, RemovedDocumentsSurvive) {
   EXPECT_EQ(2, postings->document_id(1));
 }
 
-// "common" appears in every document, taking its postings across the
-// Elias-Fano threshold, while each "termN" stays tiny and keeps the plain
-// per-term representation — so one index exercises both encodings.
+// "common" appears twice in every document, taking its postings across the
+// Elias-Fano threshold with multiple positions per document, while each
+// "termN" stays tiny and keeps the plain per-term representation — so one
+// index exercises both encodings.
 static InMemoryInvertedIndex<TextRange> wide_term_index(size_t document_count) {
   InMemoryInvertedIndex<TextRange> invidx;
   InMemoryIndexer indexer(invidx, normalizer);
   for (size_t i = 0; i < document_count; i++) {
-    auto text = "common term" + std::to_string(i);
+    auto text = "common term" + std::to_string(i) + " common";
     indexer.index_document(i, UTF8PlainTextTokenizer(text));
   }
   return invidx;
