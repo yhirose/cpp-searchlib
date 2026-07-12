@@ -21,6 +21,7 @@ add_executable(
   test_succinct.cc
   ../src/utils.cpp
   ../src/invertedindex.cpp
+  ../src/compressedindex.cpp
   ../src/search.cpp
   ../src/query.cpp
   ../src/tokenizer.cpp

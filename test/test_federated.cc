@@ -92,3 +92,37 @@ TEST(FederatedSearchTest, MutableMemberWiring) {
   members[1].mutable_index->remove_document(0);
   EXPECT_EQ(std::vector<size_t>{0}, mock_mutable->removed_document_ids);
 }
+
+TEST(FederatedSearchTest, MixedInMemoryAndCompressedMembers) {
+  // An installed, read-only corpus served by the compressed backend,
+  // searched together with a mutable in-memory notes index.
+  auto book_source =
+      make_index({"This is the first book.", "The second chapter."});
+  std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+  book_source->save(ss, {}, IndexFormat::Compressed);
+  auto book = load_compressed_index(ss);
+
+  auto notes = make_index({"A note about the book.", "Unrelated memo."});
+
+  FederatedIndex federation;
+  federation.add(book); // read-only: no mutable_index
+  federation.add(notes, notes);
+
+  auto expr = parse_query(federated_normalizer, "book");
+  ASSERT_TRUE(expr);
+
+  auto hits = perform_federated_search(federation, *expr);
+  ASSERT_EQ(2, hits.size());
+
+  EXPECT_EQ(book, hits[0].index);
+  EXPECT_EQ(0, hits[0].postings->document_id(hits[0].index_in_postings));
+
+  EXPECT_EQ(notes, hits[1].index);
+  EXPECT_EQ(0, hits[1].postings->document_id(hits[1].index_in_postings));
+
+  // Highlighting works through the compressed member's text_range.
+  auto range = book->text_range(*hits[0].postings, hits[0].index_in_postings, 0);
+  EXPECT_EQ(std::string("book"),
+            std::string("This is the first book.").substr(range.position,
+                                                          range.length));
+}

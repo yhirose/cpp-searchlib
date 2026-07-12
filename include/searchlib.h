@@ -161,7 +161,8 @@ public:
 };
 
 template <typename T>
-class IInvertedIndexWithTextRange : public IInvertedIndex, ITextRange<T> {
+class IInvertedIndexWithTextRange : public IInvertedIndex,
+                                    public ITextRange<T> {
 public:
   virtual ~IInvertedIndexWithTextRange(){};
 };
@@ -327,6 +328,25 @@ void load_text_ranges_compressed(std::istream &is,
                                  TextRangeList<TextRange> &list);
 
 } // namespace detail
+
+// Read-only backend for a Compressed-format (format_type=2) index file that
+// keeps the Elias-Fano postings and text-range structures compressed in
+// memory, instead of expanding them into the InMemoryInvertedIndex
+// representation the way InMemoryInvertedIndex<TextRange>::load does. Use it
+// when memory footprint matters more than write access (e.g. an installed
+// corpus searched alongside a mutable notes index via FederatedIndex, with
+// FederationMember::mutable_index left null).
+//
+// Only files written by InMemoryInvertedIndex<TextRange>::save with
+// IndexFormat::Compressed are accepted; any other format_type, schema
+// version, or text-range value type fails with an exception. The returned
+// index is immutable, so it is safe to share across reader threads without
+// external locking. The implementation lives in compressedindex.cpp so that
+// the succinct machinery stays out of this public header.
+std::shared_ptr<IInvertedIndexWithTextRange<TextRange>>
+load_compressed_index(std::istream &is);
+std::shared_ptr<IInvertedIndexWithTextRange<TextRange>>
+load_compressed_index(const std::string &path);
 
 class InMemoryInvertedIndexBase : public IInvertedIndex {
 public:

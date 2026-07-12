@@ -38,3 +38,5 @@ corpus/
 build*/
 cmake-build-*/
 .idea/
+
+docs/
