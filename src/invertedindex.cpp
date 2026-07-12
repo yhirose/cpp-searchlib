@@ -176,6 +176,109 @@ void InMemoryInvertedIndexBase::Postings::load_compressed(std::istream &is) {
 
 //-----------------------------------------------------------------------------
 
+namespace detail {
+
+// The text-range section compressed with the same monotonization scheme as
+// the postings: token positions are strictly increasing within a document,
+// so a per-document base turns their concatenation into one monotone
+// Elias-Fano sequence, and token lengths (>= 1) become monotone as a
+// cumulative sum. Five global EF sequences cover the whole section, so the
+// per-document overhead is negligible even for many small documents.
+void save_text_ranges_compressed(std::ostream &os,
+                                 const TextRangeList<TextRange> &list) {
+  std::vector<uint64_t> document_ids;
+  document_ids.reserve(list.size());
+  for (const auto &[document_id, _] : list) {
+    document_ids.push_back(document_id);
+  }
+  std::sort(document_ids.begin(), document_ids.end());
+
+  std::vector<uint64_t> end_offsets;
+  std::vector<uint64_t> bases;
+  std::vector<uint64_t> positions;
+  std::vector<uint64_t> cumulative_lengths;
+  end_offsets.reserve(document_ids.size());
+  bases.reserve(document_ids.size());
+  uint64_t total_values = 0;
+  uint64_t base = 0;
+  uint64_t length_sum = 0;
+  for (auto document_id : document_ids) {
+    const auto &values = list.at(static_cast<size_t>(document_id));
+    total_values += values.size();
+    end_offsets.push_back(total_values);
+    bases.push_back(base);
+    for (const auto &value : values) {
+      positions.push_back(base + value.position);
+      length_sum += value.length;
+      cumulative_lengths.push_back(length_sum);
+    }
+    if (!values.empty()) {
+      base = positions.back() + 1;
+    }
+  }
+
+  auto save_sequence = [&os](const std::vector<uint64_t> &values) {
+    EliasFano(values, values.empty() ? 0 : values.back() + 1).save(os);
+  };
+  save_sequence(document_ids);
+  save_sequence(end_offsets);
+  save_sequence(bases);
+  save_sequence(positions);
+  save_sequence(cumulative_lengths);
+}
+
+void load_text_ranges_compressed(std::istream &is,
+                                 TextRangeList<TextRange> &list) {
+  EliasFano document_ids;
+  document_ids.load(is);
+  EliasFano end_offsets;
+  end_offsets.load(is);
+  EliasFano bases;
+  bases.load(is);
+  EliasFano positions;
+  positions.load(is);
+  EliasFano cumulative_lengths;
+  cumulative_lengths.load(is);
+
+  auto document_count = document_ids.size();
+  auto total_values =
+      document_count == 0 ? 0 : end_offsets.access(document_count - 1);
+  if (end_offsets.size() != document_count ||
+      bases.size() != document_count || positions.size() != total_values ||
+      cumulative_lengths.size() != total_values) {
+    throw std::runtime_error("searchlib: corrupt compressed text ranges");
+  }
+
+  uint64_t begin = 0;
+  uint64_t previous_length_sum = 0;
+  for (size_t i = 0; i < document_count; i++) {
+    auto end = end_offsets.access(i);
+    auto base = bases.access(i);
+    if (end < begin) {
+      throw std::runtime_error("searchlib: corrupt compressed text ranges");
+    }
+    std::vector<TextRange> values;
+    values.reserve(static_cast<size_t>(end - begin));
+    for (auto j = begin; j < end; j++) {
+      auto position = positions.access(static_cast<size_t>(j));
+      auto length_sum = cumulative_lengths.access(static_cast<size_t>(j));
+      if (position < base || length_sum < previous_length_sum) {
+        throw std::runtime_error("searchlib: corrupt compressed text ranges");
+      }
+      values.push_back(
+          TextRange{static_cast<size_t>(position - base),
+                    static_cast<size_t>(length_sum - previous_length_sum)});
+      previous_length_sum = length_sum;
+    }
+    list[static_cast<size_t>(document_ids.access(i))] = std::move(values);
+    begin = end;
+  }
+}
+
+} // namespace detail
+
+//-----------------------------------------------------------------------------
+
 // Assumes document_id(index) is monotonically increasing in index, which
 // holds for every IPostings this library produces: Postings keeps entries
 // sorted by document_id, and SearchResult (search.cpp) only ever appends

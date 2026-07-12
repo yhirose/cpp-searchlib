@@ -314,6 +314,20 @@ enum class IndexFormat : uint32_t {
   Compressed = 2, // 1 is reserved for a future mmap-oriented format
 };
 
+namespace detail {
+
+// Structural Elias-Fano compression of the text-range section, available
+// when T is the built-in TextRange (whose token positions are monotone per
+// document). Implemented in invertedindex.cpp so that the succinct
+// machinery stays out of this public header; other T fall back to the
+// generic fixed-width section even in the Compressed format.
+void save_text_ranges_compressed(std::ostream &os,
+                                 const TextRangeList<TextRange> &list);
+void load_text_ranges_compressed(std::istream &is,
+                                 TextRangeList<TextRange> &list);
+
+} // namespace detail
+
 class InMemoryInvertedIndexBase : public IInvertedIndex {
 public:
   size_t document_count() const override;
@@ -469,21 +483,19 @@ public:
 
     base_.save(os, format);
 
-    // Text-range section, ordered by document_id for deterministic output.
-    detail::write_scalar<uint64_t>(os, text_range_list_.size());
-    std::vector<size_t> document_ids;
-    document_ids.reserve(text_range_list_.size());
-    for (const auto &[document_id, _] : text_range_list_) {
-      document_ids.push_back(document_id);
-    }
-    std::sort(document_ids.begin(), document_ids.end());
-    for (auto document_id : document_ids) {
-      const auto &values = text_range_list_.at(document_id);
-      detail::write_scalar<uint64_t>(os, document_id);
-      detail::write_scalar<uint64_t>(os, values.size());
-      for (const auto &value : values) {
-        save_value_(os, value, serialize_value);
+    if (format == IndexFormat::Compressed) {
+      // A marker distinguishes the structurally compressed section (only
+      // available for the built-in TextRange) from the generic fallback,
+      // so a load with a mismatched T fails loudly instead of misparsing.
+      if constexpr (std::is_same_v<T, TextRange>) {
+        detail::write_scalar<uint32_t>(os, 1);
+        detail::save_text_ranges_compressed(os, text_range_list_);
+      } else {
+        detail::write_scalar<uint32_t>(os, 0);
+        save_text_ranges_(os, serialize_value);
       }
+    } else {
+      save_text_ranges_(os, serialize_value);
     }
   }
 
@@ -514,16 +526,20 @@ public:
     base_.load(is, format);
 
     text_range_list_.clear();
-    auto document_count = detail::read_scalar<uint64_t>(is);
-    for (uint64_t i = 0; i < document_count; i++) {
-      auto document_id = static_cast<size_t>(detail::read_scalar<uint64_t>(is));
-      auto value_count = detail::read_scalar<uint64_t>(is);
-      std::vector<T> values;
-      values.reserve(static_cast<size_t>(value_count));
-      for (uint64_t j = 0; j < value_count; j++) {
-        values.push_back(load_value_(is, deserialize_value));
+    if (format == IndexFormat::Compressed) {
+      auto structural = detail::read_scalar<uint32_t>(is);
+      if (structural) {
+        if constexpr (std::is_same_v<T, TextRange>) {
+          detail::load_text_ranges_compressed(is, text_range_list_);
+        } else {
+          throw std::runtime_error(
+              "searchlib: index text-range section requires TextRange");
+        }
+      } else {
+        load_text_ranges_(is, deserialize_value);
       }
-      text_range_list_[document_id] = std::move(values);
+    } else {
+      load_text_ranges_(is, deserialize_value);
     }
   }
 
@@ -550,6 +566,42 @@ public:
 
 private:
   template <typename> friend class InMemoryIndexer;
+
+  // Generic text-range section: per-document value lists written with
+  // save_value_, ordered by document_id for deterministic output.
+  void save_text_ranges_(std::ostream &os,
+                         const TextRangeSerializer &serialize_value) const {
+    detail::write_scalar<uint64_t>(os, text_range_list_.size());
+    std::vector<size_t> document_ids;
+    document_ids.reserve(text_range_list_.size());
+    for (const auto &[document_id, _] : text_range_list_) {
+      document_ids.push_back(document_id);
+    }
+    std::sort(document_ids.begin(), document_ids.end());
+    for (auto document_id : document_ids) {
+      const auto &values = text_range_list_.at(document_id);
+      detail::write_scalar<uint64_t>(os, document_id);
+      detail::write_scalar<uint64_t>(os, values.size());
+      for (const auto &value : values) {
+        save_value_(os, value, serialize_value);
+      }
+    }
+  }
+
+  void load_text_ranges_(std::istream &is,
+                         const TextRangeDeserializer &deserialize_value) {
+    auto document_count = detail::read_scalar<uint64_t>(is);
+    for (uint64_t i = 0; i < document_count; i++) {
+      auto document_id = static_cast<size_t>(detail::read_scalar<uint64_t>(is));
+      auto value_count = detail::read_scalar<uint64_t>(is);
+      std::vector<T> values;
+      values.reserve(static_cast<size_t>(value_count));
+      for (uint64_t j = 0; j < value_count; j++) {
+        values.push_back(load_value_(is, deserialize_value));
+      }
+      text_range_list_[document_id] = std::move(values);
+    }
+  }
 
   static void save_value_(std::ostream &os, const T &value,
                           const TextRangeSerializer &serialize_value) {
