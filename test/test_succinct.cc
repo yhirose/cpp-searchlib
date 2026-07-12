@@ -1,11 +1,13 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <random>
 #include <vector>
 
 #include "succinct.h"
 
 using searchlib::detail::BitVector;
+using searchlib::detail::EliasFano;
 
 // Builds a BitVector from a plain bool vector and cross-checks every rank
 // and select answer against naive prefix sums / position lists.
@@ -88,6 +90,87 @@ TEST(BitVectorTest, Randomized) {
         bits[i] = flip(rng);
       }
       verify_against_naive(bits);
+    }
+  }
+}
+
+// Cross-checks every access() against the original values and next_geq()
+// against std::lower_bound, probing each value itself, its neighbors, and
+// the universe boundaries.
+static void verify_elias_fano(const std::vector<uint64_t> &values,
+                              uint64_t universe) {
+  EliasFano ef(values, universe);
+
+  ASSERT_EQ(values.size(), ef.size());
+  for (size_t i = 0; i < values.size(); i++) {
+    ASSERT_EQ(values[i], ef.access(i)) << "access(" << i << ")";
+  }
+
+  auto expect_next_geq = [&](uint64_t target) {
+    auto expected = static_cast<size_t>(
+        std::lower_bound(values.begin(), values.end(), target) -
+        values.begin());
+    ASSERT_EQ(expected, ef.next_geq(target)) << "next_geq(" << target << ")";
+  };
+
+  expect_next_geq(0);
+  if (universe > 0) {
+    expect_next_geq(universe - 1);
+  }
+  for (auto value : values) {
+    expect_next_geq(value);
+    if (value > 0) {
+      expect_next_geq(value - 1);
+    }
+    if (value + 1 < universe) {
+      expect_next_geq(value + 1);
+    }
+  }
+}
+
+TEST(EliasFanoTest, EmptyAndTiny) {
+  verify_elias_fano({}, 0);
+  verify_elias_fano({}, 100);
+  verify_elias_fano({0}, 1);
+  verify_elias_fano({42}, 100);
+  verify_elias_fano({0, 1, 2, 3}, 4); // fully dense, low_bits = 0
+}
+
+TEST(EliasFanoTest, Duplicates) {
+  verify_elias_fano({5, 5, 5, 9, 9, 100}, 200);
+}
+
+TEST(EliasFanoTest, HugeUniverse) {
+  // Sparse values over a 2^40 universe exercise wide low-bit widths.
+  verify_elias_fano({0, uint64_t(1) << 20, uint64_t(1) << 39},
+                    uint64_t(1) << 40);
+  // Single element with a near-2^63 universe guards the low-bit width cap.
+  verify_elias_fano({123}, uint64_t(1) << 63);
+}
+
+TEST(EliasFanoTest, Randomized) {
+  std::mt19937_64 rng(42); // fixed seed for reproducibility
+  // Universe multipliers cover dense (~n), medium, and sparse (~1000n).
+  for (uint64_t multiplier : {1u, 3u, 37u, 1000u}) {
+    for (size_t n : {1u, 2u, 100u, 5000u}) {
+      auto universe = static_cast<uint64_t>(n) * multiplier + 1;
+      std::uniform_int_distribution<uint64_t> pick(0, universe - 1);
+      std::vector<uint64_t> values(n);
+      for (auto &value : values) {
+        value = pick(rng);
+      }
+      std::sort(values.begin(), values.end()); // duplicates possible and fine
+      verify_elias_fano(values, universe);
+
+      // Also probe random targets, not just neighborhoods of members.
+      EliasFano ef(values, universe);
+      for (int probe = 0; probe < 100; probe++) {
+        auto target = pick(rng);
+        auto expected = static_cast<size_t>(
+            std::lower_bound(values.begin(), values.end(), target) -
+            values.begin());
+        ASSERT_EQ(expected, ef.next_geq(target));
+      }
     }
   }
 }

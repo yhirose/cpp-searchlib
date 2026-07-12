@@ -186,5 +186,108 @@ private:
   std::vector<uint64_t> rank_;
 };
 
+// Elias-Fano encoding of a monotone (non-decreasing) uint64_t sequence,
+// using close to the information-theoretic minimum n*(2 + log2(U/n)) bits.
+// Each value is split into `low_bits_` low bits (packed fixed-width) and the
+// remaining high bits (unary-coded bucket sizes in a BitVector), so that
+// access(i) is one select1 and next_geq(target) is two select0 plus a scan
+// of one bucket (~2 entries on average). Immutable after construction.
+class EliasFano {
+public:
+  EliasFano() = default;
+
+  // values must be sorted (duplicates allowed) with every element less than
+  // universe.
+  EliasFano(const std::vector<uint64_t> &values, uint64_t universe)
+      : size_(values.size()), universe_(universe) {
+    if (size_ == 0) {
+      return;
+    }
+
+    // Low-bit width l = floor(log2(U/n)) keeps the high-bits vector at most
+    // ~2n + 1 bits long (bucket count <= 2n).
+    auto ratio = universe_ / size_;
+    while (low_bits_ + 1 < 64 && (uint64_t(1) << (low_bits_ + 1)) <= ratio) {
+      low_bits_++;
+    }
+
+    auto bucket_count = static_cast<size_t>((universe_ - 1) >> low_bits_) + 1;
+    high_ = BitVector(size_ + bucket_count);
+    low_words_.assign((size_ * low_bits_ + 63) / 64 + 1, 0);
+
+    for (size_t i = 0; i < size_; i++) {
+      auto value = values[i];
+      high_.set(static_cast<size_t>(value >> low_bits_) + i);
+      if (low_bits_ > 0) {
+        auto bit = i * low_bits_;
+        auto low = value & low_mask_();
+        low_words_[bit / 64] |= low << (bit % 64);
+        if (bit % 64 + low_bits_ > 64) {
+          low_words_[bit / 64 + 1] |= low >> (64 - bit % 64);
+        }
+      }
+    }
+    high_.build();
+  }
+
+  size_t size() const { return size_; }
+  uint64_t universe() const { return universe_; }
+
+  // The i-th value. i must be less than size().
+  uint64_t access(size_t i) const {
+    auto high = static_cast<uint64_t>(high_.select1(i) - i);
+    return (high << low_bits_) | low_(i);
+  }
+
+  // Index of the first value >= target, or size() if none. The bucket that
+  // could contain target is located with two select0 calls, then scanned
+  // linearly.
+  size_t next_geq(uint64_t target) const {
+    if (size_ == 0 || target >= universe_) {
+      return target >= universe_ ? size_ : 0;
+    }
+
+    auto bucket = static_cast<size_t>(target >> low_bits_);
+    // Ones before a bucket = position of its preceding zero terminator
+    // minus the number of zeros before that terminator.
+    auto begin =
+        bucket == 0 ? 0 : high_.select0(bucket - 1) - (bucket - 1);
+    auto end = high_.select0(bucket) - bucket;
+
+    auto low_target = target & low_mask_();
+    for (auto i = begin; i < end; i++) {
+      if (low_(i) >= low_target) {
+        return i;
+      }
+    }
+    // The first value of any later bucket has a larger high part, so `end`
+    // (== size() when the tail is empty) is the answer.
+    return end;
+  }
+
+private:
+  uint64_t low_mask_() const {
+    return low_bits_ == 0 ? 0 : (uint64_t(1) << low_bits_) - 1;
+  }
+
+  uint64_t low_(size_t i) const {
+    if (low_bits_ == 0) {
+      return 0;
+    }
+    auto bit = i * low_bits_;
+    auto value = low_words_[bit / 64] >> (bit % 64);
+    if (bit % 64 + low_bits_ > 64) {
+      value |= low_words_[bit / 64 + 1] << (64 - bit % 64);
+    }
+    return value & low_mask_();
+  }
+
+  size_t size_ = 0;
+  uint64_t universe_ = 0;
+  size_t low_bits_ = 0;
+  BitVector high_;
+  std::vector<uint64_t> low_words_;
+};
+
 } // namespace detail
 } // namespace searchlib
