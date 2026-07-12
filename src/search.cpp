@@ -226,15 +226,41 @@ static bool
 skip_cursors(const std::vector<std::shared_ptr<IPostings>> &positings_list,
              std::vector<size_t> &cursors, size_t document_id) {
   for (size_t slot = 0; slot < positings_list.size(); slot++) {
-    // TODO: skip list support
-    while (cursors[slot] < positings_list[slot]->size()) {
-      if (positings_list[slot]->document_id(cursors[slot]) >= document_id) {
-        break;
+    const auto &postings = *positings_list[slot];
+    auto &cursor = cursors[slot];
+    auto size = postings.size();
+
+    // Exponential (galloping) search for the first entry whose document_id
+    // is >= document_id: O(log gap) accesses instead of the former linear
+    // scan's O(gap), which pays off when an AND operand skips far ahead.
+    // A separate skip-list structure is unnecessary because
+    // document_id(index) is O(1) random access.
+    if (cursor < size && postings.document_id(cursor) < document_id) {
+      size_t step = 1;
+      auto low = cursor + 1; // document_id(cursor) is known to be < target
+      auto high = cursor + step;
+      while (high < size && postings.document_id(high) < document_id) {
+        low = high + 1;
+        step *= 2;
+        high = cursor + step;
       }
-      cursors[slot]++;
+      if (high > size) {
+        high = size;
+      }
+      // Binary search within [low, high) for the first match; `high` itself
+      // is either a known match or `size`.
+      while (low < high) {
+        auto mid = low + (high - low) / 2;
+        if (postings.document_id(mid) < document_id) {
+          low = mid + 1;
+        } else {
+          high = mid;
+        }
+      }
+      cursor = low;
     }
 
-    if (cursors[slot] == positings_list[slot]->size()) {
+    if (cursor == size) {
       return true;
     }
   }
