@@ -6,9 +6,18 @@
 //
 
 #include "searchlib.h"
+#include "succinct.h"
 #include "utils.h"
 
 namespace searchlib {
+
+// Terms with fewer postings entries than this keep the plain fixed-width
+// encoding even in the Compressed format: term frequencies are Zipf
+// distributed, so most terms have tiny postings where the Elias-Fano
+// structures' fixed overhead would exceed the savings. The chosen
+// representation is recorded per term in the file, so this threshold can be
+// tuned without breaking compatibility.
+static constexpr size_t kCompressedPostingsThreshold = 64;
 
 IPostings::~IPostings() = default;
 
@@ -83,6 +92,62 @@ void InMemoryInvertedIndexBase::Postings::load(std::istream &is) {
       positions.push_back(static_cast<size_t>(detail::read_scalar<uint64_t>(is)));
     }
     positions_.emplace_back(document_id, std::move(positions));
+  }
+}
+
+void InMemoryInvertedIndexBase::Postings::save_compressed(
+    std::ostream &os) const {
+  // document_ids and the end offsets of each entry's slice in the
+  // concatenated position array are both strictly increasing, so each is
+  // one Elias-Fano sequence. The concatenated positions stay fixed-width
+  // for now (design doc section 3); their count is implied by the last
+  // end offset.
+  std::vector<uint64_t> document_ids;
+  std::vector<uint64_t> end_offsets;
+  document_ids.reserve(positions_.size());
+  end_offsets.reserve(positions_.size());
+  uint64_t total_positions = 0;
+  for (const auto &[document_id, positions] : positions_) {
+    document_ids.push_back(document_id);
+    total_positions += positions.size();
+    end_offsets.push_back(total_positions);
+  }
+
+  detail::EliasFano(document_ids, document_ids.back() + 1).save(os);
+  detail::EliasFano(end_offsets, total_positions + 1).save(os);
+  for (const auto &[_, positions] : positions_) {
+    for (auto position : positions) {
+      detail::write_scalar<uint64_t>(os, position);
+    }
+  }
+}
+
+void InMemoryInvertedIndexBase::Postings::load_compressed(std::istream &is) {
+  detail::EliasFano document_ids;
+  document_ids.load(is);
+  detail::EliasFano end_offsets;
+  end_offsets.load(is);
+  if (end_offsets.size() != document_ids.size()) {
+    throw std::runtime_error("searchlib: corrupt compressed postings");
+  }
+
+  positions_.clear();
+  positions_.reserve(document_ids.size());
+  uint64_t begin = 0;
+  for (size_t i = 0; i < document_ids.size(); i++) {
+    auto end = end_offsets.access(i);
+    if (end < begin) {
+      throw std::runtime_error("searchlib: corrupt compressed postings");
+    }
+    std::vector<size_t> positions;
+    positions.reserve(static_cast<size_t>(end - begin));
+    for (auto j = begin; j < end; j++) {
+      positions.push_back(
+          static_cast<size_t>(detail::read_scalar<uint64_t>(is)));
+    }
+    positions_.emplace_back(static_cast<size_t>(document_ids.access(i)),
+                            std::move(positions));
+    begin = end;
   }
 }
 
@@ -195,7 +260,8 @@ void InMemoryInvertedIndexBase::remove_document(size_t document_id) {
   removed_document_ids_.insert(document_id);
 }
 
-void InMemoryInvertedIndexBase::save(std::ostream &os) const {
+void InMemoryInvertedIndexBase::save(std::ostream &os,
+                                     IndexFormat format) const {
   // Documents section, ordered by document_id for deterministic output.
   detail::write_scalar<uint64_t>(os, documents_.size());
   std::vector<size_t> document_ids;
@@ -221,7 +287,19 @@ void InMemoryInvertedIndexBase::save(std::ostream &os) const {
   for (const auto *term : terms) {
     detail::write_u32string(os, term->str);
     detail::write_scalar<uint64_t>(os, term->term_count);
-    term->postings.save(os);
+    if (format == IndexFormat::Compressed) {
+      // Per-term representation flag; see kCompressedPostingsThreshold.
+      uint32_t compressed =
+          term->postings.size() >= kCompressedPostingsThreshold;
+      detail::write_scalar<uint32_t>(os, compressed);
+      if (compressed) {
+        term->postings.save_compressed(os);
+      } else {
+        term->postings.save(os);
+      }
+    } else {
+      term->postings.save(os);
+    }
   }
 
   // Removed-documents (tombstone) section, sorted for deterministic output.
@@ -234,7 +312,7 @@ void InMemoryInvertedIndexBase::save(std::ostream &os) const {
   }
 }
 
-void InMemoryInvertedIndexBase::load(std::istream &is) {
+void InMemoryInvertedIndexBase::load(std::istream &is, IndexFormat format) {
   documents_.clear();
   auto document_count = detail::read_scalar<uint64_t>(is);
   documents_.reserve(static_cast<size_t>(document_count));
@@ -253,7 +331,16 @@ void InMemoryInvertedIndexBase::load(std::istream &is) {
     auto &term = term_dictionary_[str];
     term.str = str;
     term.term_count = count;
-    term.postings.load(is);
+    if (format == IndexFormat::Compressed) {
+      auto compressed = detail::read_scalar<uint32_t>(is);
+      if (compressed) {
+        term.postings.load_compressed(is);
+      } else {
+        term.postings.load(is);
+      }
+    } else {
+      term.postings.load(is);
+    }
   }
 
   removed_document_ids_.clear();

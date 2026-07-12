@@ -3,6 +3,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 
 #include "test_utils.h"
 
@@ -85,6 +86,44 @@ TEST(KJVTest, SimpleTest) {
     EXPECT_AP(0.817, bm25_score(invidx, *expr, *postings, 0));
     EXPECT_AP(0.776, bm25_score(invidx, *expr, *postings, 1));
     EXPECT_AP(1.285, bm25_score(invidx, *expr, *postings, 2));
+  }
+}
+
+TEST(KJVTest, CompressedPersistenceRoundTrip) {
+  const auto &invidx = kjv_index();
+
+  std::stringstream plain(std::ios::in | std::ios::out | std::ios::binary);
+  invidx.save(plain);
+  std::stringstream compressed(std::ios::in | std::ios::out |
+                               std::ios::binary);
+  invidx.save(compressed, {}, IndexFormat::Compressed);
+
+  auto plain_size = plain.str().size();
+  auto compressed_size = compressed.str().size();
+  EXPECT_LT(compressed_size, plain_size);
+  std::cout << "KJV index size: plain=" << plain_size
+            << " compressed=" << compressed_size << " ("
+            << (compressed_size * 100.0 / plain_size) << "%)" << std::endl;
+
+  InMemoryInvertedIndex<TextRange> loaded;
+  loaded.load(compressed);
+
+  EXPECT_EQ(invidx.document_count(), loaded.document_count());
+  EXPECT_EQ(invidx.df(U"apple"), loaded.df(U"apple"));
+  EXPECT_EQ(invidx.df(U"the"), loaded.df(U"the")); // high-df: EF-encoded
+
+  auto expr = parse_query(normalizer, R"( apple )");
+  auto expected = perform_search(invidx, *expr);
+  auto actual = perform_search(loaded, *expr);
+  ASSERT_EQ(expected->size(), actual->size());
+  for (size_t i = 0; i < expected->size(); i++) {
+    EXPECT_EQ(expected->document_id(i), actual->document_id(i));
+    ASSERT_EQ(expected->search_hit_count(i), actual->search_hit_count(i));
+    for (size_t h = 0; h < expected->search_hit_count(i); h++) {
+      EXPECT_EQ(expected->term_position(i, h), actual->term_position(i, h));
+    }
+    EXPECT_AP(bm25_score(invidx, *expr, *expected, i),
+              bm25_score(loaded, *expr, *actual, i));
   }
 }
 

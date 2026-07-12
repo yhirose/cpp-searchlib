@@ -934,6 +934,100 @@ TEST(PersistenceTest, RemovedDocumentsSurvive) {
   EXPECT_EQ(2, postings->document_id(1));
 }
 
+// "common" appears in every document, taking its postings across the
+// Elias-Fano threshold, while each "termN" stays tiny and keeps the plain
+// per-term representation — so one index exercises both encodings.
+static InMemoryInvertedIndex<TextRange> wide_term_index(size_t document_count) {
+  InMemoryInvertedIndex<TextRange> invidx;
+  InMemoryIndexer indexer(invidx, normalizer);
+  for (size_t i = 0; i < document_count; i++) {
+    auto text = "common term" + std::to_string(i);
+    indexer.index_document(i, UTF8PlainTextTokenizer(text));
+  }
+  return invidx;
+}
+
+TEST(CompressedPersistenceTest, RoundTrip) {
+  auto invidx = wide_term_index(100);
+
+  std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+  invidx.save(ss, {}, IndexFormat::Compressed);
+
+  InMemoryInvertedIndex<TextRange> loaded;
+  loaded.load(ss); // the format is auto-detected from the header
+
+  EXPECT_EQ(invidx.document_count(), loaded.document_count());
+  for (auto term : {U"common" /* EF */, U"term42" /* plain */}) {
+    EXPECT_EQ(invidx.term_count(term), loaded.term_count(term));
+    EXPECT_EQ(invidx.df(term), loaded.df(term));
+  }
+
+  auto expr = parse_query(normalizer, "common term42");
+  auto expected = perform_search(invidx, *expr);
+  auto actual = perform_search(loaded, *expr);
+  ASSERT_EQ(expected->size(), actual->size());
+  for (size_t i = 0; i < expected->size(); i++) {
+    EXPECT_EQ(expected->document_id(i), actual->document_id(i));
+    ASSERT_EQ(expected->search_hit_count(i), actual->search_hit_count(i));
+    for (size_t h = 0; h < expected->search_hit_count(i); h++) {
+      auto a = invidx.text_range(*expected, i, h);
+      auto b = loaded.text_range(*actual, i, h);
+      EXPECT_EQ(a.position, b.position);
+      EXPECT_EQ(a.length, b.length);
+    }
+  }
+}
+
+TEST(CompressedPersistenceTest, AllTermsBelowThreshold) {
+  // sample_index's terms all have tiny postings, so a Compressed save falls
+  // back to the plain per-term representation throughout; the format must
+  // still round-trip.
+  auto invidx = sample_index();
+
+  std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+  invidx.save(ss, {}, IndexFormat::Compressed);
+
+  InMemoryInvertedIndex<TextRange> loaded;
+  loaded.load(ss);
+
+  auto expr = parse_query(normalizer, "the");
+  auto expected = perform_search(invidx, *expr);
+  auto actual = perform_search(loaded, *expr);
+  ASSERT_EQ(expected->size(), actual->size());
+  for (size_t i = 0; i < expected->size(); i++) {
+    EXPECT_EQ(expected->document_id(i), actual->document_id(i));
+  }
+}
+
+TEST(CompressedPersistenceTest, TombstoneSurvives) {
+  auto invidx = wide_term_index(100);
+  invidx.remove_document(42);
+
+  std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+  invidx.save(ss, {}, IndexFormat::Compressed);
+
+  InMemoryInvertedIndex<TextRange> loaded;
+  loaded.load(ss);
+
+  EXPECT_TRUE(loaded.is_document_removed(42));
+  auto expr = parse_query(normalizer, "common");
+  EXPECT_EQ(99, perform_search(loaded, *expr)->size());
+}
+
+TEST(CompressedPersistenceTest, SmallerThanPlain) {
+  auto invidx = wide_term_index(500);
+
+  std::stringstream plain(std::ios::in | std::ios::out | std::ios::binary);
+  invidx.save(plain, {}, IndexFormat::Plain);
+  std::stringstream compressed(std::ios::in | std::ios::out |
+                               std::ios::binary);
+  invidx.save(compressed, {}, IndexFormat::Compressed);
+
+  auto plain_size = plain.str().size();
+  auto compressed_size = compressed.str().size();
+  EXPECT_LT(compressed_size, plain_size);
+}
+
 TEST(ThreadSafetyTest, ReadWriteBasics) {
   ThreadSafeInvertedIndex<TextRange> index;
 

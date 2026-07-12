@@ -35,17 +35,23 @@ namespace searchlib {
 
 namespace detail {
 
-// The on-disk "plain" format (format_type 0) is a host-endian dump of
-// fixed-width fields, as designed in docs/embedded_minimal_roadmap.ja.md 9.1.
-// Every integer is normalized to a fixed 64-bit (or 32-bit for the header
-// tags) width so that a 32-bit and a 64-bit build agree on layout; endianness
-// is left host-native, which is acceptable because a plain-format index is
-// expected to be loaded on the same platform that wrote it. A future
-// format_type can add an endian-neutral or compressed layout without
-// disturbing this one.
+// The on-disk formats are host-endian dumps of fixed-width fields, as
+// designed in docs/embedded_minimal_roadmap.ja.md 9.1. Every integer is
+// normalized to a fixed 64-bit (or 32-bit for the header tags) width so that
+// a 32-bit and a 64-bit build agree on layout; endianness is left
+// host-native, which is acceptable because an index file is expected to be
+// loaded on the same platform that wrote it.
+//
+// format_type identifies peer alternatives (0 = plain fixed-width dump,
+// 2 = Elias-Fano compressed postings, 1 reserved for a future mmap layout;
+// see docs/postings_compression_design.ja.md), while schema_version tracks
+// layout evolution within one format_type, so each format versions
+// independently.
 inline constexpr char kIndexMagic[4] = {'S', 'I', 'D', 'X'};
 inline constexpr uint32_t kFormatTypePlain = 0;
-inline constexpr uint32_t kSchemaVersion = 2;
+inline constexpr uint32_t kFormatTypeCompressed = 2;
+inline constexpr uint32_t kSchemaVersionPlain = 2;
+inline constexpr uint32_t kSchemaVersionCompressed = 1;
 
 template <typename T> inline void write_scalar(std::ostream &os, T value) {
   static_assert(std::is_trivially_copyable_v<T>);
@@ -298,6 +304,16 @@ TextRange text_range(const TextRangeList<TextRange> &text_range_list,
                      const IPostings &positions, size_t index,
                      size_t search_hit_index);
 
+// Selects the on-disk representation for InMemoryInvertedIndex<T>::save.
+// The formats are peer alternatives, not versions: Plain favors encode/
+// decode simplicity, Compressed (Elias-Fano postings) favors file size.
+// Either way load() restores the same in-memory structure and auto-detects
+// the format from the file header, so no format argument is needed there.
+enum class IndexFormat : uint32_t {
+  Plain = 0,
+  Compressed = 2, // 1 is reserved for a future mmap-oriented format
+};
+
 class InMemoryInvertedIndexBase : public IInvertedIndex {
 public:
   size_t document_count() const override;
@@ -328,9 +344,10 @@ public:
   // Serialize/deserialize the T-independent part of the index (documents_
   // and term_dictionary_, including postings). The templated
   // InMemoryInvertedIndex<T> wraps this with the file header and the
-  // T-dependent text-range section.
-  void save(std::ostream &os) const;
-  void load(std::istream &is);
+  // T-dependent text-range section. The format decides the per-term
+  // postings encoding; the section layout is shared.
+  void save(std::ostream &os, IndexFormat format = IndexFormat::Plain) const;
+  void load(std::istream &is, IndexFormat format = IndexFormat::Plain);
 
   class Postings : public IPostings {
   public:
@@ -347,6 +364,14 @@ public:
 
     void save(std::ostream &os) const;
     void load(std::istream &is);
+
+    // Elias-Fano encoding of the same data: document_ids and the end
+    // offsets into a concatenated position array are stored as two
+    // monotone Elias-Fano sequences, the positions as fixed-width words
+    // (docs/postings_compression_design.ja.md section 3). Only used for
+    // postings long enough that the succinct-structure overhead pays off.
+    void save_compressed(std::ostream &os) const;
+    void load_compressed(std::istream &is);
 
   private:
     // Kept sorted by document_id ascending so that document_id(index) is
@@ -434,13 +459,15 @@ public:
   using TextRangeSerializer = std::function<void(std::ostream &, const T &)>;
   using TextRangeDeserializer = std::function<T(std::istream &)>;
 
-  void save(std::ostream &os,
-            const TextRangeSerializer &serialize_value = {}) const {
+  void save(std::ostream &os, const TextRangeSerializer &serialize_value = {},
+            IndexFormat format = IndexFormat::Plain) const {
     os.write(detail::kIndexMagic, sizeof(detail::kIndexMagic));
-    detail::write_scalar<uint32_t>(os, detail::kFormatTypePlain);
-    detail::write_scalar<uint32_t>(os, detail::kSchemaVersion);
+    detail::write_scalar<uint32_t>(os, static_cast<uint32_t>(format));
+    detail::write_scalar<uint32_t>(os, format == IndexFormat::Compressed
+                                           ? detail::kSchemaVersionCompressed
+                                           : detail::kSchemaVersionPlain);
 
-    base_.save(os);
+    base_.save(os, format);
 
     // Text-range section, ordered by document_id for deterministic output.
     detail::write_scalar<uint64_t>(os, text_range_list_.size());
@@ -468,15 +495,23 @@ public:
       throw std::runtime_error("searchlib: not a valid index file (bad magic)");
     }
     auto format_type = detail::read_scalar<uint32_t>(is);
-    if (format_type != detail::kFormatTypePlain) {
+    IndexFormat format;
+    uint32_t expected_schema_version;
+    if (format_type == detail::kFormatTypePlain) {
+      format = IndexFormat::Plain;
+      expected_schema_version = detail::kSchemaVersionPlain;
+    } else if (format_type == detail::kFormatTypeCompressed) {
+      format = IndexFormat::Compressed;
+      expected_schema_version = detail::kSchemaVersionCompressed;
+    } else {
       throw std::runtime_error("searchlib: unsupported index format_type");
     }
     auto schema_version = detail::read_scalar<uint32_t>(is);
-    if (schema_version != detail::kSchemaVersion) {
+    if (schema_version != expected_schema_version) {
       throw std::runtime_error("searchlib: unsupported index schema_version");
     }
 
-    base_.load(is);
+    base_.load(is, format);
 
     text_range_list_.clear();
     auto document_count = detail::read_scalar<uint64_t>(is);
@@ -493,13 +528,14 @@ public:
   }
 
   void save(const std::string &path,
-            const TextRangeSerializer &serialize_value = {}) const {
+            const TextRangeSerializer &serialize_value = {},
+            IndexFormat format = IndexFormat::Plain) const {
     std::ofstream os(path, std::ios::binary);
     if (!os) {
       throw std::runtime_error(
           "searchlib: cannot open index file for writing: " + path);
     }
-    save(os, serialize_value);
+    save(os, serialize_value, format);
   }
 
   void load(const std::string &path,

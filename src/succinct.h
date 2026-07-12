@@ -11,6 +11,8 @@
 #include <cstdint>
 #include <vector>
 
+#include "searchlib.h" // detail::write_scalar / read_scalar
+
 #if defined(_MSC_VER)
 #include <intrin.h>
 #endif
@@ -89,6 +91,24 @@ public:
 
   size_t ones() const { return ones_; }
   size_t zeros() const { return bit_count_ - ones_; }
+
+  // Writes the bit count and raw words; the rank index is rebuilt on load,
+  // so the on-disk form stays minimal and trivially deterministic.
+  void save(std::ostream &os) const {
+    write_scalar<uint64_t>(os, bit_count_);
+    for (auto word : words_) {
+      write_scalar<uint64_t>(os, word);
+    }
+  }
+
+  void load(std::istream &is) {
+    bit_count_ = static_cast<size_t>(read_scalar<uint64_t>(is));
+    words_.assign((bit_count_ + 63) / 64, 0);
+    for (auto &word : words_) {
+      word = read_scalar<uint64_t>(is);
+    }
+    build();
+  }
 
   // Number of 1 bits in [0, i). i may equal size().
   size_t rank1(size_t i) const {
@@ -232,6 +252,48 @@ public:
 
   size_t size() const { return size_; }
   uint64_t universe() const { return universe_; }
+
+  // Only (size, universe) and the raw words are stored; the low-bit width
+  // and array lengths are recomputed on load exactly as the constructor
+  // derives them, so save/load round-trips bit-for-bit.
+  void save(std::ostream &os) const {
+    write_scalar<uint64_t>(os, size_);
+    write_scalar<uint64_t>(os, universe_);
+    if (size_ == 0) {
+      return;
+    }
+    high_.save(os);
+    for (auto word : low_words_) {
+      write_scalar<uint64_t>(os, word);
+    }
+  }
+
+  void load(std::istream &is) {
+    size_ = static_cast<size_t>(read_scalar<uint64_t>(is));
+    universe_ = read_scalar<uint64_t>(is);
+    low_bits_ = 0;
+    high_ = BitVector();
+    low_words_.clear();
+    if (size_ == 0) {
+      return;
+    }
+
+    auto ratio = universe_ / size_;
+    while (low_bits_ + 1 < 64 && (uint64_t(1) << (low_bits_ + 1)) <= ratio) {
+      low_bits_++;
+    }
+
+    high_.load(is);
+    auto bucket_count = static_cast<size_t>((universe_ - 1) >> low_bits_) + 1;
+    if (high_.size() != size_ + bucket_count || high_.ones() != size_) {
+      throw std::runtime_error("searchlib: corrupt Elias-Fano data");
+    }
+
+    low_words_.assign((size_ * low_bits_ + 63) / 64 + 1, 0);
+    for (auto &word : low_words_) {
+      word = read_scalar<uint64_t>(is);
+    }
+  }
 
   // The i-th value. i must be less than size().
   uint64_t access(size_t i) const {
