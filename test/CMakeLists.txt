@@ -18,6 +18,7 @@ add_executable(
   test_kjv.cc
   test_kjv_chapters.cc
   test_federated.cc
+  test_analyzer.cc
   test_succinct.cc
   ../src/utils.cpp
   ../src/invertedindex.cpp
@@ -25,6 +26,7 @@ add_executable(
   ../src/search.cpp
   ../src/query.cpp
   ../src/tokenizer.cpp
+  ../src/analyzer.cpp
   ../src/federatedindex.cpp
 )
 

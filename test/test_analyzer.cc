@@ -1,0 +1,149 @@
+#include <gtest/gtest.h>
+#include <searchlib.h>
+
+#include "test_utils.h"
+
+using namespace searchlib;
+
+namespace {
+
+TermFilter lowercase_filter() {
+  return to_term_filter(
+      [](const std::u32string &s) { return unicode::to_lowercase(s); });
+}
+
+TermFilter stop_word_filter(std::unordered_set<std::u32string> words) {
+  return [words = std::move(words)](const std::u32string &s,
+                                    std::function<void(std::u32string)> emit) {
+    if (words.find(s) == words.end()) {
+      emit(s);
+    }
+  };
+}
+
+// Lowercases the query the same way the index chain does, so index/query
+// term boundaries agree (parse_query still only takes a Normalizer here).
+auto lc_normalizer = [](auto sv) { return unicode::to_lowercase(sv); };
+
+std::vector<size_t> search_ids(const IInvertedIndex &index,
+                               const std::string &query, Normalizer nz) {
+  auto expr = parse_query(nz, query);
+  std::vector<size_t> ids;
+  if (!expr) return ids;
+  auto postings = perform_search(index, *expr);
+  for (size_t i = 0; i < postings->size(); i++) {
+    ids.push_back(postings->document_id(i));
+  }
+  return ids;
+}
+
+} // namespace
+
+TEST(AnalyzerTest, LowercaseAndStopWordChain) {
+  auto chain = compose({lowercase_filter(),
+                        stop_word_filter({U"the", U"of", U"a", U"is"})});
+
+  InMemoryInvertedIndex<TextRange> index;
+  InMemoryIndexer indexer(index, nullptr); // normalization lives in the chain
+  indexer.index_document(
+      0, Analyzer<TextRange>{UTF8PlainTextTokenizer("The Quick Brown Fox"),
+                             chain});
+  indexer.index_document(
+      1, Analyzer<TextRange>{UTF8PlainTextTokenizer("A lazy dog"), chain});
+
+  // Content words are found regardless of the original casing.
+  EXPECT_EQ((std::vector<size_t>{0}), search_ids(index, "quick", lc_normalizer));
+  EXPECT_EQ((std::vector<size_t>{0}), search_ids(index, "QUICK", lc_normalizer));
+  EXPECT_EQ((std::vector<size_t>{1}), search_ids(index, "dog", lc_normalizer));
+
+  // Stop words were dropped at index time, so they match nothing.
+  EXPECT_TRUE(search_ids(index, "the", lc_normalizer).empty());
+  EXPECT_FALSE(index.term_exists(U"the"));
+  EXPECT_FALSE(index.term_exists(U"a"));
+
+  // Dropped tokens are not counted toward document length (design 4.3).
+  EXPECT_EQ(3u, index.document_term_count(0)); // quick brown fox
+  EXPECT_EQ(2u, index.document_term_count(1)); // lazy dog
+}
+
+TEST(AnalyzerTest, DropsCloseThePositionGap) {
+  auto chain = compose({lowercase_filter(), stop_word_filter({U"of", U"the"})});
+
+  InMemoryInvertedIndex<TextRange> index;
+  InMemoryIndexer indexer(index, nullptr);
+  indexer.index_document(
+      0, Analyzer<TextRange>{UTF8PlainTextTokenizer("apple of the tree"),
+                             chain});
+
+  // Surviving tokens are renumbered 0,1 (the gap is closed): apple@0 tree@1.
+  auto apple = index.postings(U"apple");
+  auto tree = index.postings(U"tree");
+  ASSERT_EQ(1u, apple->size());
+  ASSERT_EQ(1u, tree->size());
+  EXPECT_EQ(0u, apple->term_position(0, 0));
+  EXPECT_EQ(1u, tree->term_position(0, 0));
+
+  // Consequence of closing the gap: the phrase "apple tree" false-matches
+  // across the removed stop words (documented known trade-off, design 4.2).
+  EXPECT_EQ((std::vector<size_t>{0}),
+            search_ids(index, "\"apple tree\"", lc_normalizer));
+
+  // text_range still points into the original text via the carried-through
+  // offsets, unaffected by the dropped tokens preceding "tree".
+  auto range = index.text_range(*tree, 0, 0);
+  EXPECT_EQ(std::string("tree"),
+            std::string("apple of the tree")
+                .substr(range.position, range.length));
+}
+
+TEST(AnalyzerTest, IndexSideOneToManyThrows) {
+  // A filter that emits twice for one token (index-time synonym expansion).
+  TermFilter duplicating = [](const std::u32string &s,
+                              std::function<void(std::u32string)> emit) {
+    emit(s);
+    emit(s + U"2");
+  };
+
+  InMemoryInvertedIndex<TextRange> index;
+  InMemoryIndexer indexer(index, nullptr);
+  EXPECT_THROW(
+      indexer.index_document(
+          0, Analyzer<TextRange>{UTF8PlainTextTokenizer("hello world"),
+                                 duplicating}),
+      std::runtime_error);
+}
+
+TEST(AnalyzerTest, NormalizerAppliesAsStageZero) {
+  // Identity chain, but the indexer carries a lowercasing normalizer. It must
+  // be applied (as stage 0) rather than silently ignored.
+  InMemoryInvertedIndex<TextRange> index;
+  InMemoryIndexer indexer(index, lc_normalizer);
+  indexer.index_document(
+      0, Analyzer<TextRange>{UTF8PlainTextTokenizer("HELLO World"),
+                             compose({})});
+
+  EXPECT_TRUE(index.term_exists(U"hello"));
+  EXPECT_TRUE(index.term_exists(U"world"));
+  EXPECT_FALSE(index.term_exists(U"HELLO"));
+}
+
+TEST(AnalyzerTest, ComposeIsLeftToRightAndEmptyIsIdentity) {
+  std::vector<std::u32string> out;
+
+  // Empty compose is the identity (emits input once).
+  compose({})(U"Foo", [&](std::u32string s) { out.push_back(s); });
+  EXPECT_EQ((std::vector<std::u32string>{U"Foo"}), out);
+
+  // Order matters: lowercase THEN drop "foo" removes it; the reverse keeps it
+  // because "Foo" != "foo" when the stop-word stage runs first.
+  auto drop_foo = stop_word_filter({U"foo"});
+  out.clear();
+  compose({lowercase_filter(), drop_foo})(U"Foo",
+                                          [&](std::u32string s) { out.push_back(s); });
+  EXPECT_TRUE(out.empty());
+
+  out.clear();
+  compose({drop_foo, lowercase_filter()})(U"Foo",
+                                          [&](std::u32string s) { out.push_back(s); });
+  EXPECT_EQ((std::vector<std::u32string>{U"foo"}), out);
+}

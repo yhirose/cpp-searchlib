@@ -93,6 +93,44 @@ TEST(FederatedSearchTest, MutableMemberWiring) {
   EXPECT_EQ(std::vector<size_t>{0}, mock_mutable->removed_document_ids);
 }
 
+TEST(FederatedSearchTest, RemoveDocumentExcludesFromFederatedSearch) {
+  // Unlike MutableMemberWiring (which uses a mock that records but does not
+  // delete), this exercises real logical deletion end-to-end: a document
+  // removed through a member's IMutableInvertedIndex must disappear from
+  // perform_federated_search via the tombstone -> FilteredPostings path.
+  auto book = make_index({"This is the first book.", "Another book here."});
+  auto notes = make_index({"A note about the book.", "Unrelated memo."});
+
+  FederatedIndex federation;
+  federation.add(book);            // read-only member
+  federation.add(notes, notes);    // mutable member (real InMemoryInvertedIndex)
+
+  auto expr = parse_query(federated_normalizer, "book");
+  ASSERT_TRUE(expr);
+
+  // book/0, book/1 and notes/0 all mention "book".
+  ASSERT_EQ(3, perform_federated_search(federation, *expr).size());
+
+  // Remove notes/0 through the member's mutable handle from the snapshot.
+  auto members = federation.snapshot();
+  ASSERT_EQ(notes, members[1].index);
+  ASSERT_NE(nullptr, members[1].mutable_index);
+  members[1].mutable_index->remove_document(0);
+
+  auto hits = perform_federated_search(federation, *expr);
+  ASSERT_EQ(2, hits.size());
+  for (const auto &hit : hits) {
+    EXPECT_EQ(book, hit.index); // only the book members survive
+  }
+
+  // Re-indexing the same id clears the tombstone and it returns.
+  {
+    InMemoryIndexer indexer(*notes, federated_normalizer);
+    indexer.index_document(0, UTF8PlainTextTokenizer("A note about the book."));
+  }
+  EXPECT_EQ(3, perform_federated_search(federation, *expr).size());
+}
+
 TEST(FederatedSearchTest, MixedInMemoryAndCompressedMembers) {
   // An installed, read-only corpus served by the compressed backend,
   // searched together with a mutable in-memory notes index.

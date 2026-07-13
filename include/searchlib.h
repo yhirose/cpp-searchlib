@@ -152,6 +152,35 @@ using Tokenizer =
                                           size_t term_pos, T text_range)>
                            callback)>;
 
+//-----------------------------------------------------------------------------
+// Analyzer pipeline (see docs/analyzer_pipeline_design.ja.md)
+//-----------------------------------------------------------------------------
+
+// One composable stage of an analyzer pipeline. It receives a single token
+// string and calls emit 0 times (drop, e.g. stop-word removal), 1 time
+// (transform, e.g. lowercasing/stemming), or several times (expansion, e.g.
+// synonyms). Equivalent to Lucene's TokenFilter / Tantivy's TokenFilter
+// trait, but kept in the same push-style (continuation-passing) shape as
+// Tokenizer<T>.
+//
+// Note: the type can express 1->N, but the index-side Analyzer<T> supports
+// only 1->0 / 1->1 (v1); 1->N is reserved for query-side expansion. It is
+// intentionally independent of the text-range type T so that the same string
+// logic can be reused by parse_query (design section 6).
+using TermFilter =
+    std::function<void(const std::u32string &str,
+                       std::function<void(std::u32string)> emit)>;
+
+// Serially composes several TermFilters left-to-right into one TermFilter;
+// the vector order is the application order. An empty vector yields the
+// identity filter (emits its input once).
+TermFilter compose(std::vector<TermFilter> filters);
+
+// Lifts an existing Normalizer (a single 1->1 string transform) into a
+// TermFilter that always emits exactly once. A null Normalizer lifts to the
+// identity filter.
+TermFilter to_term_filter(Normalizer normalizer);
+
 template <typename T> class ITextRange {
 public:
   virtual ~ITextRange(){};
@@ -238,6 +267,14 @@ struct FederatedHit {
 //
 // This class only guards its own member list; it does not make any
 // individual IInvertedIndex/IMutableInvertedIndex thread-safe on its own.
+//
+// There is deliberately no federation-level remove_document(document_id):
+// document ids are member-local (see the note on IPostings::document_id), so
+// an id alone does not identify which member to delete from. Callers remove
+// through the owning member's IMutableInvertedIndex
+// (FederationMember::mutable_index->remove_document(id)); a removed document
+// then disappears from perform_federated_search automatically, since each
+// member's perform_search filters its own tombstones.
 class FederatedIndex {
 public:
   void add(std::shared_ptr<IInvertedIndex> index,
@@ -297,6 +334,71 @@ public:
 
 private:
   std::string_view text_;
+};
+
+// Wraps a raw-splitting Tokenizer<T> (e.g. UTF8PlainTextTokenizer) with a
+// TermFilter chain and re-exposes the result under the existing Tokenizer<T>
+// contract, so IIndexer/InMemoryIndexer/InMemoryInvertedIndex need no changes
+// -- callers just swap UTF8PlainTextTokenizer for
+// Analyzer<T>{UTF8PlainTextTokenizer(text), chain}.
+//
+// Position policy (v1): only tokens that survive the chain get 0,1,2,...
+// term positions; dropped tokens do NOT consume a position (gaps are
+// closed). This keeps the term_pos == text_range array-index invariant that
+// InMemoryIndexer and the text-range machinery (including the format_type=2
+// on-disk layout) depend on -- see design section 1.1. The known trade-off
+// is that a phrase spanning removed stop-words can false-match (e.g. "apple
+// of the tree" indexes as "apple tree"); gap-preservation is a future step.
+//
+// If a filter emits more than once for one token (1->N), operator() throws:
+// silently accepting it would break the same invariant and make text_range
+// read out of bounds. Index-side synonym expansion is intentionally
+// unsupported; do it query-side (design section 5).
+//
+// The text_range from base_tokenizer is carried through to the emitted
+// output unchanged (offsets are into the original text, so filtering the
+// string does not move them). The normalizer passed to operator() is applied
+// as "stage 0" (before the chain) by being forwarded to base_tokenizer,
+// matching InMemoryIndexer, which always hands its normalizer to the
+// tokenizer -- ignoring it would silently drop a normalizer-equipped
+// indexer's normalization.
+template <typename T> class Analyzer {
+public:
+  Analyzer(Tokenizer<T> base_tokenizer, TermFilter filter)
+      : base_tokenizer_(std::move(base_tokenizer)),
+        filter_(std::move(filter)) {}
+
+  void operator()(Normalizer normalizer,
+                  std::function<void(const std::u32string &, size_t, T)>
+                      callback) {
+    size_t term_pos = 0;
+    base_tokenizer_(normalizer, [&](const std::u32string &str, size_t,
+                                    T text_range) {
+      size_t emit_count = 0;
+      auto emit = [&](std::u32string out) {
+        if (++emit_count > 1) {
+          throw std::runtime_error(
+              "searchlib: Analyzer does not support 1->N (synonym) expansion "
+              "on the index side; expand synonyms query-side instead");
+        }
+        callback(out, term_pos, text_range);
+      };
+      if (filter_) {
+        filter_(str, emit);
+      } else {
+        emit(str);
+      }
+      // Only advance the position when at least one token survived, so drops
+      // close the gap (term_pos stays == text_range array index).
+      if (emit_count > 0) {
+        term_pos++;
+      }
+    });
+  }
+
+private:
+  Tokenizer<T> base_tokenizer_;
+  TermFilter filter_;
 };
 
 //-----------------------------------------------------------------------------
