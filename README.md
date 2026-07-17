@@ -110,3 +110,17 @@ The on-disk format is a "plain" host-native dump (`format_type` 0) tagged with
 a `format_type`/`schema_version` header, leaving room for compressed or
 mmap-friendly backends later. It is intended to be loaded on the same platform
 that wrote it.
+
+## CLI
+
+`cli/` builds a small `searchlib-cli` executable exercising the library:
+
+```sh
+# Index every file under a directory into INDEX_PATH (plus an
+# INDEX_PATH.manifest sidecar mapping document ids back to file paths).
+searchlib-cli index SOURCE INDEX_PATH
+
+# Search INDEX_PATH, printing the top hits ranked by BM25 with their
+# matching text ranges.
+searchlib-cli search INDEX_PATH QUERY [-n N]
+```
