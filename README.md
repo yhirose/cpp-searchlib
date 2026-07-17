@@ -111,7 +111,7 @@ a `format_type`/`schema_version` header, leaving room for compressed or
 mmap-friendly backends later. It is intended to be loaded on the same platform
 that wrote it.
 
-## Multi-field schema, DocValues, Stored Fields
+## Multi-field schema
 
 Documents with several distinct text fields (title/body/tags) each get their
 own `InMemoryInvertedIndex`, grouped by name in a `MultiFieldIndex`. Because
@@ -137,29 +137,6 @@ auto hits = perform_multi_field_search(index, *expr);
 
 There is no query-string `field:` syntax; field selection is a C++-level
 choice. `MultiFieldIndex::save`/`load` persist every field.
-
-`DocValues<T>` is a columnar per-document scalar store (a sort key, a facet
-bucket id, ...) for O(1) lookup without walking postings, independent of the
-inverted index:
-
-```cpp
-DocValues<uint64_t> published_year;
-published_year.set(0, 1925);
-auto year = published_year.get(0); // std::optional<uint64_t>
-```
-
-`StoredFields` holds the original per-document payload (raw text, JSON, ...)
-alongside the index, so callers don't need a separate out-of-band
-`documents[document_id]` table:
-
-```cpp
-StoredFields titles;
-titles.set(0, "The Great Gatsby");
-const std::string *original = titles.get(0);
-```
-
-Both are wired to an index purely by sharing `document_id` values, and both
-have `save`/`load`.
 
 ## CLI
 
