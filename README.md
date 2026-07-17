@@ -67,6 +67,20 @@ only valid along with at least one positive term.
 `term_count_score`, `tf_idf_score` and `bm25_score` are available to score
 each search result. Ranking is up to the caller.
 
+`top_k` collects the k highest-scoring hits using a bounded min-heap
+(`O(n log k)` instead of scoring and sorting every hit):
+
+```cpp
+auto hits = top_k(*result, 10, [&](size_t i) {
+  return bm25_score(invidx, *expr, *result, i);
+});
+
+for (const auto &hit : hits) {
+  auto document_id = result->document_id(hit.index);
+  // hit.score
+}
+```
+
 ## Persistence
 
 An index can be saved to and loaded from disk, so it does not have to be

@@ -769,6 +769,120 @@ TEST(TF_IDF_Test, TF_IDF) {
   }
 }
 
+TEST(TopKTest, ReturnsHighestScoresDescending) {
+  const std::vector<std::string> documents = {
+      "apple apple apple",
+      "apple",
+      "banana",
+      "apple apple",
+  };
+
+  InMemoryInvertedIndex<TextRange> invidx;
+  {
+    InMemoryIndexer indexer(invidx, normalizer);
+    size_t document_id = 0;
+    for (const auto &doc : documents) {
+      UTF8PlainTextTokenizer tokenizer(doc);
+      indexer.index_document(document_id, tokenizer);
+      document_id++;
+    }
+  }
+
+  auto expr = parse_query(normalizer, "apple");
+  auto result = perform_search(invidx, *expr);
+  ASSERT_EQ(3, result->size()); // docs 0, 1, 3
+
+  auto hits = top_k(*result, 2, [&](size_t i) {
+    return term_count_score(invidx, *expr, *result, i);
+  });
+
+  ASSERT_EQ(2, hits.size());
+  EXPECT_EQ(0, result->document_id(hits[0].index));
+  EXPECT_EQ(3, hits[0].score);
+  EXPECT_EQ(3, result->document_id(hits[1].index));
+  EXPECT_EQ(2, hits[1].score);
+}
+
+TEST(TopKTest, KGreaterThanCountReturnsAllSorted) {
+  const std::vector<std::string> documents = {
+      "apple",
+      "apple apple apple",
+      "apple apple",
+  };
+
+  InMemoryInvertedIndex<TextRange> invidx;
+  {
+    InMemoryIndexer indexer(invidx, normalizer);
+    size_t document_id = 0;
+    for (const auto &doc : documents) {
+      UTF8PlainTextTokenizer tokenizer(doc);
+      indexer.index_document(document_id, tokenizer);
+      document_id++;
+    }
+  }
+
+  auto expr = parse_query(normalizer, "apple");
+  auto result = perform_search(invidx, *expr);
+
+  auto hits = top_k(*result, 10, [&](size_t i) {
+    return term_count_score(invidx, *expr, *result, i);
+  });
+
+  ASSERT_EQ(3, hits.size());
+  EXPECT_EQ(1, result->document_id(hits[0].index));
+  EXPECT_EQ(2, result->document_id(hits[1].index));
+  EXPECT_EQ(0, result->document_id(hits[2].index));
+}
+
+TEST(TopKTest, ZeroKReturnsEmpty) {
+  const std::vector<std::string> documents = {"apple"};
+
+  InMemoryInvertedIndex<TextRange> invidx;
+  InMemoryIndexer indexer(invidx, normalizer);
+  UTF8PlainTextTokenizer tokenizer(documents[0]);
+  indexer.index_document(0, tokenizer);
+
+  auto expr = parse_query(normalizer, "apple");
+  auto result = perform_search(invidx, *expr);
+
+  auto hits = top_k(*result, 0, [&](size_t i) {
+    return term_count_score(invidx, *expr, *result, i);
+  });
+
+  EXPECT_TRUE(hits.empty());
+}
+
+TEST(TopKTest, TiesBrokenByAscendingIndex) {
+  const std::vector<std::string> documents = {
+      "apple",
+      "apple",
+      "apple",
+  };
+
+  InMemoryInvertedIndex<TextRange> invidx;
+  {
+    InMemoryIndexer indexer(invidx, normalizer);
+    size_t document_id = 0;
+    for (const auto &doc : documents) {
+      UTF8PlainTextTokenizer tokenizer(doc);
+      indexer.index_document(document_id, tokenizer);
+      document_id++;
+    }
+  }
+
+  auto expr = parse_query(normalizer, "apple");
+  auto result = perform_search(invidx, *expr);
+
+  auto hits = top_k(*result, 3, [&](size_t i) {
+    return term_count_score(invidx, *expr, *result, i);
+  });
+
+  ASSERT_EQ(3, hits.size());
+  EXPECT_EQ(0, hits[0].index);
+  EXPECT_EQ(1, hits[1].index);
+  EXPECT_EQ(2, hits[2].index);
+}
+
 TEST(PersistenceTest, RoundTrip) {
   auto invidx = sample_index();
 

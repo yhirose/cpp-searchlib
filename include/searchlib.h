@@ -271,6 +271,69 @@ double bm25_score(const IInvertedIndex &invidx, const Expression &expr,
                   double b = 0.75);
 
 //-----------------------------------------------------------------------------
+// Ranking support: bounded top-k collection
+//-----------------------------------------------------------------------------
+
+// One collected hit: `index` is the position in whatever result collection
+// score_fn was scoring (e.g. an index into IPostings, or into a
+// FederatedHit vector), not a document id.
+struct ScoredHit {
+  size_t index;
+  double score;
+};
+
+// Collects the k highest-scoring hits out of [0, count) using a bounded
+// min-heap, i.e. O(count * log k) instead of the naive "score everything,
+// then sort everything" O(count * log count). score_fn(i) computes the
+// score for element i; it is called exactly once per i. Returns hits
+// sorted by descending score, ties broken by ascending index.
+template <typename ScoreFn>
+std::vector<ScoredHit> top_k(size_t count, size_t k, ScoreFn score_fn) {
+  std::vector<ScoredHit> heap;
+  if (k == 0 || count == 0) {
+    return heap;
+  }
+  heap.reserve(std::min(count, k));
+
+  // Heap top is the smallest score currently kept, so it's the first
+  // candidate to evict when a better-scoring hit shows up.
+  auto min_heap_order = [](const ScoredHit &a, const ScoredHit &b) {
+    return a.score > b.score;
+  };
+
+  for (size_t i = 0; i < count; i++) {
+    double score = static_cast<double>(score_fn(i));
+    if (heap.size() < k) {
+      heap.push_back(ScoredHit{i, score});
+      std::push_heap(heap.begin(), heap.end(), min_heap_order);
+    } else if (score > heap.front().score) {
+      std::pop_heap(heap.begin(), heap.end(), min_heap_order);
+      heap.back() = ScoredHit{i, score};
+      std::push_heap(heap.begin(), heap.end(), min_heap_order);
+    }
+  }
+
+  std::sort(heap.begin(), heap.end(), [](const ScoredHit &a, const ScoredHit &b) {
+    if (a.score != b.score) {
+      return a.score > b.score;
+    }
+    return a.index < b.index;
+  });
+  return heap;
+}
+
+// Convenience overload for the common case of ranking a single IPostings
+// result set, e.g.:
+//   auto hits = top_k(*result, 10, [&](size_t i) {
+//     return bm25_score(invidx, *expr, *result, i);
+//   });
+template <typename ScoreFn>
+std::vector<ScoredHit> top_k(const IPostings &postings, size_t k,
+                             ScoreFn score_fn) {
+  return top_k(postings.size(), k, std::move(score_fn));
+}
+
+//-----------------------------------------------------------------------------
 // Federated Search
 //-----------------------------------------------------------------------------
 
