@@ -45,8 +45,13 @@ static bool is_valid_expression(const Expression &expr) {
   }
 }
 
-std::optional<Expression> parse_query(Normalizer normalizer,
-                                      std::string_view query) {
+static const size_t DEFAULT_NEAR_SIZE = 4;
+
+// Shared grammar for both parse_query overloads; only TERM handling (how a
+// raw query token becomes an Expression) differs between them.
+static std::optional<Expression>
+parse_query_impl(const std::function<Expression(std::string_view)> &term_handler,
+                 std::string_view query) {
   static peg::parser parser(R"(
     ROOT        <- OR?
     OR          <- AND ('|' AND)*
@@ -66,8 +71,6 @@ std::optional<Expression> parse_query(Normalizer normalizer,
     }
     return std::nullopt;
   };
-
-  size_t DEFAULT_NEAR_SIZE = 4;
 
   auto list_handler = [&](Operation operation) {
     return [=](const peg::SemanticValues &vs) {
@@ -109,27 +112,7 @@ std::optional<Expression> parse_query(Normalizer normalizer,
   };
 
   parser["TERM"] = [&](const peg::SemanticValues &vs) {
-    // Tokenize the query token with the same logic as documents, so that
-    // index side and query side always agree on term boundaries.
-    std::vector<Expression> nodes;
-    UTF8PlainTextTokenizer tokenizer(vs.token());
-    tokenizer(normalizer, [&](const auto &str, auto, auto) {
-      nodes.push_back(Expression{Operation::Term, str});
-    });
-
-    if (nodes.empty()) {
-      // No letter sequence in the token (e.g. digits only); such a term can
-      // never exist in the index and matches nothing.
-      auto term = normalizer ? normalizer(u32(vs.token())) : u32(vs.token());
-      return Expression{Operation::Term, term};
-    }
-    if (nodes.size() == 1) {
-      return nodes[0];
-    }
-    // A token split into multiple terms (e.g. `well-known`) is an implicit
-    // phrase.
-    return Expression{Operation::Adjacent, std::u32string(), DEFAULT_NEAR_SIZE,
-                      std::move(nodes)};
+    return term_handler(vs.token());
   };
 
   // parser.log = [](size_t line, size_t col, const std::string& msg) {
@@ -146,6 +129,84 @@ std::optional<Expression> parse_query(Normalizer normalizer,
   }
 
   return expr;
+}
+
+std::optional<Expression> parse_query(Normalizer normalizer,
+                                      std::string_view query) {
+  return parse_query(to_term_filter(std::move(normalizer)), query);
+}
+
+std::optional<Expression> parse_query(TermFilter filter,
+                                      std::string_view query) {
+  // Tokenize the raw query token with the same splitting logic as
+  // documents (index side and query side always agree on term
+  // boundaries), then run each split piece through the same TermFilter
+  // chain an index-side Analyzer<T> would use.
+  auto term_handler = [&](std::string_view token) -> Expression {
+    auto run_filter = [&](const std::u32string &str) {
+      std::vector<std::u32string> emitted;
+      if (filter) {
+        filter(str, [&](std::u32string out) { emitted.push_back(std::move(out)); });
+      } else {
+        emitted.push_back(str);
+      }
+      return emitted;
+    };
+
+    auto to_expression = [](std::vector<std::u32string> emitted) {
+      // A single emit is a plain Term; a filter that expanded one token into
+      // several (e.g. synonyms) maps to an Or, never an implicit Adjacent
+      // phrase (that would build the wrong query, e.g. "usa united states").
+      if (emitted.size() == 1) {
+        return Expression{Operation::Term, emitted[0]};
+      }
+      std::vector<Expression> nodes;
+      for (auto &term : emitted) {
+        nodes.push_back(Expression{Operation::Term, term});
+      }
+      return Expression{Operation::Or, std::u32string(), 0, std::move(nodes)};
+    };
+
+    std::vector<Expression> nodes;
+    bool split_any = false;
+    UTF8PlainTextTokenizer tokenizer(token);
+    tokenizer(nullptr, [&](const auto &str, auto, auto) {
+      split_any = true;
+      auto emitted = run_filter(str);
+      if (emitted.empty()) {
+        // Dropped (e.g. stop word); close the gap, matching how
+        // Analyzer<T> closes position gaps on the index side.
+        return;
+      }
+      nodes.push_back(to_expression(std::move(emitted)));
+    });
+
+    if (!split_any) {
+      // No letter sequence in the token (e.g. digits only); such a term can
+      // never exist in the index. Run it through the filter as-is so a
+      // configured chain (e.g. lowercasing) still applies, but an empty
+      // result still matches nothing.
+      auto emitted = run_filter(u32(token));
+      if (emitted.empty()) {
+        return Expression{Operation::Term, u32(token)};
+      }
+      return to_expression(std::move(emitted));
+    }
+
+    if (nodes.empty()) {
+      // Every split piece was dropped by the filter; matches nothing.
+      return Expression{Operation::Term, std::u32string()};
+    }
+    if (nodes.size() == 1) {
+      return nodes[0];
+    }
+    // A token split into multiple pieces (e.g. `well-known`) is an implicit
+    // phrase.
+    return Expression{Operation::Adjacent, std::u32string(), DEFAULT_NEAR_SIZE,
+                      std::move(nodes)};
+  };
+
+  return parse_query_impl(term_handler, query);
 }
 
 } // namespace searchlib

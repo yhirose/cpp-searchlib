@@ -253,6 +253,17 @@ struct Expression {
 std::optional<Expression> parse_query(Normalizer normalizer,
                                       std::string_view query);
 
+// Same grammar as the Normalizer overload, but reuses the same TermFilter
+// chain used to build an index-side Analyzer<T>, so query-time term
+// splitting/filtering stays symmetric with index-time (see design section
+// 6). Unlike the Analyzer<T> index path, this overload does not throw on
+// 1->N: a filter that expands one raw token into several (e.g. synonyms)
+// maps to an `Or` of those terms, while a token the raw tokenizer itself
+// split into several pieces (e.g. `well-known`) still maps to the implicit
+// `Adjacent` phrase, exactly as the Normalizer overload does.
+std::optional<Expression> parse_query(TermFilter filter,
+                                      std::string_view query);
+
 // scope_index is consulted only for Operation::SameScope nodes; if null,
 // such nodes contribute no matches (the same "no match" treatment as an
 // empty And/Or operand), rather than throwing.

@@ -37,7 +37,74 @@ std::vector<size_t> search_ids(const IInvertedIndex &index,
   return ids;
 }
 
+std::vector<size_t> search_ids(const IInvertedIndex &index,
+                               const std::string &query, TermFilter filter) {
+  auto expr = parse_query(filter, query);
+  std::vector<size_t> ids;
+  if (!expr) return ids;
+  auto postings = perform_search(index, *expr);
+  for (size_t i = 0; i < postings->size(); i++) {
+    ids.push_back(postings->document_id(i));
+  }
+  return ids;
+}
+
 } // namespace
+
+TEST(AnalyzerTest, QueryTermFilterMirrorsIndexChain) {
+  // Same chain drives both index and query side, so a query for a stop word
+  // matches nothing while a content word still matches regardless of case.
+  auto chain = compose({lowercase_filter(), stop_word_filter({U"of", U"the"})});
+
+  InMemoryInvertedIndex<TextRange> index;
+  InMemoryIndexer indexer(index, nullptr);
+  indexer.index_document(
+      0, Analyzer<TextRange>{UTF8PlainTextTokenizer("apple of the tree"),
+                             chain});
+
+  EXPECT_EQ((std::vector<size_t>{0}), search_ids(index, "APPLE", chain));
+  EXPECT_TRUE(search_ids(index, "the", chain).empty());
+
+  // The same gap-closing trade-off from the index side (design 4.2) shows up
+  // query-side too, since the query chain closes the gap the same way: a
+  // phrase spanning a dropped stop word still matches.
+  EXPECT_EQ((std::vector<size_t>{0}),
+            search_ids(index, "\"apple tree\"", chain));
+}
+
+TEST(AnalyzerTest, QueryTermFilterOneToManyMapsToOr) {
+  // Unlike the index-side Analyzer<T>, a 1->N filter is legal query-side and
+  // maps to Or, not an implicit Adjacent phrase (design section 6).
+  TermFilter synonyms = [](const std::u32string &s,
+                           std::function<void(std::u32string)> emit) {
+    emit(s);
+    if (s == U"usa") emit(U"america");
+  };
+
+  auto expr = parse_query(synonyms, "usa");
+  ASSERT_TRUE(expr.has_value());
+  EXPECT_EQ(Operation::Or, expr->operation);
+  ASSERT_EQ(2u, expr->nodes.size());
+  EXPECT_EQ(U"usa", expr->nodes[0].term_str);
+  EXPECT_EQ(U"america", expr->nodes[1].term_str);
+
+  InMemoryInvertedIndex<TextRange> index;
+  InMemoryIndexer indexer(index, nullptr);
+  indexer.index_document(
+      0, Analyzer<TextRange>{UTF8PlainTextTokenizer("america"), compose({})});
+  EXPECT_EQ((std::vector<size_t>{0}), search_ids(index, "usa", synonyms));
+}
+
+TEST(AnalyzerTest, QueryTermFilterRawSplitStaysAdjacent) {
+  // A token the raw tokenizer itself splits (e.g. `well-known`) is still an
+  // implicit Adjacent phrase, distinct from a filter's 1->N expansion.
+  auto expr = parse_query(TermFilter(nullptr), "well-known");
+  ASSERT_TRUE(expr.has_value());
+  EXPECT_EQ(Operation::Adjacent, expr->operation);
+  ASSERT_EQ(2u, expr->nodes.size());
+  EXPECT_EQ(U"well", expr->nodes[0].term_str);
+  EXPECT_EQ(U"known", expr->nodes[1].term_str);
+}
 
 TEST(AnalyzerTest, LowercaseAndStopWordChain) {
   auto chain = compose({lowercase_filter(),
