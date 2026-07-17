@@ -25,6 +25,22 @@ IInvertedIndex::~IInvertedIndex() = default;
 
 IMutableInvertedIndex::~IMutableInvertedIndex() = default;
 
+IScopeIndex::~IScopeIndex() = default;
+
+//-----------------------------------------------------------------------------
+
+// Definition of the opaque type forward-declared in searchlib.h. One
+// Elias-Fano sequence per (scope_name, document_id), each mapping term_pos ->
+// scope ordinal via EliasFano::access (see docs comment on ScopeIndexData's
+// forward declaration for why this stays out of the public header).
+namespace detail {
+class ScopeIndexData {
+public:
+  std::unordered_map<std::string, std::unordered_map<size_t, EliasFano>>
+      by_name;
+};
+} // namespace detail
+
 //-----------------------------------------------------------------------------
 
 size_t InMemoryInvertedIndexBase::Postings::size() const {
@@ -386,6 +402,58 @@ void InMemoryInvertedIndexBase::remove_document(size_t document_id) {
   removed_document_ids_.insert(document_id);
 }
 
+void InMemoryInvertedIndexBase::set_scope_ids(
+    const std::string &scope_name, size_t document_id,
+    const std::vector<size_t> &scope_ids) {
+  if (scope_ids.size() != document_term_count(document_id)) {
+    throw std::invalid_argument(
+        "searchlib: scope_ids.size() must equal document_term_count()");
+  }
+  if (!std::is_sorted(scope_ids.begin(), scope_ids.end())) {
+    throw std::invalid_argument(
+        "searchlib: scope_ids must be monotonically non-decreasing");
+  }
+
+  if (!scope_data_) {
+    scope_data_ = std::make_shared<detail::ScopeIndexData>();
+  }
+
+  auto universe =
+      scope_ids.empty() ? uint64_t(1) : uint64_t(scope_ids.back()) + 1;
+  std::vector<uint64_t> values(scope_ids.begin(), scope_ids.end());
+  scope_data_->by_name[scope_name].insert_or_assign(
+      document_id, detail::EliasFano(values, universe));
+}
+
+bool InMemoryInvertedIndexBase::has_scope(const std::string &scope_name,
+                                          size_t document_id) const {
+  if (!scope_data_) {
+    return false;
+  }
+  auto it = scope_data_->by_name.find(scope_name);
+  if (it == scope_data_->by_name.end()) {
+    return false;
+  }
+  return it->second.find(document_id) != it->second.end();
+}
+
+size_t InMemoryInvertedIndexBase::scope_id(const std::string &scope_name,
+                                           size_t document_id,
+                                           size_t term_pos) const {
+  if (!scope_data_) {
+    return static_cast<size_t>(-1);
+  }
+  auto it = scope_data_->by_name.find(scope_name);
+  if (it == scope_data_->by_name.end()) {
+    return static_cast<size_t>(-1);
+  }
+  auto doc_it = it->second.find(document_id);
+  if (doc_it == it->second.end()) {
+    return static_cast<size_t>(-1);
+  }
+  return static_cast<size_t>(doc_it->second.access(term_pos));
+}
+
 void InMemoryInvertedIndexBase::save(std::ostream &os,
                                      IndexFormat format) const {
   // Documents section, ordered by document_id for deterministic output.
@@ -436,6 +504,39 @@ void InMemoryInvertedIndexBase::save(std::ostream &os,
   for (auto document_id : removed_ids) {
     detail::write_scalar<uint64_t>(os, document_id);
   }
+
+  // Scope-index section: per scope_name (sorted), per document_id (sorted),
+  // an Elias-Fano encoded term_pos->scope-ordinal sequence. Stored the same
+  // way regardless of `format`, since EliasFano is already compact.
+  if (scope_data_) {
+    detail::write_scalar<uint64_t>(os, scope_data_->by_name.size());
+    std::vector<std::string> scope_names;
+    scope_names.reserve(scope_data_->by_name.size());
+    for (const auto &[name, _] : scope_data_->by_name) {
+      scope_names.push_back(name);
+    }
+    std::sort(scope_names.begin(), scope_names.end());
+    for (const auto &name : scope_names) {
+      detail::write_scalar<uint64_t>(os, name.size());
+      os.write(name.data(), static_cast<std::streamsize>(name.size()));
+
+      const auto &by_document = scope_data_->by_name.at(name);
+      std::vector<size_t> doc_ids;
+      doc_ids.reserve(by_document.size());
+      for (const auto &[document_id, _] : by_document) {
+        doc_ids.push_back(document_id);
+      }
+      std::sort(doc_ids.begin(), doc_ids.end());
+
+      detail::write_scalar<uint64_t>(os, doc_ids.size());
+      for (auto document_id : doc_ids) {
+        detail::write_scalar<uint64_t>(os, document_id);
+        by_document.at(document_id).save(os);
+      }
+    }
+  } else {
+    detail::write_scalar<uint64_t>(os, uint64_t(0));
+  }
 }
 
 void InMemoryInvertedIndexBase::load(std::istream &is, IndexFormat format) {
@@ -475,6 +576,27 @@ void InMemoryInvertedIndexBase::load(std::istream &is, IndexFormat format) {
   for (uint64_t i = 0; i < removed_count; i++) {
     removed_document_ids_.insert(
         static_cast<size_t>(detail::read_scalar<uint64_t>(is)));
+  }
+
+  scope_data_.reset();
+  auto scope_name_count = detail::read_scalar<uint64_t>(is);
+  if (scope_name_count > 0) {
+    scope_data_ = std::make_shared<detail::ScopeIndexData>();
+    for (uint64_t i = 0; i < scope_name_count; i++) {
+      auto name_size = static_cast<size_t>(detail::read_scalar<uint64_t>(is));
+      std::string name(name_size, '\0');
+      is.read(name.data(), static_cast<std::streamsize>(name_size));
+
+      auto &by_document = scope_data_->by_name[name];
+      auto doc_count = detail::read_scalar<uint64_t>(is);
+      for (uint64_t j = 0; j < doc_count; j++) {
+        auto document_id =
+            static_cast<size_t>(detail::read_scalar<uint64_t>(is));
+        detail::EliasFano ef;
+        ef.load(is);
+        by_document.insert_or_assign(document_id, std::move(ef));
+      }
+    }
   }
 }
 

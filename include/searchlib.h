@@ -50,8 +50,17 @@ namespace detail {
 inline constexpr char kIndexMagic[4] = {'S', 'I', 'D', 'X'};
 inline constexpr uint32_t kFormatTypePlain = 0;
 inline constexpr uint32_t kFormatTypeCompressed = 2;
-inline constexpr uint32_t kSchemaVersionPlain = 2;
-inline constexpr uint32_t kSchemaVersionCompressed = 1;
+inline constexpr uint32_t kSchemaVersionPlain = 3;
+inline constexpr uint32_t kSchemaVersionCompressed = 2;
+
+// Opaque storage for InMemoryInvertedIndexBase's scope data (a map of
+// Elias-Fano encoded position->scope-ordinal sequences, one per
+// (scope_name, document_id)). Defined in invertedindex.cpp, which includes
+// succinct.h; kept incomplete here so that succinct machinery stays out of
+// this public header. shared_ptr<incomplete T> is safe as a class member
+// (unlike unique_ptr<incomplete T>) since it never needs T's destructor to
+// be visible at the point of use.
+class ScopeIndexData;
 
 template <typename T> inline void write_scalar(std::ostream &os, T value) {
   static_assert(std::is_trivially_copyable_v<T>);
@@ -197,23 +206,59 @@ public:
 };
 
 //-----------------------------------------------------------------------------
+// Search Scopes (document/section/paragraph containment)
+//-----------------------------------------------------------------------------
+
+// Optional per-index capability, analogous to IMutableInvertedIndex: kept
+// separate from IInvertedIndex (rather than discovered via
+// dynamic_pointer_cast) so callers wire it in explicitly, with no RTTI
+// involved. Maps a (scope_name, document_id, term_pos) triple to the ordinal
+// of the structural unit (e.g. paragraph number) that term_pos falls in, so
+// that Operation::SameScope can test whether hits from different sub-queries
+// co-occur within the same unit. scope_name is an opaque caller-chosen
+// identifier (e.g. "section", "paragraph"); this interface does not
+// interpret it.
+class IScopeIndex {
+public:
+  virtual ~IScopeIndex() = 0;
+
+  virtual bool has_scope(const std::string &scope_name,
+                         size_t document_id) const = 0;
+
+  // The scope ordinal at term_pos. term_pos must be < document_term_count(
+  // document_id); behavior is unspecified otherwise. Only meaningful when
+  // has_scope(scope_name, document_id) is true.
+  virtual size_t scope_id(const std::string &scope_name, size_t document_id,
+                          size_t term_pos) const = 0;
+};
+
+//-----------------------------------------------------------------------------
 // Search
 //-----------------------------------------------------------------------------
 
-enum class Operation { Term, And, Adjacent, Or, Near, Not };
+enum class Operation { Term, And, Adjacent, Or, Near, Not, SameScope };
 
 struct Expression {
   Operation operation;
   std::u32string term_str;
   size_t near_operation_distance;
   std::vector<Expression> nodes;
+
+  // Only meaningful for Operation::SameScope: the scope_name passed to
+  // IScopeIndex. nodes holds the two or more sub-expressions whose hits must
+  // share the same scope ordinal to survive.
+  std::string scope_name;
 };
 
 std::optional<Expression> parse_query(Normalizer normalizer,
                                       std::string_view query);
 
+// scope_index is consulted only for Operation::SameScope nodes; if null,
+// such nodes contribute no matches (the same "no match" treatment as an
+// empty And/Or operand), rather than throwing.
 std::shared_ptr<IPostings> perform_search(const IInvertedIndex &invidx,
-                                          const Expression &expr);
+                                          const Expression &expr,
+                                          const IScopeIndex *scope_index = nullptr);
 
 size_t term_count_score(const IInvertedIndex &invidx, const Expression &expr,
                         const IPostings &postings, size_t index);
@@ -450,7 +495,7 @@ load_compressed_index(std::istream &is);
 std::shared_ptr<IInvertedIndexWithTextRange<TextRange>>
 load_compressed_index(const std::string &path);
 
-class InMemoryInvertedIndexBase : public IInvertedIndex {
+class InMemoryInvertedIndexBase : public IInvertedIndex, public IScopeIndex {
 public:
   size_t document_count() const override;
 
@@ -476,6 +521,20 @@ public:
   // removed document_ids at their output. Re-indexing the same document_id
   // via InMemoryIndexer clears the tombstone.
   void remove_document(size_t document_id);
+
+  // Search-scope side data (see IScopeIndex). scope_ids.size() must equal
+  // document_term_count(document_id) and its values must be monotonically
+  // non-decreasing (positions in the same structural unit share a value;
+  // later units get strictly larger values). Overwrites any previous
+  // registration for the same (scope_name, document_id). Throws
+  // std::invalid_argument on a size mismatch or a non-monotone sequence.
+  void set_scope_ids(const std::string &scope_name, size_t document_id,
+                     const std::vector<size_t> &scope_ids);
+
+  bool has_scope(const std::string &scope_name,
+                size_t document_id) const override;
+  size_t scope_id(const std::string &scope_name, size_t document_id,
+                  size_t term_pos) const override;
 
   // Serialize/deserialize the T-independent part of the index (documents_
   // and term_dictionary_, including postings). The templated
@@ -530,11 +589,13 @@ public:
   std::unordered_map<size_t /*document_id*/, Document> documents_;
   std::unordered_map<std::u32string /*str*/, Term> term_dictionary_;
   std::unordered_set<size_t /*document_id*/> removed_document_ids_;
+  std::shared_ptr<detail::ScopeIndexData> scope_data_;
 };
 
 template <typename T>
 class InMemoryInvertedIndex : public IInvertedIndexWithTextRange<T>,
-                             public IMutableInvertedIndex {
+                             public IMutableInvertedIndex,
+                             public IScopeIndex {
 public:
   size_t document_count() const override { return base_.document_count(); }
 
@@ -580,6 +641,21 @@ public:
 
   void remove_document(size_t document_id) override {
     base_.remove_document(document_id);
+  }
+
+  void set_scope_ids(const std::string &scope_name, size_t document_id,
+                     const std::vector<size_t> &scope_ids) {
+    base_.set_scope_ids(scope_name, document_id, scope_ids);
+  }
+
+  bool has_scope(const std::string &scope_name,
+                size_t document_id) const override {
+    return base_.has_scope(scope_name, document_id);
+  }
+
+  size_t scope_id(const std::string &scope_name, size_t document_id,
+                  size_t term_pos) const override {
+    return base_.scope_id(scope_name, document_id, term_pos);
   }
 
   T text_range(const IPostings &positions, size_t index,

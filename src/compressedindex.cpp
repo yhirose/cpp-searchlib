@@ -200,6 +200,24 @@ public:
           static_cast<size_t>(detail::read_scalar<uint64_t>(is)));
     }
 
+    // Scope-index section (see InMemoryInvertedIndexBase::save): read and
+    // discard, since IScopeIndex is not exposed by this read-only backend
+    // yet (v1 limitation, see docs/missing_features.ja.md 3.4.1). Skipping
+    // it explicitly keeps the following sections aligned.
+    auto scope_name_count = detail::read_scalar<uint64_t>(is);
+    for (uint64_t i = 0; i < scope_name_count; i++) {
+      auto name_size = static_cast<size_t>(detail::read_scalar<uint64_t>(is));
+      std::string name(name_size, '\0');
+      is.read(name.data(), static_cast<std::streamsize>(name_size));
+
+      auto doc_count = detail::read_scalar<uint64_t>(is);
+      for (uint64_t j = 0; j < doc_count; j++) {
+        detail::read_scalar<uint64_t>(is); // document_id
+        detail::EliasFano discarded;
+        discarded.load(is);
+      }
+    }
+
     if (detail::read_scalar<uint32_t>(is) != 1) {
       throw std::runtime_error(
           "searchlib: index text-range section requires TextRange");

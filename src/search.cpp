@@ -171,15 +171,20 @@ private:
 // Dispatches an expression to its operation handler without applying the
 // tombstone filter. Used internally (including for recursive sub-expressions)
 // so that removed documents are filtered exactly once, at the public entry.
+// scope_index is threaded through purely so that a nested Operation::SameScope
+// node can reach it; every other operation just forwards it unused.
 static std::shared_ptr<IPostings>
 perform_search_operation(const IInvertedIndex &inverted_index,
-                         const Expression &expr);
+                         const Expression &expr,
+                         const IScopeIndex *scope_index);
 
 static auto positings_list(const IInvertedIndex &inverted_index,
-                           const std::vector<Expression> &nodes) {
+                           const std::vector<Expression> &nodes,
+                           const IScopeIndex *scope_index) {
   std::vector<std::shared_ptr<IPostings>> positings_list;
   for (const auto &expr : nodes) {
-    positings_list.push_back(perform_search_operation(inverted_index, expr));
+    positings_list.push_back(
+        perform_search_operation(inverted_index, expr, scope_index));
   }
   return positings_list;
 }
@@ -442,7 +447,8 @@ perform_term_operation(const IInvertedIndex &inverted_index,
 
 static std::shared_ptr<IPostings>
 perform_and_operation(const IInvertedIndex &inverted_index,
-                      const Expression &expr) {
+                      const Expression &expr,
+                      const IScopeIndex *scope_index) {
   std::vector<Expression> positive_nodes;
   std::vector<Expression> negative_nodes;
   for (const auto &node : expr.nodes) {
@@ -453,11 +459,12 @@ perform_and_operation(const IInvertedIndex &inverted_index,
     }
   }
 
-  auto negative_postings_list = positings_list(inverted_index, negative_nodes);
+  auto negative_postings_list =
+      positings_list(inverted_index, negative_nodes, scope_index);
   std::vector<size_t> negative_cursors(negative_postings_list.size(), 0);
 
   return intersect_postings(
-      positings_list(inverted_index, positive_nodes),
+      positings_list(inverted_index, positive_nodes, scope_index),
       [&](const auto &positings_list,
           const auto &cursors) -> std::shared_ptr<Position> {
         auto document_id = positings_list[0]->document_id(cursors[0]);
@@ -491,9 +498,10 @@ perform_and_operation(const IInvertedIndex &inverted_index,
 
 static std::shared_ptr<IPostings>
 perform_adjacent_operation(const IInvertedIndex &inverted_index,
-                           const Expression &expr) {
+                           const Expression &expr,
+                           const IScopeIndex *scope_index) {
   return intersect_postings(
-      positings_list(inverted_index, expr.nodes),
+      positings_list(inverted_index, expr.nodes, scope_index),
       [](const auto &positings_list, const auto &cursors) {
         std::vector<size_t> term_positions;
         std::vector<size_t> term_lengths;
@@ -525,15 +533,17 @@ perform_adjacent_operation(const IInvertedIndex &inverted_index,
 
 static std::shared_ptr<IPostings>
 perform_or_operation(const IInvertedIndex &inverted_index,
-                     const Expression &expr) {
-  return union_postings(positings_list(inverted_index, expr.nodes));
+                     const Expression &expr,
+                     const IScopeIndex *scope_index) {
+  return union_postings(positings_list(inverted_index, expr.nodes, scope_index));
 }
 
 static std::shared_ptr<IPostings>
 perform_near_operation(const IInvertedIndex &inverted_index,
-                       const Expression &expr) {
+                       const Expression &expr,
+                       const IScopeIndex *scope_index) {
   return intersect_postings(
-      positings_list(inverted_index, expr.nodes),
+      positings_list(inverted_index, expr.nodes, scope_index),
       [&](const auto &positings_list, const auto &cursors) {
         std::vector<size_t> term_positions;
         std::vector<size_t> term_lengths;
@@ -612,30 +622,126 @@ perform_near_operation(const IInvertedIndex &inverted_index,
       });
 }
 
+// Like perform_near_operation, but keeps only the combinations of hits (one
+// per node) that fall in the same structural unit (e.g. paragraph), per
+// scope_index->scope_id(), instead of within a fixed position distance. If
+// scope_index is null, or a candidate document has no scope data registered
+// for expr.scope_name, it contributes no matches -- the same "no match"
+// treatment as an empty And/Or operand, not an error.
+static std::shared_ptr<IPostings>
+perform_same_scope_operation(const IInvertedIndex &inverted_index,
+                             const Expression &expr,
+                             const IScopeIndex *scope_index) {
+  if (!scope_index) {
+    return std::make_shared<SearchResult>();
+  }
+
+  return intersect_postings(
+      positings_list(inverted_index, expr.nodes, scope_index),
+      [&](const auto &positings_list,
+          const auto &cursors) -> std::shared_ptr<Position> {
+        auto document_id = positings_list[0]->document_id(cursors[0]);
+        if (!scope_index->has_scope(expr.scope_name, document_id)) {
+          return nullptr;
+        }
+
+        std::vector<size_t> term_positions;
+        std::vector<size_t> term_lengths;
+        std::vector<size_t> search_hit_cursors(positings_list.size(), 0);
+
+        auto done = false;
+        while (!done) {
+          std::map<size_t /*term_pos*/,
+                   std::pair<size_t /*slot*/, size_t /*term_length*/>>
+              slots_by_term_pos;
+          {
+            auto slot = 0;
+            for (const auto &p : positings_list) {
+              auto index = cursors[slot];
+              auto hit_index = search_hit_cursors[slot];
+              auto term_pos = p->term_position(index, hit_index);
+              auto term_length = p->term_length(index, hit_index);
+              slots_by_term_pos[term_pos] = std::pair(slot, term_length);
+              slot++;
+            }
+          }
+
+          std::optional<size_t> reference_scope_id;
+          auto same_scope = true;
+          for (const auto &[term_pos, item] : slots_by_term_pos) {
+            auto sid =
+                scope_index->scope_id(expr.scope_name, document_id, term_pos);
+            if (!reference_scope_id) {
+              reference_scope_id = sid;
+            } else if (*reference_scope_id != sid) {
+              same_scope = false;
+              break;
+            }
+          }
+
+          if (same_scope) {
+            for (const auto &[term_pos, item] : slots_by_term_pos) {
+              auto [slot, term_length] = item;
+              term_positions.push_back(term_pos);
+              term_lengths.push_back(term_length);
+              search_hit_cursors[slot]++;
+
+              if (search_hit_cursors[slot] ==
+                  positings_list[slot]->search_hit_count(cursors[slot])) {
+                done = true;
+              }
+            }
+          } else {
+            // Skip search hit cursor for the smallest slot, same tie-break as
+            // perform_near_operation.
+            auto slot = slots_by_term_pos.begin()->second.first;
+            search_hit_cursors[slot]++;
+
+            if (search_hit_cursors[slot] ==
+                positings_list[slot]->search_hit_count(cursors[slot])) {
+              done = true;
+            }
+          }
+        }
+
+        if (term_positions.empty()) {
+          return std::shared_ptr<Position>();
+        } else {
+          return std::make_shared<Position>(document_id,
+                                            std::move(term_positions),
+                                            std::move(term_lengths));
+        }
+      });
+}
+
 //-----------------------------------------------------------------------------
 
 static std::shared_ptr<IPostings>
 perform_search_operation(const IInvertedIndex &inverted_index,
-                         const Expression &expr) {
+                         const Expression &expr,
+                         const IScopeIndex *scope_index) {
   switch (expr.operation) {
   case Operation::Term:
     return perform_term_operation(inverted_index, expr);
   case Operation::And:
-    return perform_and_operation(inverted_index, expr);
+    return perform_and_operation(inverted_index, expr, scope_index);
   case Operation::Adjacent:
-    return perform_adjacent_operation(inverted_index, expr);
+    return perform_adjacent_operation(inverted_index, expr, scope_index);
   case Operation::Or:
-    return perform_or_operation(inverted_index, expr);
+    return perform_or_operation(inverted_index, expr, scope_index);
   case Operation::Near:
-    return perform_near_operation(inverted_index, expr);
+    return perform_near_operation(inverted_index, expr, scope_index);
+  case Operation::SameScope:
+    return perform_same_scope_operation(inverted_index, expr, scope_index);
   default:
     return nullptr;
   }
 }
 
 std::shared_ptr<IPostings> perform_search(const IInvertedIndex &inverted_index,
-                                          const Expression &expr) {
-  auto result = perform_search_operation(inverted_index, expr);
+                                          const Expression &expr,
+                                          const IScopeIndex *scope_index) {
+  auto result = perform_search_operation(inverted_index, expr, scope_index);
   // Exclude logically-deleted documents from the final result. Skipped
   // entirely when the index has no tombstones, so the common path is free.
   if (result && inverted_index.has_removed_documents()) {

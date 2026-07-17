@@ -934,6 +934,190 @@ TEST(PersistenceTest, RemovedDocumentsSurvive) {
   EXPECT_EQ(2, postings->document_id(1));
 }
 
+// Builds an Operation::SameScope Expression by hand: parse_query does not
+// support a query-string syntax for it (v1, C++ API only; see
+// docs/missing_features.ja.md 3.4.1).
+static Expression same_scope_expr(const std::string &scope_name,
+                                  std::vector<std::u32string> terms) {
+  Expression expr;
+  expr.operation = Operation::SameScope;
+  expr.scope_name = scope_name;
+  for (auto &t : terms) {
+    Expression node;
+    node.operation = Operation::Term;
+    node.term_str = t;
+    expr.nodes.push_back(node);
+  }
+  return expr;
+}
+
+// Fixture for SameScopeTest: 5 documents, each with a hand-picked
+// term_pos -> scope-ordinal assignment registered under scope_name
+// "paragraph". Document 2 deliberately has no scope data registered at all.
+//
+//   0: "alpha beta gamma delta"     paragraphs: {alpha,beta} | {gamma,delta}
+//   1: "alpha gamma alpha delta"    paragraphs: {alpha,gamma} | {alpha,delta}
+//   2: "gamma delta"                (no scope registered)
+//   3: "epsilon zeta epsilon"       paragraphs: {epsilon,zeta,epsilon}
+//   4: "one two three"              paragraphs: {one,two,three}
+static InMemoryInvertedIndex<TextRange> same_scope_index() {
+  InMemoryInvertedIndex<TextRange> invidx;
+  InMemoryIndexer indexer(invidx, normalizer);
+
+  indexer.index_document(0, UTF8PlainTextTokenizer("alpha beta gamma delta"));
+  invidx.set_scope_ids("paragraph", 0, {0, 0, 1, 1});
+
+  indexer.index_document(1, UTF8PlainTextTokenizer("alpha gamma alpha delta"));
+  invidx.set_scope_ids("paragraph", 1, {0, 0, 1, 1});
+
+  indexer.index_document(2, UTF8PlainTextTokenizer("gamma delta"));
+  // No set_scope_ids call for document 2.
+
+  indexer.index_document(3, UTF8PlainTextTokenizer("epsilon zeta epsilon"));
+  invidx.set_scope_ids("paragraph", 3, {7, 7, 7});
+
+  indexer.index_document(4, UTF8PlainTextTokenizer("one two three"));
+  invidx.set_scope_ids("paragraph", 4, {9, 9, 9});
+
+  return invidx;
+}
+
+TEST(SameScopeTest, HitsInSameScopeSurvive) {
+  auto invidx = same_scope_index();
+
+  // alpha@0 and beta@1 share paragraph 0 in document 0; document 1 has no
+  // "beta" at all, so it is excluded by the And-style document intersection
+  // before scope filtering even runs.
+  auto expr = same_scope_expr("paragraph", {U"alpha", U"beta"});
+  auto postings = perform_search(invidx, expr, &invidx);
+
+  ASSERT_EQ(1, postings->size());
+  EXPECT_EQ(0, postings->document_id(0));
+  ASSERT_EQ(2, postings->search_hit_count(0));
+  EXPECT_EQ(0, postings->term_position(0, 0));
+  EXPECT_EQ(1, postings->term_position(0, 1));
+}
+
+TEST(SameScopeTest, HitsAcrossScopesAreDropped) {
+  auto invidx = same_scope_index();
+
+  // In document 0, alpha@0 is paragraph 0 while gamma@2 is paragraph 1, so
+  // that document contributes no match. Document 1 has alpha@0/gamma@1 in
+  // paragraph 0 (a match) and alpha@2 in paragraph 1 (no partner), so only
+  // the first combination survives.
+  auto expr = same_scope_expr("paragraph", {U"alpha", U"gamma"});
+  auto postings = perform_search(invidx, expr, &invidx);
+
+  ASSERT_EQ(1, postings->size());
+  EXPECT_EQ(1, postings->document_id(0));
+  ASSERT_EQ(2, postings->search_hit_count(0));
+  EXPECT_EQ(0, postings->term_position(0, 0)); // alpha@0
+  EXPECT_EQ(1, postings->term_position(0, 1)); // gamma@1
+}
+
+TEST(SameScopeTest, DocumentsWithoutScopeDataAreExcluded) {
+  auto invidx = same_scope_index();
+
+  // Document 2 has both "gamma" and "delta" as plain terms but never had
+  // set_scope_ids called for it, so has_scope() is false and it must not
+  // appear in the result even though document 0 matches.
+  auto expr = same_scope_expr("paragraph", {U"gamma", U"delta"});
+  auto postings = perform_search(invidx, expr, &invidx);
+
+  ASSERT_EQ(1, postings->size());
+  EXPECT_EQ(0, postings->document_id(0));
+  ASSERT_EQ(2, postings->search_hit_count(0));
+  EXPECT_EQ(2, postings->term_position(0, 0)); // gamma@2
+  EXPECT_EQ(3, postings->term_position(0, 1)); // delta@3
+}
+
+TEST(SameScopeTest, ThreeOrMoreNodes) {
+  auto invidx = same_scope_index();
+
+  auto expr = same_scope_expr("paragraph", {U"one", U"two", U"three"});
+  auto postings = perform_search(invidx, expr, &invidx);
+
+  ASSERT_EQ(1, postings->size());
+  EXPECT_EQ(4, postings->document_id(0));
+  ASSERT_EQ(3, postings->search_hit_count(0));
+  EXPECT_EQ(0, postings->term_position(0, 0));
+  EXPECT_EQ(1, postings->term_position(0, 1));
+  EXPECT_EQ(2, postings->term_position(0, 2));
+}
+
+TEST(SameScopeTest, NullScopeIndexYieldsNoMatches) {
+  auto invidx = same_scope_index();
+
+  auto expr = same_scope_expr("paragraph", {U"alpha", U"beta"});
+  auto postings = perform_search(invidx, expr); // scope_index defaults to null
+
+  EXPECT_EQ(0, postings->size());
+}
+
+TEST(SameScopeTest, ComposesInsideAnd) {
+  auto invidx = same_scope_index();
+
+  // And(Term("delta"), SameScope(gamma, delta)) — SameScope nested as an And
+  // operand recurses through the same perform_search_operation dispatch, so
+  // it composes with the existing algebra with no special-casing.
+  Expression and_expr;
+  and_expr.operation = Operation::And;
+  Expression delta_term;
+  delta_term.operation = Operation::Term;
+  delta_term.term_str = U"delta";
+  and_expr.nodes.push_back(delta_term);
+  and_expr.nodes.push_back(same_scope_expr("paragraph", {U"gamma", U"delta"}));
+
+  auto postings = perform_search(invidx, and_expr, &invidx);
+
+  ASSERT_EQ(1, postings->size());
+  EXPECT_EQ(0, postings->document_id(0));
+}
+
+TEST(SameScopeTest, SetScopeIdsRejectsSizeMismatch) {
+  InMemoryInvertedIndex<TextRange> invidx;
+  InMemoryIndexer indexer(invidx, normalizer);
+  indexer.index_document(0, UTF8PlainTextTokenizer("alpha beta"));
+
+  EXPECT_THROW(invidx.set_scope_ids("paragraph", 0, {0}),
+              std::invalid_argument);
+}
+
+TEST(SameScopeTest, SetScopeIdsRejectsNonMonotone) {
+  InMemoryInvertedIndex<TextRange> invidx;
+  InMemoryIndexer indexer(invidx, normalizer);
+  indexer.index_document(0, UTF8PlainTextTokenizer("alpha beta gamma"));
+
+  EXPECT_THROW(invidx.set_scope_ids("paragraph", 0, {0, 1, 0}),
+              std::invalid_argument);
+}
+
+TEST(SameScopeTest, PersistedScopeSurvivesRoundtrip) {
+  auto invidx = same_scope_index();
+
+  std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+  invidx.save(ss);
+
+  InMemoryInvertedIndex<TextRange> loaded;
+  loaded.load(ss);
+
+  EXPECT_TRUE(loaded.has_scope("paragraph", 0));
+  EXPECT_FALSE(loaded.has_scope("paragraph", 2));
+
+  auto expr = same_scope_expr("paragraph", {U"alpha", U"gamma"});
+  auto expected = perform_search(invidx, expr, &invidx);
+  auto actual = perform_search(loaded, expr, &loaded);
+
+  ASSERT_EQ(expected->size(), actual->size());
+  for (size_t i = 0; i < expected->size(); i++) {
+    EXPECT_EQ(expected->document_id(i), actual->document_id(i));
+    ASSERT_EQ(expected->search_hit_count(i), actual->search_hit_count(i));
+    for (size_t h = 0; h < expected->search_hit_count(i); h++) {
+      EXPECT_EQ(expected->term_position(i, h), actual->term_position(i, h));
+    }
+  }
+}
+
 // "common" appears twice in every document, taking its postings across the
 // Elias-Fano threshold with multiple positions per document, while each
 // "termN" stays tiny and keeps the plain per-term representation — so one
