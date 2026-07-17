@@ -12,6 +12,7 @@ add_executable(
   ../src/tokenizer.cpp
   ../src/analyzer.cpp
   ../src/federatedindex.cpp
+  ../src/storedfields.cpp
 )
 
 target_include_directories(searchlib-cli PRIVATE ../include ../src)

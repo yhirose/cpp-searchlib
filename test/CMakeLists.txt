@@ -20,6 +20,7 @@ add_executable(
   test_federated.cc
   test_analyzer.cc
   test_succinct.cc
+  test_multifield.cc
   ../src/utils.cpp
   ../src/invertedindex.cpp
   ../src/compressedindex.cpp
@@ -28,6 +29,7 @@ add_executable(
   ../src/tokenizer.cpp
   ../src/analyzer.cpp
   ../src/federatedindex.cpp
+  ../src/storedfields.cpp
 )
 
 target_include_directories(test-main PRIVATE ../include ../src)

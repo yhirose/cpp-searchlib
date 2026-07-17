@@ -94,6 +94,38 @@ inline std::u32string read_u32string(std::istream &is) {
   return s;
 }
 
+// Shared shape for serializing a sparse `document_id -> value` map: write
+// the count, then (key, value) pairs in ascending key order so the output
+// is deterministic regardless of the map's internal (hash) iteration order.
+// write_value/read_value handle the value's own encoding, so this is reused
+// by both DocValues<T>::save/load (a fixed-width T) and
+// StoredFields::save/load (a length-prefixed byte blob).
+template <typename Map, typename WriteValue>
+inline void save_sorted_map(std::ostream &os, const Map &map,
+                            WriteValue write_value) {
+  write_scalar<uint64_t>(os, map.size());
+  std::vector<size_t> keys;
+  keys.reserve(map.size());
+  for (const auto &[key, value] : map) {
+    keys.push_back(key);
+  }
+  std::sort(keys.begin(), keys.end());
+  for (auto key : keys) {
+    write_scalar<uint64_t>(os, key);
+    write_value(os, map.at(key));
+  }
+}
+
+template <typename Map, typename ReadValue>
+inline void load_sorted_map(std::istream &is, Map &map, ReadValue read_value) {
+  map.clear();
+  auto count = read_scalar<uint64_t>(is);
+  for (uint64_t i = 0; i < count; i++) {
+    auto key = static_cast<size_t>(read_scalar<uint64_t>(is));
+    map[key] = read_value(is);
+  }
+}
+
 } // namespace detail
 
 //-----------------------------------------------------------------------------
@@ -332,6 +364,100 @@ std::vector<ScoredHit> top_k(const IPostings &postings, size_t k,
                              ScoreFn score_fn) {
   return top_k(postings.size(), k, std::move(score_fn));
 }
+
+//-----------------------------------------------------------------------------
+// DocValues: per-document scalar column store (Lucene DocValues equivalent)
+//-----------------------------------------------------------------------------
+
+// A sparse columnar store mapping document_id -> a single trivially-copyable
+// value T (e.g. a sort key, a facet bucket id, a numeric field), independent
+// of the inverted index and its term postings. Where the inverted index
+// answers "which documents contain this term", DocValues answers "what is
+// this document's value" in O(1) without walking any postings list -- the
+// use case Lucene/Tantivy cover with columnar DocValues/fast fields
+// (docs/missing_features.ja.md 2.4).
+//
+// Kept as its own class (not folded into IInvertedIndex/IScopeIndex) because
+// it has no notion of terms or positions; a caller wires document_ids to
+// match its InMemoryInvertedIndex the same way it already wires
+// IScopeIndex::set_scope_ids. Deliberately a plain sparse map -- the
+// "embedded minimal" scope (docs/embedded_minimal_roadmap.ja.md) does not
+// call for succinct compression here the way term postings needed it.
+template <typename T> class DocValues {
+public:
+  static_assert(std::is_trivially_copyable_v<T>,
+               "DocValues<T> requires a trivially-copyable T; see "
+               "docs/missing_features.ja.md 2.4");
+
+  void set(size_t document_id, T value) {
+    values_[document_id] = value;
+  }
+
+  bool has(size_t document_id) const {
+    return values_.find(document_id) != values_.end();
+  }
+
+  // Returns nullopt if no value was set for document_id (rather than a
+  // default-constructed T), so callers can distinguish "absent" from "zero".
+  std::optional<T> get(size_t document_id) const {
+    auto it = values_.find(document_id);
+    if (it == values_.end()) {
+      return std::nullopt;
+    }
+    return it->second;
+  }
+
+  void remove(size_t document_id) {
+    values_.erase(document_id);
+  }
+
+  size_t size() const { return values_.size(); }
+
+  void save(std::ostream &os) const {
+    detail::save_sorted_map(
+        os, values_,
+        [](std::ostream &os, const T &value) { detail::write_scalar<T>(os, value); });
+  }
+
+  void load(std::istream &is) {
+    detail::load_sorted_map(is, values_, [](std::istream &is) {
+      return detail::read_scalar<T>(is);
+    });
+  }
+
+private:
+  std::unordered_map<size_t, T> values_;
+};
+
+//-----------------------------------------------------------------------------
+// Stored Fields: original per-document payload storage
+//-----------------------------------------------------------------------------
+
+// Stores the original (untokenized) data for a document_id alongside the
+// index, so a caller does not have to keep its own out-of-band
+// documents[document_id] table (docs/missing_features.ja.md 2.5). Value is
+// an opaque byte blob (std::string used as a byte buffer); interpretation
+// (raw text, JSON, a serialized struct) is up to the caller. Independent of
+// IInvertedIndex for the same reason as DocValues: it has no notion of terms
+// or postings, so it is wired to an index purely by sharing document_id
+// values.
+class StoredFields {
+public:
+  void set(size_t document_id, std::string value);
+  bool has(size_t document_id) const;
+
+  // Returns nullptr if no value was stored for document_id.
+  const std::string *get(size_t document_id) const;
+
+  void remove(size_t document_id);
+  size_t size() const;
+
+  void save(std::ostream &os) const;
+  void load(std::istream &is);
+
+private:
+  std::unordered_map<size_t, std::string> values_;
+};
 
 //-----------------------------------------------------------------------------
 // Federated Search
@@ -990,5 +1116,127 @@ private:
   InMemoryInvertedIndex<T> index_;
   mutable std::shared_mutex mutex_;
 };
+
+//-----------------------------------------------------------------------------
+// Multi-Field Schema
+//-----------------------------------------------------------------------------
+
+// Groups several independently-built InMemoryInvertedIndex<T> instances
+// under named fields (e.g. "title", "body", "tags"), the minimal answer to
+// docs/missing_features.ja.md 2.2. Unlike FederatedIndex (whose members have
+// member-local document_id spaces, see the note on IPostings::document_id),
+// a MultiFieldIndex's fields share one document_id space: the caller indexes
+// the same logical document under the same document_id into whichever
+// fields it has content for, so grouping hits back into "this document
+// matched in title and body" is a plain document_id comparison, no
+// per-field id remapping needed.
+//
+// Field-qualified search ("only search the title field") needs no new API:
+// call perform_search(*index.field("title"), expr) directly, exactly as for
+// any InMemoryInvertedIndex. There is deliberately no query-string `field:`
+// syntax (same precedent as Operation::SameScope / roadmap item 10) --
+// field selection is a C++-level choice made by the caller, not the parser.
+template <typename T> class MultiFieldIndex {
+public:
+  // Returns the named field's index, creating an empty one on first use.
+  InMemoryInvertedIndex<T> &field(const std::string &name) {
+    return fields_[name];
+  }
+
+  // Returns nullptr if the field has never been touched via the non-const
+  // field(name) overload.
+  const InMemoryInvertedIndex<T> *field(const std::string &name) const {
+    auto it = fields_.find(name);
+    if (it == fields_.end()) {
+      return nullptr;
+    }
+    return &it->second;
+  }
+
+  bool has_field(const std::string &name) const {
+    return fields_.find(name) != fields_.end();
+  }
+
+  // Sorted by name (fields_ is a std::map), so iteration order is
+  // deterministic across runs and matches the on-disk field order.
+  std::vector<std::string> field_names() const {
+    std::vector<std::string> names;
+    names.reserve(fields_.size());
+    for (const auto &[name, index] : fields_) {
+      names.push_back(name);
+    }
+    return names;
+  }
+
+  void save(std::ostream &os,
+           const typename InMemoryInvertedIndex<T>::TextRangeSerializer
+               &serialize_value = {},
+           IndexFormat format = IndexFormat::Plain) const {
+    detail::write_scalar<uint64_t>(os, fields_.size());
+    for (const auto &[name, index] : fields_) {
+      detail::write_scalar<uint64_t>(os, name.size());
+      os.write(name.data(), static_cast<std::streamsize>(name.size()));
+      index.save(os, serialize_value, format);
+    }
+  }
+
+  void load(std::istream &is,
+           const typename InMemoryInvertedIndex<T>::TextRangeDeserializer
+               &deserialize_value = {}) {
+    fields_.clear();
+    auto count = detail::read_scalar<uint64_t>(is);
+    for (uint64_t i = 0; i < count; i++) {
+      auto name_length =
+          static_cast<size_t>(detail::read_scalar<uint64_t>(is));
+      std::string name(name_length, '\0');
+      if (name_length > 0) {
+        is.read(name.data(), static_cast<std::streamsize>(name_length));
+        if (!is) {
+          throw std::runtime_error(
+              "searchlib: unexpected end of multi-field index stream");
+        }
+      }
+      InMemoryInvertedIndex<T> index;
+      index.load(is, deserialize_value);
+      fields_[std::move(name)] = std::move(index);
+    }
+  }
+
+private:
+  std::map<std::string, InMemoryInvertedIndex<T>> fields_;
+};
+
+// One hit produced by perform_multi_field_search, tagged with the field it
+// came from. document_id (via postings->document_id(index_in_postings)) is
+// shared across fields -- see the MultiFieldIndex note above -- so callers
+// group hits by that id to combine per-field matches/scores for the same
+// document.
+template <typename T> struct MultiFieldHit {
+  std::string field;
+  std::shared_ptr<IPostings> postings;
+  size_t index_in_postings;
+};
+
+// Runs expr independently against every field of index (each field resolves
+// its own And/Or/Near/Not cursors via perform_search) and concatenates the
+// results tagged by field name. No cross-field score normalization,
+// combination, or sorting is performed; callers that need a single combined
+// ranking do so themselves (e.g. summing or maxing bm25_score across the
+// fields where a document_id appears) -- the same division of
+// responsibility as perform_federated_search.
+template <typename T>
+std::vector<MultiFieldHit<T>>
+perform_multi_field_search(const MultiFieldIndex<T> &index,
+                          const Expression &expr) {
+  std::vector<MultiFieldHit<T>> hits;
+  for (const auto &name : index.field_names()) {
+    const auto *field_index = index.field(name);
+    auto postings = perform_search(*field_index, expr);
+    for (size_t i = 0; i < postings->size(); i++) {
+      hits.push_back({name, postings, i});
+    }
+  }
+  return hits;
+}
 
 } // namespace searchlib
