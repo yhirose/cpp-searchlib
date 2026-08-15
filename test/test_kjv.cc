@@ -146,15 +146,30 @@ TEST(KJVTest, CompressedBackend) {
   EXPECT_FALSE(loaded->term_exists(U"zzzzz"));
   EXPECT_FALSE(loaded->has_removed_documents());
 
-  // "apple" stays plain-coded, "the" is EF-coded, and the phrase query
-  // exercises is_term_position and multi-term text ranges on both paths.
+  // Both backends still answer prefix enumeration with a full dictionary
+  // scan, so they must agree term for term.
+  auto collect = [](const IInvertedIndex &index, const std::u32string &prefix) {
+    std::vector<std::u32string> terms;
+    index.enumerate_terms_with_prefix(
+        prefix, [&](const auto &str) { terms.push_back(str); });
+    std::sort(terms.begin(), terms.end());
+    return terms;
+  };
+  auto expected_terms = collect(invidx, U"sanctif");
+  ASSERT_FALSE(expected_terms.empty());
+  EXPECT_EQ(expected_terms, collect(*loaded, U"sanctif"));
+
+  // "apple" stays plain-coded, "the" is EF-coded, the phrase query exercises
+  // is_term_position and multi-term text ranges, and "sanctif*" exercises the
+  // prefix expansion (dictionary scan plus union) on both paths.
   for (const auto *query : {R"( apple )", R"( the )", R"( "apple tree" )",
-                            R"( "the lord" )"}) {
+                            R"( "the lord" )", R"( sanctif* )"}) {
     auto expr = parse_query(normalizer, query);
     ASSERT_TRUE(expr);
 
     auto expected = perform_search(invidx, *expr);
     auto actual = perform_search(*loaded, *expr);
+    ASSERT_GT(expected->size(), 0u) << query;
     ASSERT_EQ(expected->size(), actual->size()) << query;
     for (size_t i = 0; i < expected->size(); i++) {
       EXPECT_EQ(expected->document_id(i), actual->document_id(i));

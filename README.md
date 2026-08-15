@@ -56,11 +56,39 @@ for (size_t i = 0; i < result->size(); i++) {
 | `apple -banana` | NOT - exclude documents containing the term |
 | `"apple tree"` | Phrase - adjacent terms |
 | `apple ~ tree` | NEAR - terms within 4 term positions |
+| `app*` | Prefix - every term starting with `app` |
 | `( ... )` | Grouping |
 
 Terms are tokenized and normalized in the same way as documents, so Unicode
 terms (e.g. Japanese) work as long as the tokenizer indexed them. `NOT` is
 only valid along with at least one positive term.
+
+A trailing `*` expands against the index's dictionary at search time, so
+`app*` is equivalent to an `OR` over every indexed term starting with `app`,
+scoring included. The star has to touch its term (`app*`, not `app *`), and a
+bare `*` is not a match-all: it stays an ordinary term, which no index can
+contain. The prefix is enumerated with
+`IInvertedIndex::enumerate_terms_with_prefix`, which is also usable directly:
+
+```cpp
+index.enumerate_terms_with_prefix(U"app", [](const auto &term) {
+  std::cout << u8(term) << std::endl;
+});
+```
+
+Both current backends answer it with a full dictionary scan (their term
+dictionaries are hash maps), so its cost is linear in the vocabulary size.
+`perform_search` enumerates once per query, but the scoring functions take an
+expression per hit, so scoring a prefix query directly repeats that scan for
+every hit. Expand once up front instead:
+
+```cpp
+auto expr = expand_prefixes(index, *parse_query(normalizer, "app*"));
+auto result = perform_search(index, expr);
+auto hits = top_k(*result, 10, [&](size_t i) {
+  return bm25_score(index, expr, *result, i);
+});
+```
 
 ## Scoring
 

@@ -281,6 +281,21 @@ public:
     return empty_postings;
   }
 
+  void enumerate_terms_with_prefix(
+      const std::u32string &prefix,
+      const std::function<void(const std::u32string &str)> &callback)
+      const override {
+    // Same full scan as the in-memory index: this backend's dictionary is
+    // still a hash map (only the postings and text ranges are compressed).
+    // Replacing it with an FST is what turns this into a subtree descent.
+    for (const auto &[str, term] : term_dictionary_) {
+      if (str.size() >= prefix.size() &&
+          str.compare(0, prefix.size(), prefix) == 0) {
+        callback(str);
+      }
+    }
+  }
+
   bool has_removed_documents() const override {
     return !removed_document_ids_.empty();
   }

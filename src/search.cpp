@@ -538,6 +538,19 @@ perform_or_operation(const IInvertedIndex &inverted_index,
   return union_postings(positings_list(inverted_index, expr.nodes, scope_index));
 }
 
+// A Prefix node is answered by expanding it against the index's dictionary
+// and unioning the matching terms, i.e. `foo*` behaves exactly like an Or
+// over every term starting with `foo`. The expansion happens at search time
+// rather than in parse_query because the parser has no index to consult, and
+// a parsed Expression is meant to stay reusable across indexes.
+static std::shared_ptr<IPostings>
+perform_prefix_operation(const IInvertedIndex &inverted_index,
+                         const Expression &expr,
+                         const IScopeIndex *scope_index) {
+  return perform_search_operation(
+      inverted_index, expand_prefixes(inverted_index, expr), scope_index);
+}
+
 static std::shared_ptr<IPostings>
 perform_near_operation(const IInvertedIndex &inverted_index,
                        const Expression &expr,
@@ -733,9 +746,37 @@ perform_search_operation(const IInvertedIndex &inverted_index,
     return perform_near_operation(inverted_index, expr, scope_index);
   case Operation::SameScope:
     return perform_same_scope_operation(inverted_index, expr, scope_index);
+  case Operation::Prefix:
+    return perform_prefix_operation(inverted_index, expr, scope_index);
   default:
     return nullptr;
   }
+}
+
+Expression expand_prefixes(const IInvertedIndex &inverted_index,
+                           const Expression &expr) {
+  if (expr.operation == Operation::Prefix) {
+    std::vector<Expression> nodes;
+    inverted_index.enumerate_terms_with_prefix(
+        expr.term_str, [&](const auto &str) {
+          nodes.push_back(Expression{Operation::Term, str});
+        });
+
+    // enumerate_terms_with_prefix leaves the order unspecified, and the
+    // expanded Expression is handed back to the caller, so sort to keep it
+    // reproducible for one prefix against one index.
+    std::sort(nodes.begin(), nodes.end(), [](const auto &a, const auto &b) {
+      return a.term_str < b.term_str;
+    });
+
+    return Expression{Operation::Or, std::u32string(), 0, std::move(nodes)};
+  }
+
+  auto expanded = expr;
+  for (auto &node : expanded.nodes) {
+    node = expand_prefixes(inverted_index, node);
+  }
+  return expanded;
 }
 
 std::shared_ptr<IPostings> perform_search(const IInvertedIndex &inverted_index,
@@ -751,14 +792,20 @@ std::shared_ptr<IPostings> perform_search(const IInvertedIndex &inverted_index,
   return result;
 }
 
-template <typename T> void enumerate_terms(const Expression &expr, T fn) {
+template <typename T>
+void enumerate_terms(const IInvertedIndex &invidx, const Expression &expr,
+                     T fn) {
   if (expr.operation == Operation::Term) {
     fn(expr.term_str);
+  } else if (expr.operation == Operation::Prefix) {
+    // Score a prefix node as the Or it expands to, so that `foo*` and a
+    // hand-written Or over the same terms score identically.
+    invidx.enumerate_terms_with_prefix(expr.term_str, fn);
   } else if (expr.operation == Operation::Not) {
     // Excluded terms do not contribute to scores.
   } else {
     for (const auto &node : expr.nodes) {
-      enumerate_terms(node, fn);
+      enumerate_terms(invidx, node, fn);
     }
   }
 }
@@ -767,7 +814,7 @@ size_t term_count_score(const IInvertedIndex &invidx, const Expression &expr,
                         const IPostings &postings, size_t index) {
   auto document_id = postings.document_id(index);
   size_t score = 0;
-  enumerate_terms(expr, [&](const auto &term) {
+  enumerate_terms(invidx, expr, [&](const auto &term) {
     score += invidx.term_count(term, document_id);
   });
   return score;
@@ -778,7 +825,7 @@ double tf_idf_score(const IInvertedIndex &invidx, const Expression &expr,
   auto document_id = postings.document_id(index);
   auto N = static_cast<double>(invidx.document_count());
   double score = 0.0;
-  enumerate_terms(expr, [&](const auto &term) {
+  enumerate_terms(invidx, expr, [&](const auto &term) {
     auto n = static_cast<double>(invidx.df(term));
     auto idf = std::log2((N + 0.001) / (n + 0.001));
     score += invidx.tf(term, document_id) * idf;
@@ -795,7 +842,7 @@ double bm25_score(const IInvertedIndex &invidx, const Expression &expr,
   auto avgdl = static_cast<double>(invidx.average_document_term_count());
 
   double score = 0.0;
-  enumerate_terms(expr, [&](const auto &term) {
+  enumerate_terms(invidx, expr, [&](const auto &term) {
     auto n = static_cast<double>(invidx.df(term));
     auto idf = std::log2((N - n + 0.5) / (n + 0.5));
     auto tf = invidx.tf(term, document_id);

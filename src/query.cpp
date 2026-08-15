@@ -143,6 +143,39 @@ std::optional<Expression> parse_query(TermFilter filter,
   // boundaries), then run each split piece through the same TermFilter
   // chain an index-side Analyzer<T> would use.
   auto term_handler = [&](std::string_view token) -> Expression {
+    // A trailing `*` turns the token into a prefix query. This is resolved
+    // here rather than in the grammar so that the star binds tightly to its
+    // token (`foo*` is a prefix, `foo *` is not) without having to fight
+    // %whitespace skipping. A bare `*` is left alone: it stays an ordinary
+    // term that no index can contain, rather than becoming a match-all.
+    auto is_prefix = token.size() > 1 && token.back() == '*';
+    if (is_prefix) {
+      token.remove_suffix(1);
+    }
+
+    // Turns the term the `*` was attached to into a Prefix node. Only the
+    // last term is converted, so a token the raw tokenizer split into an
+    // implicit phrase (`well-kno*`) keeps its leading terms exact. A token a
+    // filter expanded into an Or (synonyms) is left alone, since a prefix of
+    // a synonym set has no useful meaning.
+    //
+    // An empty term means the filter dropped the whole token (a stop word).
+    // It has to stay a Term, which matches nothing: as a Prefix the empty
+    // string enumerates the entire dictionary, so `the*` would silently
+    // become a match-all.
+    auto as_prefix = [](Expression expr) -> Expression {
+      if (expr.operation == Operation::Term) {
+        if (!expr.term_str.empty()) {
+          expr.operation = Operation::Prefix;
+        }
+      } else if (expr.operation == Operation::Adjacent && !expr.nodes.empty() &&
+                 expr.nodes.back().operation == Operation::Term &&
+                 !expr.nodes.back().term_str.empty()) {
+        expr.nodes.back().operation = Operation::Prefix;
+      }
+      return expr;
+    };
+
     auto run_filter = [&](const std::u32string &str) {
       std::vector<std::u32string> emitted;
       if (filter) {
@@ -167,43 +200,51 @@ std::optional<Expression> parse_query(TermFilter filter,
       return Expression{Operation::Or, std::u32string(), 0, std::move(nodes)};
     };
 
-    std::vector<Expression> nodes;
-    bool split_any = false;
-    UTF8PlainTextTokenizer tokenizer(token);
-    tokenizer(nullptr, [&](const auto &str, auto, auto) {
-      split_any = true;
-      auto emitted = run_filter(str);
-      if (emitted.empty()) {
-        // Dropped (e.g. stop word); close the gap, matching how
-        // Analyzer<T> closes position gaps on the index side.
-        return;
-      }
-      nodes.push_back(to_expression(std::move(emitted)));
-    });
+    auto build = [&]() -> Expression {
+      std::vector<Expression> nodes;
+      bool split_any = false;
+      UTF8PlainTextTokenizer tokenizer(token);
+      tokenizer(nullptr, [&](const auto &str, auto, auto) {
+        split_any = true;
+        auto emitted = run_filter(str);
+        if (emitted.empty()) {
+          // Dropped (e.g. stop word); close the gap, matching how
+          // Analyzer<T> closes position gaps on the index side.
+          return;
+        }
+        nodes.push_back(to_expression(std::move(emitted)));
+      });
 
-    if (!split_any) {
-      // No letter sequence in the token (e.g. digits only); such a term can
-      // never exist in the index. Run it through the filter as-is so a
-      // configured chain (e.g. lowercasing) still applies, but an empty
-      // result still matches nothing.
-      auto emitted = run_filter(u32(token));
-      if (emitted.empty()) {
-        return Expression{Operation::Term, u32(token)};
+      if (!split_any) {
+        // No letter sequence in the token (e.g. digits only); such a term can
+        // never exist in the index. Run it through the filter as-is so a
+        // configured chain (e.g. lowercasing) still applies, but an empty
+        // result still matches nothing.
+        auto emitted = run_filter(u32(token));
+        if (emitted.empty()) {
+          return Expression{Operation::Term, u32(token)};
+        }
+        return to_expression(std::move(emitted));
       }
-      return to_expression(std::move(emitted));
-    }
 
-    if (nodes.empty()) {
-      // Every split piece was dropped by the filter; matches nothing.
-      return Expression{Operation::Term, std::u32string()};
+      if (nodes.empty()) {
+        // Every split piece was dropped by the filter; matches nothing.
+        return Expression{Operation::Term, std::u32string()};
+      }
+      if (nodes.size() == 1) {
+        return nodes[0];
+      }
+      // A token split into multiple pieces (e.g. `well-known`) is an implicit
+      // phrase.
+      return Expression{Operation::Adjacent, std::u32string(),
+                        DEFAULT_NEAR_SIZE, std::move(nodes)};
+    };
+
+    auto expr = build();
+    if (is_prefix) {
+      return as_prefix(std::move(expr));
     }
-    if (nodes.size() == 1) {
-      return nodes[0];
-    }
-    // A token split into multiple pieces (e.g. `well-known`) is an implicit
-    // phrase.
-    return Expression{Operation::Adjacent, std::u32string(), DEFAULT_NEAR_SIZE,
-                      std::move(nodes)};
+    return expr;
   };
 
   return parse_query_impl(term_handler, query);

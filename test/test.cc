@@ -1429,3 +1429,230 @@ TEST(ThreadSafetyTest, ConcurrentReadersAndWriter) {
       [&](const auto &idx) { return perform_search(idx, *expr)->size(); });
   EXPECT_GT(count, 0u);
 }
+
+//-----------------------------------------------------------------------------
+// Prefix search (roadmap item 14)
+//-----------------------------------------------------------------------------
+
+const std::vector<std::string> prefix_documents = {
+    "apple apricot",
+    "apple banana",
+    "application",
+    "banana",
+};
+
+auto prefix_index() {
+  InMemoryInvertedIndex<TextRange> invidx;
+  InMemoryIndexer indexer(invidx, normalizer);
+  size_t document_id = 0;
+  for (const auto &doc : prefix_documents) {
+    indexer.index_document(document_id, UTF8PlainTextTokenizer(doc));
+    document_id++;
+  }
+  return invidx;
+}
+
+// enumerate_terms_with_prefix leaves the order unspecified, so every
+// assertion here compares sorted vectors.
+static std::vector<std::string> terms_with_prefix(const IInvertedIndex &invidx,
+                                                  const std::u32string &prefix) {
+  std::vector<std::string> terms;
+  invidx.enumerate_terms_with_prefix(
+      prefix, [&](const auto &str) { terms.push_back(u8(str)); });
+  std::sort(terms.begin(), terms.end());
+  return terms;
+}
+
+static std::vector<size_t> hit_document_ids(const IPostings &postings) {
+  std::vector<size_t> ids;
+  for (size_t i = 0; i < postings.size(); i++) {
+    ids.push_back(postings.document_id(i));
+  }
+  return ids;
+}
+
+TEST(PrefixSearchTest, EnumerateTermsWithPrefix) {
+  auto invidx = prefix_index();
+
+  EXPECT_EQ((std::vector<std::string>{"apple", "application", "apricot"}),
+            terms_with_prefix(invidx, U"ap"));
+  EXPECT_EQ((std::vector<std::string>{"apple", "application"}),
+            terms_with_prefix(invidx, U"app"));
+  EXPECT_EQ((std::vector<std::string>{"banana"}),
+            terms_with_prefix(invidx, U"banana"));
+  EXPECT_TRUE(terms_with_prefix(invidx, U"zzz").empty());
+}
+
+TEST(PrefixSearchTest, EmptyPrefixEnumeratesWholeDictionary) {
+  auto invidx = prefix_index();
+  EXPECT_EQ((std::vector<std::string>{"apple", "application", "apricot",
+                                      "banana"}),
+            terms_with_prefix(invidx, U""));
+}
+
+TEST(PrefixSearchTest, QueryMatchesEveryTermWithThePrefix) {
+  auto invidx = prefix_index();
+
+  auto expr = parse_query(normalizer, "app*");
+  ASSERT_TRUE(expr);
+  EXPECT_EQ(Operation::Prefix, expr->operation);
+  EXPECT_EQ(U"app", expr->term_str);
+
+  // apple (docs 0, 1) + application (doc 2)
+  auto result = perform_search(invidx, *expr);
+  EXPECT_EQ((std::vector<size_t>{0, 1, 2}), hit_document_ids(*result));
+}
+
+TEST(PrefixSearchTest, QueryIsEquivalentToTheExplicitOr) {
+  auto invidx = prefix_index();
+
+  auto prefix_expr = parse_query(normalizer, "ap*");
+  auto or_expr = parse_query(normalizer, "apple|application|apricot");
+  ASSERT_TRUE(prefix_expr);
+  ASSERT_TRUE(or_expr);
+
+  auto prefix_result = perform_search(invidx, *prefix_expr);
+  auto or_result = perform_search(invidx, *or_expr);
+
+  ASSERT_EQ(or_result->size(), prefix_result->size());
+  EXPECT_EQ(hit_document_ids(*or_result), hit_document_ids(*prefix_result));
+
+  // Scoring has to agree too: enumerate_terms expands a Prefix node into the
+  // same term set the Or spells out by hand.
+  for (size_t i = 0; i < prefix_result->size(); i++) {
+    EXPECT_AP(bm25_score(invidx, *or_expr, *or_result, i),
+              bm25_score(invidx, *prefix_expr, *prefix_result, i));
+  }
+}
+
+TEST(PrefixSearchTest, NoMatchingTermYieldsNoHits) {
+  auto invidx = prefix_index();
+
+  auto expr = parse_query(normalizer, "zzz*");
+  ASSERT_TRUE(expr);
+  EXPECT_EQ(Operation::Prefix, expr->operation);
+  EXPECT_EQ(0, perform_search(invidx, *expr)->size());
+}
+
+TEST(PrefixSearchTest, BareStarStaysAnOrdinaryTerm) {
+  auto invidx = prefix_index();
+
+  auto expr = parse_query(normalizer, "*");
+  ASSERT_TRUE(expr);
+  // Not a match-all: `*` alone is just a term no tokenizer can produce.
+  EXPECT_EQ(Operation::Term, expr->operation);
+  EXPECT_EQ(0, perform_search(invidx, *expr)->size());
+}
+
+TEST(PrefixSearchTest, CombinesWithOtherOperators) {
+  auto invidx = prefix_index();
+
+  // `app* banana` == documents holding both an "app"-prefixed term and
+  // "banana"; only doc 1 (apple banana) qualifies.
+  auto and_expr = parse_query(normalizer, "app* banana");
+  ASSERT_TRUE(and_expr);
+  EXPECT_EQ((std::vector<size_t>{1}),
+            hit_document_ids(*perform_search(invidx, *and_expr)));
+
+  // Negation over a prefix: "banana" but nothing starting with "app".
+  auto not_expr = parse_query(normalizer, "banana -app*");
+  ASSERT_TRUE(not_expr);
+  EXPECT_EQ((std::vector<size_t>{3}),
+            hit_document_ids(*perform_search(invidx, *not_expr)));
+}
+
+TEST(PrefixSearchTest, AppliesToTheLastTermOfASplitToken) {
+  InMemoryInvertedIndex<TextRange> invidx;
+  {
+    InMemoryIndexer indexer(invidx, normalizer);
+    indexer.index_document(0, UTF8PlainTextTokenizer("a well-known example"));
+    indexer.index_document(1, UTF8PlainTextTokenizer("well done"));
+  }
+
+  // `well-kno*` is an implicit phrase whose last term is a prefix, so it
+  // matches doc 0 but not doc 1.
+  auto expr = parse_query(normalizer, "well-kno*");
+  ASSERT_TRUE(expr);
+  ASSERT_EQ(Operation::Adjacent, expr->operation);
+  ASSERT_EQ(2, expr->nodes.size());
+  EXPECT_EQ(Operation::Term, expr->nodes[0].operation);
+  EXPECT_EQ(Operation::Prefix, expr->nodes[1].operation);
+
+  EXPECT_EQ((std::vector<size_t>{0}),
+            hit_document_ids(*perform_search(invidx, *expr)));
+}
+
+TEST(PrefixSearchTest, ExcludesLogicallyDeletedDocuments) {
+  auto invidx = prefix_index();
+  invidx.remove_document(1);
+
+  auto expr = parse_query(normalizer, "app*");
+  ASSERT_TRUE(expr);
+  EXPECT_EQ((std::vector<size_t>{0, 2}),
+            hit_document_ids(*perform_search(invidx, *expr)));
+}
+
+TEST(PrefixSearchTest, DroppedTokenDoesNotBecomeMatchAll) {
+  auto invidx = prefix_index();
+
+  // A stop-word filter drops "the" entirely, so `build()` yields a Term with
+  // an empty string. Turning that into a Prefix would enumerate the whole
+  // dictionary, i.e. `the*` would quietly match every document.
+  TermFilter drop_the = [](const std::u32string &str, auto emit) {
+    if (str != U"the") {
+      emit(to_lowercase(str));
+    }
+  };
+
+  auto expr = parse_query(drop_the, "the*");
+  ASSERT_TRUE(expr);
+  EXPECT_EQ(Operation::Term, expr->operation);
+  EXPECT_TRUE(expr->term_str.empty());
+  EXPECT_EQ(0, perform_search(invidx, *expr)->size());
+}
+
+TEST(PrefixSearchTest, ExpandPrefixesRewritesToAnEquivalentOr) {
+  auto invidx = prefix_index();
+
+  auto parsed = parse_query(normalizer, "ap*");
+  ASSERT_TRUE(parsed);
+  ASSERT_EQ(Operation::Prefix, parsed->operation);
+
+  auto expanded = expand_prefixes(invidx, *parsed);
+  ASSERT_EQ(Operation::Or, expanded.operation);
+  ASSERT_EQ(3, expanded.nodes.size());
+  // Sorted, so the expansion is reproducible for one prefix and one index.
+  EXPECT_EQ(U"apple", expanded.nodes[0].term_str);
+  EXPECT_EQ(U"application", expanded.nodes[1].term_str);
+  EXPECT_EQ(U"apricot", expanded.nodes[2].term_str);
+
+  // Same hits and same scores as searching the unexpanded expression, which
+  // is what makes expanding-before-scoring a pure optimization.
+  auto result = perform_search(invidx, expanded);
+  auto direct = perform_search(invidx, *parsed);
+  ASSERT_EQ(direct->size(), result->size());
+  for (size_t i = 0; i < result->size(); i++) {
+    EXPECT_EQ(direct->document_id(i), result->document_id(i));
+    EXPECT_AP(bm25_score(invidx, *parsed, *direct, i),
+              bm25_score(invidx, expanded, *result, i));
+  }
+}
+
+TEST(PrefixSearchTest, ExpandPrefixesRewritesNestedNodes) {
+  auto invidx = prefix_index();
+
+  auto parsed = parse_query(normalizer, "app* banana");
+  ASSERT_TRUE(parsed);
+  ASSERT_EQ(Operation::And, parsed->operation);
+
+  auto expanded = expand_prefixes(invidx, *parsed);
+  ASSERT_EQ(Operation::And, expanded.operation);
+  ASSERT_EQ(2, expanded.nodes.size());
+  // The Prefix child became an Or; the plain Term child is untouched.
+  EXPECT_EQ(Operation::Or, expanded.nodes[0].operation);
+  EXPECT_EQ(Operation::Term, expanded.nodes[1].operation);
+  EXPECT_EQ(U"banana", expanded.nodes[1].term_str);
+
+  EXPECT_EQ((std::vector<size_t>{1}),
+            hit_document_ids(*perform_search(invidx, expanded)));
+}

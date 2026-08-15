@@ -128,18 +128,22 @@ int cmd_search(const std::string &index_path, const std::string &query_str,
   invidx.load(index_path);
   auto document_paths = load_manifest(index_path);
 
-  auto expr = parse_query(normalizer, query_str);
-  if (!expr) {
+  auto parsed = parse_query(normalizer, query_str);
+  if (!parsed) {
     return error("invalid query: " + query_str);
   }
 
-  auto result = perform_search(invidx, *expr);
+  // Every hit gets scored below, and scoring a Prefix node enumerates the
+  // dictionary each time, so expand the prefixes once up front.
+  auto expr = expand_prefixes(invidx, *parsed);
+
+  auto result = perform_search(invidx, expr);
   if (verbose) {
     std::cout << result->size() << " matching document(s)" << std::endl;
   }
 
   auto hits = top_k(*result, limit, [&](size_t i) {
-    return bm25_score(invidx, *expr, *result, i);
+    return bm25_score(invidx, expr, *result, i);
   });
 
   size_t rank = 1;

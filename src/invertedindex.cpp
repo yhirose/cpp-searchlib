@@ -390,6 +390,20 @@ InMemoryInvertedIndexBase::postings(const std::u32string &str) const {
   return empty_postings;
 }
 
+void InMemoryInvertedIndexBase::enumerate_terms_with_prefix(
+    const std::u32string &prefix,
+    const std::function<void(const std::u32string &str)> &callback) const {
+  // term_dictionary_ is a hash map, so there is no subtree to descend into:
+  // every term has to be tested. Linear in the vocabulary size, which is the
+  // price of keeping the writable index cheap to mutate.
+  for (const auto &[str, term] : term_dictionary_) {
+    if (str.size() >= prefix.size() &&
+        str.compare(0, prefix.size(), prefix) == 0) {
+      callback(str);
+    }
+  }
+}
+
 bool InMemoryInvertedIndexBase::has_removed_documents() const {
   return !removed_document_ids_.empty();
 }

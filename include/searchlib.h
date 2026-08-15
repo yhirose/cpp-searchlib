@@ -141,6 +141,18 @@ public:
   virtual std::shared_ptr<const IPostings>
   postings(const std::u32string &str) const = 0;
 
+  // Calls callback once for every term in the dictionary that starts with
+  // `prefix`; an empty prefix enumerates the whole dictionary. This is what
+  // backs Operation::Prefix.
+  //
+  // The enumeration order and the cost are both unspecified: an unordered
+  // dictionary answers this with a full scan, an ordered one descends
+  // straight to the matching subtree. Callers needing a deterministic order
+  // must sort the collected terms themselves.
+  virtual void enumerate_terms_with_prefix(
+      const std::u32string &prefix,
+      const std::function<void(const std::u32string &str)> &callback) const = 0;
+
   // Logical (tombstone) deletion support. Read-only indexes report no
   // removals; searches filter out removed document_ids via these hooks.
   // Overridden by indexes that support IMutableInvertedIndex::remove_document.
@@ -236,10 +248,13 @@ public:
 // Search
 //-----------------------------------------------------------------------------
 
-enum class Operation { Term, And, Adjacent, Or, Near, Not, SameScope };
+enum class Operation { Term, And, Adjacent, Or, Near, Not, SameScope, Prefix };
 
 struct Expression {
   Operation operation;
+
+  // For Operation::Term the term to look up; for Operation::Prefix the prefix
+  // every matching term must start with.
   std::u32string term_str;
   size_t near_operation_distance;
   std::vector<Expression> nodes;
@@ -270,6 +285,15 @@ std::optional<Expression> parse_query(TermFilter filter,
 std::shared_ptr<IPostings> perform_search(const IInvertedIndex &invidx,
                                           const Expression &expr,
                                           const IScopeIndex *scope_index = nullptr);
+
+// Rewrites every Operation::Prefix node into the Or over the terms it expands
+// to against invidx, leaving the rest of the tree alone. perform_search does
+// this internally, so it is only worth calling explicitly before scoring:
+// the scoring functions below take an Expression per hit, and a Prefix node
+// costs one dictionary enumeration every time they are called. Expanding once
+// and scoring the result is one enumeration per query instead of one per hit.
+Expression expand_prefixes(const IInvertedIndex &invidx,
+                           const Expression &expr);
 
 size_t term_count_score(const IInvertedIndex &invidx, const Expression &expr,
                         const IPostings &postings, size_t index);
@@ -587,6 +611,11 @@ public:
   std::shared_ptr<const IPostings>
   postings(const std::u32string &str) const override;
 
+  void enumerate_terms_with_prefix(
+      const std::u32string &prefix,
+      const std::function<void(const std::u32string &str)> &callback)
+      const override;
+
   bool has_removed_documents() const override;
   bool is_document_removed(size_t document_id) const override;
 
@@ -703,6 +732,13 @@ public:
   std::shared_ptr<const IPostings>
   postings(const std::u32string &str) const override {
     return base_.postings(str);
+  }
+
+  void enumerate_terms_with_prefix(
+      const std::u32string &prefix,
+      const std::function<void(const std::u32string &str)> &callback)
+      const override {
+    base_.enumerate_terms_with_prefix(prefix, callback);
   }
 
   bool has_removed_documents() const override {
