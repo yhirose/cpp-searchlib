@@ -311,6 +311,18 @@ public:
     term_dictionary_.enumerate_with_wildcard(pattern, callback);
   }
 
+  void enumerate_terms_with_edit_distance(
+      const std::u32string &target, size_t max_edits,
+      const std::function<void(const std::u32string &str)> &callback)
+      const override {
+    // Like the wildcard walk, this is an automaton driven over the whole FST
+    // rather than a descent into one subtree, but the pruning is much tighter
+    // here: can_match() rejects a subtree as soon as every alignment already
+    // costs more than max_edits, which happens within a few characters for
+    // most of the dictionary.
+    term_dictionary_.enumerate_with_edit_distance(target, max_edits, callback);
+  }
+
   bool has_removed_documents() const override {
     return !removed_document_ids_.empty();
   }

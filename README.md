@@ -58,6 +58,7 @@ for (size_t i = 0; i < result->size(); i++) {
 | `apple ~ tree` | NEAR - terms within 4 term positions |
 | `app*` | Prefix - every term starting with `app` |
 | `a*e`, `*ana`, `app*ion` | Wildcard - `*` matches zero or more characters anywhere in the term |
+| `apple~2` | Fuzzy - terms within 2 edits of `apple` |
 | `( ... )` | Grouping |
 
 Terms are tokenized and normalized in the same way as documents, so Unicode
@@ -116,6 +117,37 @@ pattern cannot match. It still visits more of the FST than a literal prefix
 does -- a `*` can match anything, so descent can't be confined to one subtree
 -- which is why the common single-trailing-`*` case stays on the cheaper
 Prefix path instead of going through the wildcard automaton.
+
+### Fuzzy search
+
+`term~N` matches every term within `N` Levenshtein edits (insertion, deletion,
+substitution) of `term`, counted in codepoints rather than bytes, so it works
+on non-ASCII text. `apple~1` finds `ample` and `apply`; `sanctifed~1` finds
+`sanctified`.
+
+The `~` has to touch its term and be followed by digits, which is what keeps
+it apart from the NEAR operator: `apple~2` is a fuzzy query, while `apple ~ 2`
+and `apple~tree` are still NEAR. `N` is capped at 2 (as it is in Lucene): a
+larger distance defeats the pruning both backends depend on and matches most
+of the dictionary. The underlying
+`IInvertedIndex::enumerate_terms_with_edit_distance` takes any distance, since
+a caller naming one directly is not untrusted input.
+
+```cpp
+index.enumerate_terms_with_edit_distance(U"apple", 1, [](const auto &term) {
+  std::cout << u8(term) << std::endl;
+});
+```
+
+Like a prefix or wildcard query, this expands to an `OR` over the matching
+terms, so `expand_fuzzy` is worth calling once before scoring for the same
+reason `expand_prefixes` is. Every matching term contributes equally to the
+score -- unlike Lucene, a closer edit distance carries no boost.
+
+The compressed backend walks the FST with fstlib's own `LevenshteinAutomaton`,
+which prunes a subtree as soon as every alignment through it already costs
+more than `N`. The in-memory backend tests each term with a rolling-row DP,
+skipping any term whose length alone puts it out of range.
 
 ## Scoring
 

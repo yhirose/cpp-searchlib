@@ -189,6 +189,22 @@ public:
       const std::u32string &pattern,
       const std::function<void(const std::u32string &str)> &callback) const = 0;
 
+  // Calls callback once for every term within `max_edits` Levenshtein edits
+  // (insertion, deletion, substitution, each counted at codepoint granularity)
+  // of `target`. This is what backs Operation::Fuzzy; max_edits of 0 matches
+  // only `target` itself.
+  //
+  // No cap is applied here -- the query syntax caps `term~N`, but a caller
+  // naming a distance directly is trusted to know that the cost grows sharply
+  // with it, since a large enough distance matches most of the dictionary.
+  //
+  // Same order/cost/buffer-reuse contract as enumerate_terms_with_prefix: the
+  // enumeration order is unspecified, and the string handed to the callback
+  // is only valid for the duration of that call.
+  virtual void enumerate_terms_with_edit_distance(
+      const std::u32string &target, size_t max_edits,
+      const std::function<void(const std::u32string &str)> &callback) const = 0;
+
   // Logical (tombstone) deletion support. Read-only indexes report no
   // removals; searches filter out removed document_ids via these hooks.
   // Overridden by indexes that support IMutableInvertedIndex::remove_document.
@@ -293,7 +309,8 @@ enum class Operation {
   Not,
   SameScope,
   Prefix,
-  Wildcard
+  Wildcard,
+  Fuzzy
 };
 
 struct Expression {
@@ -302,8 +319,13 @@ struct Expression {
   // For Operation::Term the term to look up; for Operation::Prefix the prefix
   // every matching term must start with; for Operation::Wildcard the glob
   // pattern every matching term must satisfy (see
-  // IInvertedIndex::enumerate_terms_with_wildcard).
+  // IInvertedIndex::enumerate_terms_with_wildcard); for Operation::Fuzzy the
+  // term every match must be within near_operation_distance edits of.
   std::u32string term_str;
+
+  // The proximity window for Operation::Near, and -- reusing the same field
+  // rather than adding one only two operations would ever read -- the maximum
+  // edit distance for Operation::Fuzzy. Unused by every other operation.
   size_t near_operation_distance;
   std::vector<Expression> nodes;
 
@@ -349,6 +371,12 @@ Expression expand_prefixes(const IInvertedIndex &invidx,
 // needs both calls to fully expand.
 Expression expand_wildcards(const IInvertedIndex &invidx,
                             const Expression &expr);
+
+// Same rationale and mechanics again, for Operation::Fuzzy nodes and
+// IInvertedIndex::enumerate_terms_with_edit_distance. Note that every term the
+// expansion finds contributes equally to the score: unlike Lucene, a closer
+// edit distance is not boosted.
+Expression expand_fuzzy(const IInvertedIndex &invidx, const Expression &expr);
 
 size_t term_count_score(const IInvertedIndex &invidx, const Expression &expr,
                         const IPostings &postings, size_t index);
@@ -676,6 +704,11 @@ public:
       const std::function<void(const std::u32string &str)> &callback)
       const override;
 
+  void enumerate_terms_with_edit_distance(
+      const std::u32string &target, size_t max_edits,
+      const std::function<void(const std::u32string &str)> &callback)
+      const override;
+
   bool has_removed_documents() const override;
   bool is_document_removed(size_t document_id) const override;
 
@@ -820,6 +853,13 @@ public:
       const std::function<void(const std::u32string &str)> &callback)
       const override {
     base_.enumerate_terms_with_wildcard(pattern, callback);
+  }
+
+  void enumerate_terms_with_edit_distance(
+      const std::u32string &target, size_t max_edits,
+      const std::function<void(const std::u32string &str)> &callback)
+      const override {
+    base_.enumerate_terms_with_edit_distance(target, max_edits, callback);
   }
 
   bool has_removed_documents() const override {

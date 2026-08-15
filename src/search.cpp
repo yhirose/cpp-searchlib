@@ -565,6 +565,16 @@ perform_wildcard_operation(const IInvertedIndex &inverted_index,
       inverted_index, expand_wildcards(inverted_index, expr), scope_index);
 }
 
+// And likewise for Fuzzy, which differs from the two above only in which
+// dictionary enumeration it expands through.
+static std::shared_ptr<IPostings>
+perform_fuzzy_operation(const IInvertedIndex &inverted_index,
+                        const Expression &expr,
+                        const IScopeIndex *scope_index) {
+  return perform_search_operation(
+      inverted_index, expand_fuzzy(inverted_index, expr), scope_index);
+}
+
 static std::shared_ptr<IPostings>
 perform_near_operation(const IInvertedIndex &inverted_index,
                        const Expression &expr,
@@ -764,6 +774,8 @@ perform_search_operation(const IInvertedIndex &inverted_index,
     return perform_prefix_operation(inverted_index, expr, scope_index);
   case Operation::Wildcard:
     return perform_wildcard_operation(inverted_index, expr, scope_index);
+  case Operation::Fuzzy:
+    return perform_fuzzy_operation(inverted_index, expr, scope_index);
   default:
     return nullptr;
   }
@@ -820,6 +832,31 @@ Expression expand_wildcards(const IInvertedIndex &inverted_index,
   return expanded;
 }
 
+Expression expand_fuzzy(const IInvertedIndex &inverted_index,
+                        const Expression &expr) {
+  if (expr.operation == Operation::Fuzzy) {
+    std::vector<Expression> nodes;
+    inverted_index.enumerate_terms_with_edit_distance(
+        expr.term_str, expr.near_operation_distance, [&](const auto &str) {
+          nodes.push_back(Expression{Operation::Term, str});
+        });
+
+    // enumerate_terms_with_edit_distance leaves the order unspecified, same
+    // reproducibility rationale as expand_prefixes.
+    std::sort(nodes.begin(), nodes.end(), [](const auto &a, const auto &b) {
+      return a.term_str < b.term_str;
+    });
+
+    return Expression{Operation::Or, std::u32string(), 0, std::move(nodes)};
+  }
+
+  auto expanded = expr;
+  for (auto &node : expanded.nodes) {
+    node = expand_fuzzy(inverted_index, node);
+  }
+  return expanded;
+}
+
 std::shared_ptr<IPostings> perform_search(const IInvertedIndex &inverted_index,
                                           const Expression &expr,
                                           const IScopeIndex *scope_index) {
@@ -845,6 +882,11 @@ void enumerate_terms(const IInvertedIndex &invidx, const Expression &expr,
   } else if (expr.operation == Operation::Wildcard) {
     // Same rationale as Operation::Prefix above.
     invidx.enumerate_terms_with_wildcard(expr.term_str, fn);
+  } else if (expr.operation == Operation::Fuzzy) {
+    // Same again; every term within the distance scores as an equal Or
+    // branch, with no boost for being a closer match.
+    invidx.enumerate_terms_with_edit_distance(
+        expr.term_str, expr.near_operation_distance, fn);
   } else if (expr.operation == Operation::Not) {
     // Excluded terms do not contribute to scores.
   } else {

@@ -180,13 +180,38 @@ TEST(KJVTest, CompressedBackend) {
   ASSERT_FALSE(expected_wildcard_terms.empty());
   EXPECT_EQ(expected_wildcard_terms, collect_wildcard(*loaded, U"sanct*fy"));
 
+  // And for the fuzzy path, where the compressed backend drives fstlib's
+  // LevenshteinAutomaton over the FST and the in-memory one runs a DP per
+  // term. A real vocabulary is what makes this worth checking: "lord" alone
+  // has dozens of neighbours at distance 1 in KJV.
+  auto collect_fuzzy = [](const IInvertedIndex &index,
+                          const std::u32string &str, size_t max_edits) {
+    std::vector<std::u32string> terms;
+    index.enumerate_terms_with_edit_distance(
+        str, max_edits, [&](const auto &s) { terms.push_back(s); });
+    std::sort(terms.begin(), terms.end());
+    return terms;
+  };
+  for (size_t max_edits : {size_t{1}, size_t{2}}) {
+    auto expected_fuzzy_terms = collect_fuzzy(invidx, U"lord", max_edits);
+    ASSERT_FALSE(expected_fuzzy_terms.empty()) << max_edits;
+    EXPECT_EQ(expected_fuzzy_terms, collect_fuzzy(*loaded, U"lord", max_edits))
+        << max_edits;
+  }
+
+  // A typo has to reach the word it was a typo of.
+  auto typo_terms = collect_fuzzy(invidx, U"sanctifed", 1);
+  EXPECT_NE(std::find(typo_terms.begin(), typo_terms.end(), U"sanctified"),
+            typo_terms.end());
+
   // "apple" stays plain-coded, "the" is EF-coded, the phrase query exercises
   // is_term_position and multi-term text ranges, "sanctif*" exercises the
-  // prefix expansion (dictionary scan plus union), and "sanct*fy" exercises
-  // the wildcard expansion (automaton walk plus union) on both paths.
+  // prefix expansion (dictionary scan plus union), "sanct*fy" the wildcard
+  // expansion (automaton walk plus union), and "sanctifed~1" the fuzzy one,
+  // on both paths.
   for (const auto *query : {R"( apple )", R"( the )", R"( "apple tree" )",
                             R"( "the lord" )", R"( sanctif* )",
-                            R"( sanct*fy )"}) {
+                            R"( sanct*fy )", R"( sanctifed~1 )"}) {
     auto expr = parse_query(normalizer, query);
     ASSERT_TRUE(expr);
 

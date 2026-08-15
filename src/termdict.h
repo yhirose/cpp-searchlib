@@ -189,16 +189,23 @@ public:
   void enumerate_with_wildcard(
       const std::u32string &pattern,
       const std::function<void(const std::u32string &str)> &callback) const {
-    if (!map_) {
-      return;
-    }
-    std::u32string term; // reused across hits, same rationale as above
-    map_->custom_search(WildcardAutomaton(pattern),
-                        [&](const std::string &key, const uint32_t &) {
-                          term.clear();
-                          unicode::utf8::decode(key, term);
-                          callback(term);
-                        });
+    enumerate_with_automaton(WildcardAutomaton(pattern), callback);
+  }
+
+  void enumerate_with_edit_distance(
+      const std::u32string &target, size_t max_edits,
+      const std::function<void(const std::u32string &str)> &callback) const {
+    // fst::map::edit_distance_search would do the same walk, but it collects
+    // every hit into a vector first, and it rejects an empty needle outright;
+    // going through custom_search keeps this in the same streaming,
+    // one-reused-buffer shape as the enumerators above, and lets an empty
+    // `target` mean what the interface says it means (every term of length <=
+    // max_edits), which is what the in-memory backend answers too. The
+    // automaton is fstlib's own, so nothing is reimplemented here.
+    enumerate_with_automaton(
+        fst::LevenshteinAutomaton(u8(target), max_edits, /*insert_cost=*/1,
+                                  /*delete_cost=*/1, /*replace_cost=*/1),
+        callback);
   }
 
   // Recovers the ordinal -> term mapping. Used by readers that need the term
@@ -236,6 +243,29 @@ public:
   }
 
 private:
+  // The shape both automaton-driven enumerators share: one buffer refilled per
+  // hit rather than a fresh u32string each time, since a term longer than the
+  // small-string buffer (4 codepoints on libc++) would otherwise cost a
+  // malloc/free pair. Callbacks receive it by reference and must not retain
+  // it, which is what the IInvertedIndex::enumerate_terms_with_* contract
+  // promises. (enumerate_with_prefix stays separate: it descends to a subtree
+  // with predictive_search instead of walking with an automaton.)
+  template <typename Automaton>
+  void enumerate_with_automaton(
+      const Automaton &automaton,
+      const std::function<void(const std::u32string &str)> &callback) const {
+    if (!map_) {
+      return;
+    }
+    std::u32string term;
+    map_->custom_search(automaton,
+                        [&](const std::string &key, const uint32_t &) {
+                          term.clear();
+                          unicode::utf8::decode(key, term);
+                          callback(term);
+                        });
+  }
+
   std::string bytes_;
   std::unique_ptr<fst::map<uint32_t>> map_; // points into bytes_
 };

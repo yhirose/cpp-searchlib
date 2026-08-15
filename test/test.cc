@@ -1891,6 +1891,340 @@ TEST(WildcardSearchTest, CompressedEnumerationReusesItsBuffer) {
 }
 
 //-----------------------------------------------------------------------------
+// Fuzzy search (edit distance)
+//-----------------------------------------------------------------------------
+
+// A vocabulary with terms one and two edits apart from "apple", so that the
+// distance threshold is what decides each case rather than the corpus.
+const std::vector<std::string> fuzzy_documents = {
+    "apple ample",
+    "maple banana",
+    "apply",
+    "東京 東京都",
+};
+
+auto fuzzy_index() {
+  InMemoryInvertedIndex<TextRange> invidx;
+  InMemoryIndexer indexer(invidx, normalizer);
+  size_t document_id = 0;
+  for (const auto &doc : fuzzy_documents) {
+    indexer.index_document(document_id, UTF8PlainTextTokenizer(doc));
+    document_id++;
+  }
+  return invidx;
+}
+
+// enumerate_terms_with_edit_distance leaves the order unspecified, so every
+// assertion here compares sorted vectors.
+static std::vector<std::string>
+terms_within_edits(const IInvertedIndex &invidx, const std::u32string &str,
+                   size_t max_edits) {
+  std::vector<std::string> terms;
+  invidx.enumerate_terms_with_edit_distance(
+      str, max_edits, [&](const auto &s) { terms.push_back(u8(s)); });
+  std::sort(terms.begin(), terms.end());
+  return terms;
+}
+
+TEST(FuzzySearchTest, EnumerateTermsWithEditDistance) {
+  auto invidx = fuzzy_index();
+
+  // Distance 0 is an exact match, and each step out admits the next ring of
+  // terms: "ample"/"apply" are one edit from "apple", "maple" is two.
+  EXPECT_EQ((std::vector<std::string>{"apple"}),
+            terms_within_edits(invidx, U"apple", 0));
+  EXPECT_EQ((std::vector<std::string>{"ample", "apple", "apply"}),
+            terms_within_edits(invidx, U"apple", 1));
+  EXPECT_EQ((std::vector<std::string>{"ample", "apple", "apply", "maple"}),
+            terms_within_edits(invidx, U"apple", 2));
+  EXPECT_TRUE(terms_within_edits(invidx, U"zzzzz", 2).empty());
+}
+
+TEST(FuzzySearchTest, CountsEachEditKind) {
+  auto invidx = fuzzy_index();
+
+  // All three edits count the same, and each of these needles is one edit of
+  // exactly one kind away from "apple" and two or more from every other term.
+  EXPECT_EQ((std::vector<std::string>{"apple"}), // substitute i -> a
+            terms_within_edits(invidx, U"ipple", 1));
+  EXPECT_EQ((std::vector<std::string>{"apple"}), // insert the missing a
+            terms_within_edits(invidx, U"pple", 1));
+  EXPECT_EQ((std::vector<std::string>{"apple"}), // delete the extra p
+            terms_within_edits(invidx, U"appple", 1));
+}
+
+TEST(FuzzySearchTest, MeasuresDistanceInCodepointsNotBytes) {
+  auto invidx = fuzzy_index();
+
+  // One CJK codepoint is three UTF-8 bytes, so a byte-wise distance would
+  // call this three edits and find nothing at 1.
+  EXPECT_EQ((std::vector<std::string>{"東京"}),
+            terms_within_edits(invidx, U"東今", 1));
+  EXPECT_EQ((std::vector<std::string>{"東京", "東京都"}),
+            terms_within_edits(invidx, U"東京", 1));
+}
+
+TEST(FuzzySearchTest, EmptyTermMatchesEveryTermWithinTheDistance) {
+  auto invidx = fuzzy_index();
+
+  // Every term is `its length` edits away from the empty string. The query
+  // syntax never produces this (see DroppedTokenDoesNotBecomeMatchAll), but
+  // the C++ API answers it per its documented contract.
+  EXPECT_TRUE(terms_within_edits(invidx, U"", 1).empty());
+  EXPECT_EQ((std::vector<std::string>{"東京"}),
+            terms_within_edits(invidx, U"", 2));
+}
+
+TEST(FuzzySearchTest, TermTildeDigitsParsesAsFuzzy) {
+  auto expr = parse_query(normalizer, "apple~2");
+  ASSERT_TRUE(expr);
+  EXPECT_EQ(Operation::Fuzzy, expr->operation);
+  EXPECT_EQ(U"apple", expr->term_str);
+  EXPECT_EQ(2, expr->near_operation_distance);
+}
+
+// The `~` is NEAR's operator, so every established spelling of it has to keep
+// parsing exactly as it did before Fuzzy existed. Each row here was captured
+// from the parser before the FUZZY rule was added.
+TEST(FuzzySearchTest, DoesNotDisturbTheNearOperator) {
+  struct Case {
+    const char *query;
+    const char *description;
+  };
+  for (const auto &c : {
+           Case{"apple ~ 2", "spaced, digits: the star has to touch its term"},
+           Case{"apple ~ tree", "the ordinary spelling"},
+           Case{"apple~ tree", "no digits after the tilde"},
+           Case{"apple ~tree", "no digits after the tilde"},
+           Case{"apple~tree", "no digits after the tilde"},
+           Case{"apple~2x", "digits are not the end of the token"},
+       }) {
+    auto expr = parse_query(normalizer, c.query);
+    ASSERT_TRUE(expr) << c.query;
+    EXPECT_EQ(Operation::Near, expr->operation) << c.query << " -- " << c.description;
+  }
+
+  // A phrase keeps its own reading too: Lucene's `"..."~N` phrase slop is not
+  // supported, and this stays the NEAR it always was.
+  auto phrase = parse_query(normalizer, R"("apple tree"~2)");
+  ASSERT_TRUE(phrase);
+  EXPECT_EQ(Operation::Near, phrase->operation);
+}
+
+TEST(FuzzySearchTest, DistanceIsClampedAndNeverOverflows) {
+  // A distance from a query string is end-user input: a huge one would defeat
+  // both backends' pruning, and a huge enough one would overflow a naive
+  // parse. It saturates at the cap instead.
+  auto huge = parse_query(normalizer, "apple~99999999999999999999");
+  ASSERT_TRUE(huge);
+  EXPECT_EQ(Operation::Fuzzy, huge->operation);
+  EXPECT_EQ(2, huge->near_operation_distance);
+
+  auto within = parse_query(normalizer, "apple~1");
+  ASSERT_TRUE(within);
+  EXPECT_EQ(1, within->near_operation_distance);
+
+  // Zero is a legitimate distance, not "unset": it means an exact match.
+  auto zero = parse_query(normalizer, "apple~0");
+  ASSERT_TRUE(zero);
+  EXPECT_EQ(Operation::Fuzzy, zero->operation);
+  EXPECT_EQ(0, zero->near_operation_distance);
+}
+
+TEST(FuzzySearchTest, AppliesToTheLastTermOfASplitToken) {
+  auto expr = parse_query(normalizer, "well-known~1");
+  ASSERT_TRUE(expr);
+  ASSERT_EQ(Operation::Adjacent, expr->operation);
+  ASSERT_EQ(2, expr->nodes.size());
+  EXPECT_EQ(Operation::Term, expr->nodes[0].operation);
+  EXPECT_EQ(Operation::Fuzzy, expr->nodes[1].operation);
+  EXPECT_EQ(U"known", expr->nodes[1].term_str);
+  EXPECT_EQ(1, expr->nodes[1].near_operation_distance);
+}
+
+TEST(FuzzySearchTest, DoesNotApplyToAPrefixNode) {
+  // `app*~2` has no useful reading -- a distance around a prefix expansion is
+  // meaningless -- so the `~2` is dropped and the Prefix stands, mirroring how
+  // a `*` on a synonym expansion is dropped.
+  auto expr = parse_query(normalizer, "app*~2");
+  ASSERT_TRUE(expr);
+  EXPECT_EQ(Operation::Prefix, expr->operation);
+  EXPECT_EQ(U"app", expr->term_str);
+}
+
+TEST(FuzzySearchTest, DroppedTokenDoesNotBecomeMatchAll) {
+  auto invidx = fuzzy_index();
+
+  // A stop-word filter drops "the" entirely, leaving an empty term. As a
+  // Fuzzy that would match every term of length <= 2, so it has to stay a
+  // Term, which matches nothing.
+  TermFilter drop_the = [](const std::u32string &str, auto emit) {
+    if (str != U"the") {
+      emit(to_lowercase(str));
+    }
+  };
+
+  auto expr = parse_query(drop_the, "the~2");
+  ASSERT_TRUE(expr);
+  EXPECT_EQ(Operation::Term, expr->operation);
+  EXPECT_TRUE(expr->term_str.empty());
+  EXPECT_EQ(0, perform_search(invidx, *expr)->size());
+}
+
+TEST(FuzzySearchTest, QueryMatchesEveryTermWithinTheDistance) {
+  auto invidx = fuzzy_index();
+
+  // One edit from "apple" reaches "ample" (doc 0) and "apply" (doc 2).
+  auto expr = parse_query(normalizer, "apple~1");
+  ASSERT_TRUE(expr);
+  EXPECT_EQ((std::vector<size_t>{0, 2}),
+            hit_document_ids(*perform_search(invidx, *expr)));
+
+  // Widening to two edits pulls in "maple" (doc 1) as well.
+  auto wider = parse_query(normalizer, "apple~2");
+  ASSERT_TRUE(wider);
+  EXPECT_EQ((std::vector<size_t>{0, 1, 2}),
+            hit_document_ids(*perform_search(invidx, *wider)));
+}
+
+TEST(FuzzySearchTest, QueryIsEquivalentToTheExplicitOr) {
+  auto invidx = fuzzy_index();
+
+  auto fuzzy_expr = parse_query(normalizer, "apple~1");
+  auto or_expr = parse_query(normalizer, "ample|apple|apply");
+  ASSERT_TRUE(fuzzy_expr);
+  ASSERT_TRUE(or_expr);
+
+  auto fuzzy_result = perform_search(invidx, *fuzzy_expr);
+  auto or_result = perform_search(invidx, *or_expr);
+
+  ASSERT_EQ(or_result->size(), fuzzy_result->size());
+  EXPECT_EQ(hit_document_ids(*or_result), hit_document_ids(*fuzzy_result));
+
+  // Scoring agrees too, which is also what pins down that a closer edit
+  // distance carries no boost: every branch of the expansion is equal.
+  for (size_t i = 0; i < fuzzy_result->size(); i++) {
+    EXPECT_AP(bm25_score(invidx, *or_expr, *or_result, i),
+              bm25_score(invidx, *fuzzy_expr, *fuzzy_result, i));
+  }
+}
+
+TEST(FuzzySearchTest, NoMatchingTermYieldsNoHits) {
+  auto invidx = fuzzy_index();
+
+  auto expr = parse_query(normalizer, "zzzzz~2");
+  ASSERT_TRUE(expr);
+  EXPECT_EQ(Operation::Fuzzy, expr->operation);
+  EXPECT_EQ(0, perform_search(invidx, *expr)->size());
+}
+
+TEST(FuzzySearchTest, CombinesWithOtherOperators) {
+  auto invidx = fuzzy_index();
+
+  // Both an "apple"-ish term and "banana": only doc 1 (maple banana) has
+  // both, and only once the distance reaches 2 and admits "maple".
+  auto and_expr = parse_query(normalizer, "apple~2 banana");
+  ASSERT_TRUE(and_expr);
+  EXPECT_EQ((std::vector<size_t>{1}),
+            hit_document_ids(*perform_search(invidx, *and_expr)));
+
+  // Negation over a fuzzy term: "banana" but nothing within one edit of
+  // "maple", which excludes doc 1.
+  auto not_expr = parse_query(normalizer, "banana -maple~1");
+  ASSERT_TRUE(not_expr);
+  EXPECT_EQ(0, perform_search(invidx, *not_expr)->size());
+}
+
+TEST(FuzzySearchTest, ExcludesLogicallyDeletedDocuments) {
+  auto invidx = fuzzy_index();
+  invidx.remove_document(0); // apple ample
+
+  auto expr = parse_query(normalizer, "apple~1");
+  ASSERT_TRUE(expr);
+  EXPECT_EQ((std::vector<size_t>{2}),
+            hit_document_ids(*perform_search(invidx, *expr)));
+}
+
+TEST(FuzzySearchTest, ExpandFuzzyRewritesToAnEquivalentOr) {
+  auto invidx = fuzzy_index();
+
+  auto parsed = parse_query(normalizer, "apple~1");
+  ASSERT_TRUE(parsed);
+  ASSERT_EQ(Operation::Fuzzy, parsed->operation);
+
+  auto expanded = expand_fuzzy(invidx, *parsed);
+  ASSERT_EQ(Operation::Or, expanded.operation);
+  ASSERT_EQ(3, expanded.nodes.size());
+  // Sorted, so the expansion is reproducible for one term and one index.
+  EXPECT_EQ(U"ample", expanded.nodes[0].term_str);
+  EXPECT_EQ(U"apple", expanded.nodes[1].term_str);
+  EXPECT_EQ(U"apply", expanded.nodes[2].term_str);
+
+  auto result = perform_search(invidx, expanded);
+  auto direct = perform_search(invidx, *parsed);
+  ASSERT_EQ(direct->size(), result->size());
+  for (size_t i = 0; i < result->size(); i++) {
+    EXPECT_EQ(direct->document_id(i), result->document_id(i));
+    EXPECT_AP(bm25_score(invidx, *parsed, *direct, i),
+              bm25_score(invidx, expanded, *result, i));
+  }
+}
+
+TEST(FuzzySearchTest, ExpandFuzzyRewritesNestedNodes) {
+  auto invidx = fuzzy_index();
+
+  auto parsed = parse_query(normalizer, "aple~2 banana");
+  ASSERT_TRUE(parsed);
+  ASSERT_EQ(Operation::And, parsed->operation);
+
+  auto expanded = expand_fuzzy(invidx, *parsed);
+  ASSERT_EQ(Operation::And, expanded.operation);
+  ASSERT_EQ(2, expanded.nodes.size());
+  EXPECT_EQ(Operation::Or, expanded.nodes[0].operation);
+  EXPECT_EQ(Operation::Term, expanded.nodes[1].operation);
+  EXPECT_EQ(U"banana", expanded.nodes[1].term_str);
+
+  EXPECT_EQ((std::vector<size_t>{1}),
+            hit_document_ids(*perform_search(invidx, expanded)));
+}
+
+TEST(FuzzySearchTest, CompressedBackendMatchesInMemory) {
+  auto invidx = fuzzy_index();
+
+  std::stringstream compressed(std::ios::in | std::ios::out |
+                               std::ios::binary);
+  invidx.save(compressed, {}, IndexFormat::Compressed);
+  auto loaded = load_compressed_index(compressed);
+
+  // The compressed backend drives fstlib's LevenshteinAutomaton over the FST
+  // while the in-memory one runs a rolling-row DP per term, so this pins the
+  // two implementations to the same answer -- including the empty term, where
+  // fstlib's own edit_distance_search would have bailed out early.
+  for (const auto *str : {U"apple", U"aple", U"zzzzz", U"東今", U""}) {
+    for (size_t max_edits : {size_t{0}, size_t{1}, size_t{2}}) {
+      EXPECT_EQ(terms_within_edits(invidx, str, max_edits),
+                terms_within_edits(*loaded, str, max_edits))
+          << u8(str) << "~" << max_edits;
+    }
+  }
+}
+
+TEST(FuzzySearchTest, CompressedEnumerationReusesItsBuffer) {
+  auto invidx = fuzzy_index();
+
+  std::stringstream compressed(std::ios::in | std::ios::out |
+                               std::ios::binary);
+  invidx.save(compressed, {}, IndexFormat::Compressed);
+  auto loaded = load_compressed_index(compressed);
+
+  std::vector<std::string> copied;
+  loaded->enumerate_terms_with_edit_distance(
+      U"apple", 1, [&](const auto &str) { copied.push_back(u8(str)); });
+  std::sort(copied.begin(), copied.end());
+  EXPECT_EQ((std::vector<std::string>{"ample", "apple", "apply"}), copied);
+}
+
+//-----------------------------------------------------------------------------
 // FST term dictionary (Compressed format, roadmap item 14 step 2)
 //-----------------------------------------------------------------------------
 

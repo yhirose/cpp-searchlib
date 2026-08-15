@@ -5,6 +5,9 @@
 //  MIT License
 //
 
+#include <algorithm>
+#include <numeric>
+
 #include "searchlib.h"
 #include "succinct.h"
 #include "termdict.h"
@@ -437,6 +440,40 @@ bool matches_wildcard(const std::u32string &pattern,
   return p == pattern.size();
 }
 
+// Levenshtein distance, capped: once every cell of a row exceeds max_edits no
+// later row can come back under it, so the walk stops there instead of
+// finishing a distance the caller is going to reject anyway. Two rolling rows
+// rather than a full matrix, since only the previous one is ever read.
+//
+// The rows are the caller's, not locals, because this runs once per term of a
+// full dictionary scan and std::vector has no small-buffer optimization, so
+// owning them here would mean two allocations per term tested. Passing `b` the
+// string that stays fixed across the scan also makes the resize a no-op after
+// the first term. Both rows are pure scratch; nothing is read back out.
+bool within_edit_distance(const std::u32string &a, const std::u32string &b,
+                          size_t max_edits, std::vector<size_t> &prev,
+                          std::vector<size_t> &curr) {
+  prev.resize(b.size() + 1);
+  curr.resize(b.size() + 1);
+  std::iota(prev.begin(), prev.end(), size_t{0});
+
+  for (size_t i = 1; i <= a.size(); i++) {
+    curr[0] = i;
+    auto row_min = curr[0];
+    for (size_t j = 1; j <= b.size(); j++) {
+      auto cost = a[i - 1] == b[j - 1] ? size_t{0} : size_t{1};
+      curr[j] = std::min({curr[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost});
+      row_min = std::min(row_min, curr[j]);
+    }
+    if (row_min > max_edits) {
+      return false;
+    }
+    std::swap(prev, curr);
+  }
+
+  return prev[b.size()] <= max_edits;
+}
+
 } // namespace
 
 void InMemoryInvertedIndexBase::enumerate_terms_with_wildcard(
@@ -446,6 +483,33 @@ void InMemoryInvertedIndexBase::enumerate_terms_with_wildcard(
   // is a hash map, so every term has to be tested against the pattern.
   for (const auto &[str, term] : term_dictionary_) {
     if (matches_wildcard(pattern, str)) {
+      callback(str);
+    }
+  }
+}
+
+void InMemoryInvertedIndexBase::enumerate_terms_with_edit_distance(
+    const std::u32string &target, size_t max_edits,
+    const std::function<void(const std::u32string &str)> &callback) const {
+  // Same full-scan tradeoff as the other two enumerators. The length check
+  // first because it settles most terms without touching the DP: a term can
+  // only be within max_edits if its length is, since every edit changes the
+  // length by at most one.
+  //
+  // The DP rows live out here rather than inside within_edit_distance so that
+  // one pair of allocations covers the whole scan. They are locals, not
+  // members: a mutable member cache would be a data race under
+  // ThreadSafeInvertedIndex's shared_lock, which this const accessor runs
+  // beneath.
+  std::vector<size_t> prev;
+  std::vector<size_t> curr;
+  for (const auto &[str, term] : term_dictionary_) {
+    auto shorter = std::min(target.size(), str.size());
+    auto longer = std::max(target.size(), str.size());
+    if (longer - shorter > max_edits) {
+      continue;
+    }
+    if (within_edit_distance(str, target, max_edits, prev, curr)) {
       callback(str);
     }
   }
