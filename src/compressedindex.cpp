@@ -9,6 +9,8 @@
 
 #include "searchlib.h"
 #include "succinct.h"
+#include "termdict.h"
+#include "utils.h"
 
 namespace searchlib {
 
@@ -175,11 +177,17 @@ public:
       documents_[document_id] = term_count;
     }
 
-    auto term_count = detail::read_scalar<uint64_t>(is);
-    term_dictionary_.reserve(static_cast<size_t>(term_count));
-    for (uint64_t i = 0; i < term_count; i++) {
-      auto str = detail::read_u32string(is);
-      auto &term = term_dictionary_[str];
+    // Term dictionary: the FST stays as the dictionary rather than being
+    // expanded into a hash map, so lookups run over the byte code in place
+    // and prefix enumeration descends a subtree instead of scanning. The
+    // per-term records that follow are in FST-ordinal order (see termdict.h),
+    // so the ordinal indexes terms_ directly.
+    auto term_count = static_cast<size_t>(detail::read_scalar<uint64_t>(is));
+    term_dictionary_.load(is);
+
+    terms_.resize(term_count);
+    for (size_t i = 0; i < term_count; i++) {
+      auto &term = terms_[i];
       term.term_count = static_cast<size_t>(detail::read_scalar<uint64_t>(is));
       if (detail::read_scalar<uint32_t>(is)) {
         auto postings = std::make_shared<EFPostings>();
@@ -238,12 +246,12 @@ public:
   }
 
   bool term_exists(const std::u32string &str) const override {
-    return term_dictionary_.find(str) != term_dictionary_.end();
+    return find_term_(str) != nullptr;
   }
 
   size_t term_count(const std::u32string &str) const override {
-    auto it = term_dictionary_.find(str);
-    return it != term_dictionary_.end() ? it->second.term_count : 0;
+    const auto *term = find_term_(str);
+    return term ? term->term_count : 0;
   }
 
   size_t term_count(const std::u32string &str,
@@ -274,26 +282,21 @@ public:
   postings(const std::u32string &str) const override {
     static const auto empty_postings =
         std::make_shared<const InMemoryInvertedIndexBase::Postings>();
-    auto it = term_dictionary_.find(str);
-    if (it != term_dictionary_.end()) {
-      return it->second.postings;
-    }
-    return empty_postings;
+    const auto *term = find_term_(str);
+    return term ? term->postings : empty_postings;
   }
 
   void enumerate_terms_with_prefix(
       const std::u32string &prefix,
       const std::function<void(const std::u32string &str)> &callback)
       const override {
-    // Same full scan as the in-memory index: this backend's dictionary is
-    // still a hash map (only the postings and text ranges are compressed).
-    // Replacing it with an FST is what turns this into a subtree descent.
-    for (const auto &[str, term] : term_dictionary_) {
-      if (str.size() >= prefix.size() &&
-          str.compare(0, prefix.size(), prefix) == 0) {
-        callback(str);
-      }
-    }
+    // Unlike the in-memory index, this descends straight to the subtree the
+    // prefix names instead of testing every term, so the cost scales with the
+    // number of matches rather than with the vocabulary size. It therefore
+    // wins by a wide margin for the selective prefixes queries actually use,
+    // and loses only when the prefix matches a large fraction of the
+    // dictionary (roughly a tenth of it, measured on KJV).
+    term_dictionary_.enumerate_with_prefix(prefix, callback);
   }
 
   bool has_removed_documents() const override {
@@ -325,6 +328,16 @@ private:
     std::shared_ptr<const IPostings> postings;
   };
 
+  // Exact lookup through the FST: one walk over the byte code yields the
+  // term's ordinal, which indexes terms_ directly.
+  const CompressedTerm *find_term_(const std::u32string &str) const {
+    uint32_t ordinal = 0;
+    if (!term_dictionary_.find(str, ordinal) || ordinal >= terms_.size()) {
+      return nullptr;
+    }
+    return &terms_[ordinal];
+  }
+
   // Same overflow-safe accumulation as
   // InMemoryInvertedIndexBase::average_document_term_count, evaluated once
   // at load time since the index never changes afterwards.
@@ -348,7 +361,12 @@ private:
   }
 
   std::unordered_map<size_t /*document_id*/, size_t /*term_count*/> documents_;
-  std::unordered_map<std::u32string, CompressedTerm> term_dictionary_;
+
+  // Holding this makes the whole index non-copyable and non-movable, which
+  // is required: the FST points into its own byte buffer (see termdict.h).
+  detail::TermDictionaryFst term_dictionary_;
+  std::vector<CompressedTerm> terms_; // indexed by the FST's ordinal
+
   std::unordered_set<size_t> removed_document_ids_;
   EFTextRanges text_ranges_;
   double average_document_term_count_ = 0.0;

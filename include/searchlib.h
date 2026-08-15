@@ -51,7 +51,7 @@ inline constexpr char kIndexMagic[4] = {'S', 'I', 'D', 'X'};
 inline constexpr uint32_t kFormatTypePlain = 0;
 inline constexpr uint32_t kFormatTypeCompressed = 2;
 inline constexpr uint32_t kSchemaVersionPlain = 3;
-inline constexpr uint32_t kSchemaVersionCompressed = 2;
+inline constexpr uint32_t kSchemaVersionCompressed = 3;
 
 // Opaque storage for InMemoryInvertedIndexBase's scope data (a map of
 // Elias-Fano encoded position->scope-ordinal sequences, one per
@@ -92,6 +92,24 @@ inline std::u32string read_u32string(std::istream &is) {
     s.push_back(static_cast<char32_t>(read_scalar<uint32_t>(is)));
   }
   return s;
+}
+
+// The same length-prefixed shape for an opaque byte blob.
+inline void write_bytes(std::ostream &os, std::string_view bytes) {
+  write_scalar<uint64_t>(os, bytes.size());
+  os.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+}
+
+inline std::string read_bytes(std::istream &is) {
+  auto n = static_cast<size_t>(read_scalar<uint64_t>(is));
+  std::string bytes(n, '\0');
+  if (n > 0) {
+    is.read(bytes.data(), static_cast<std::streamsize>(n));
+    if (!is) {
+      throw std::runtime_error("searchlib: unexpected end of index stream");
+    }
+  }
+  return bytes;
 }
 
 } // namespace detail
@@ -149,6 +167,10 @@ public:
   // dictionary answers this with a full scan, an ordered one descends
   // straight to the matching subtree. Callers needing a deterministic order
   // must sort the collected terms themselves.
+  //
+  // The string handed to the callback is only valid for the duration of that
+  // call; an implementation may hand out a buffer it reuses for the next
+  // term. Copy it to keep it.
   virtual void enumerate_terms_with_prefix(
       const std::u32string &prefix,
       const std::function<void(const std::u32string &str)> &callback) const = 0;

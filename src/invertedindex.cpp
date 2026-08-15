@@ -7,6 +7,7 @@
 
 #include "searchlib.h"
 #include "succinct.h"
+#include "termdict.h"
 #include "utils.h"
 
 namespace searchlib {
@@ -492,8 +493,23 @@ void InMemoryInvertedIndexBase::save(std::ostream &os,
   }
   std::sort(terms.begin(), terms.end(),
             [](const Term *a, const Term *b) { return a->str < b->str; });
+
+  if (format == IndexFormat::Compressed) {
+    // The term strings go into one FST instead of being written per term;
+    // the per-term records below are then indexed by the FST's ordinal,
+    // which is the term's position in this sorted sequence (see termdict.h).
+    std::vector<std::string> keys;
+    keys.reserve(terms.size());
+    for (const auto *term : terms) {
+      keys.push_back(u8(term->str));
+    }
+    detail::write_term_dictionary_fst(os, keys);
+  }
+
   for (const auto *term : terms) {
-    detail::write_u32string(os, term->str);
+    if (format != IndexFormat::Compressed) {
+      detail::write_u32string(os, term->str);
+    }
     detail::write_scalar<uint64_t>(os, term->term_count);
     if (format == IndexFormat::Compressed) {
       // Per-term representation flag; see kCompressedPostingsThreshold.
@@ -566,8 +582,21 @@ void InMemoryInvertedIndexBase::load(std::istream &is, IndexFormat format) {
   term_dictionary_.clear();
   auto term_count = detail::read_scalar<uint64_t>(is);
   term_dictionary_.reserve(static_cast<size_t>(term_count));
+
+  // In the Compressed format the term strings live in one FST ahead of the
+  // per-term records; recover them up front so the loop below can stay
+  // shared with the Plain format.
+  std::vector<std::u32string> fst_terms;
+  if (format == IndexFormat::Compressed) {
+    detail::TermDictionaryFst fst;
+    fst.load(is);
+    fst_terms = fst.terms(static_cast<size_t>(term_count));
+  }
+
   for (uint64_t i = 0; i < term_count; i++) {
-    auto str = detail::read_u32string(is);
+    auto str = format == IndexFormat::Compressed
+                   ? fst_terms[static_cast<size_t>(i)]
+                   : detail::read_u32string(is);
     auto count = static_cast<size_t>(detail::read_scalar<uint64_t>(is));
     auto &term = term_dictionary_[str];
     term.str = str;

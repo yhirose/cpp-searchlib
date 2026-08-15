@@ -1656,3 +1656,131 @@ TEST(PrefixSearchTest, ExpandPrefixesRewritesNestedNodes) {
   EXPECT_EQ((std::vector<size_t>{1}),
             hit_document_ids(*perform_search(invidx, expanded)));
 }
+
+//-----------------------------------------------------------------------------
+// FST term dictionary (Compressed format, roadmap item 14 step 2)
+//-----------------------------------------------------------------------------
+
+TEST(FstTermDictionaryTest, RoundTripsUnicodeTerms) {
+  // The FST keys are UTF-8 encoded, so non-ASCII terms are the interesting
+  // case: they have to come back as the same u32strings.
+  auto invidx = sample_index();
+
+  std::stringstream compressed(std::ios::in | std::ios::out |
+                               std::ios::binary);
+  invidx.save(compressed, {}, IndexFormat::Compressed);
+
+  InMemoryInvertedIndex<TextRange> loaded;
+  loaded.load(compressed);
+
+  for (const auto *term : {U"東京", U"タワー", U"港区", U"document", U"the"}) {
+    EXPECT_TRUE(loaded.term_exists(term)) << u8(term);
+    EXPECT_EQ(invidx.term_count(term), loaded.term_count(term)) << u8(term);
+    EXPECT_EQ(invidx.df(term), loaded.df(term)) << u8(term);
+  }
+  EXPECT_FALSE(loaded.term_exists(U"zzzzz"));
+}
+
+TEST(FstTermDictionaryTest, CompressedBackendLooksUpUnicodeTerms) {
+  auto invidx = sample_index();
+
+  std::stringstream compressed(std::ios::in | std::ios::out |
+                               std::ios::binary);
+  invidx.save(compressed, {}, IndexFormat::Compressed);
+  auto loaded = load_compressed_index(compressed);
+
+  EXPECT_TRUE(loaded->term_exists(U"東京"));
+  EXPECT_EQ(invidx.df(U"東京"), loaded->df(U"東京"));
+  EXPECT_FALSE(loaded->term_exists(U"京"));  // a suffix is not a term
+  EXPECT_FALSE(loaded->term_exists(U"東"));  // nor is a prefix
+
+  // predictive_search over UTF-8 must not split a multi-byte codepoint.
+  EXPECT_EQ((std::vector<std::string>{"東京"}),
+            terms_with_prefix(*loaded, U"東"));
+}
+
+TEST(FstTermDictionaryTest, EmptyIndexRoundTrips) {
+  // Zero terms means no FST is built at all; the reader has to cope.
+  InMemoryInvertedIndex<TextRange> invidx;
+
+  std::stringstream compressed(std::ios::in | std::ios::out |
+                               std::ios::binary);
+  invidx.save(compressed, {}, IndexFormat::Compressed);
+
+  auto position = compressed.tellg();
+  InMemoryInvertedIndex<TextRange> loaded;
+  loaded.load(compressed);
+  EXPECT_EQ(0, loaded.document_count());
+  EXPECT_FALSE(loaded.term_exists(U"anything"));
+
+  compressed.clear();
+  compressed.seekg(position);
+  auto read_only = load_compressed_index(compressed);
+  EXPECT_EQ(0, read_only->document_count());
+  EXPECT_FALSE(read_only->term_exists(U"anything"));
+
+  EXPECT_TRUE(terms_with_prefix(*read_only, U"").empty());
+}
+
+TEST(FstTermDictionaryTest, CompressedPrefixEnumerationMatchesInMemory) {
+  auto invidx = prefix_index();
+
+  std::stringstream compressed(std::ios::in | std::ios::out |
+                               std::ios::binary);
+  invidx.save(compressed, {}, IndexFormat::Compressed);
+  auto loaded = load_compressed_index(compressed);
+
+  // The compressed backend descends the FST while the in-memory one scans
+  // its hash map, so this pins the two implementations to the same answer.
+  for (const auto *prefix : {U"", U"a", U"ap", U"app", U"b", U"zzz"}) {
+    EXPECT_EQ(terms_with_prefix(invidx, prefix),
+              terms_with_prefix(*loaded, prefix))
+        << u8(prefix);
+  }
+}
+
+TEST(FstTermDictionaryTest, CompressedEnumerationReusesItsBuffer) {
+  auto invidx = prefix_index();
+
+  std::stringstream compressed(std::ios::in | std::ios::out |
+                               std::ios::binary);
+  invidx.save(compressed, {}, IndexFormat::Compressed);
+  auto loaded = load_compressed_index(compressed);
+
+  // The compressed backend hands the callback a buffer it refills per term,
+  // as IInvertedIndex::enumerate_terms_with_prefix allows. Copying in the
+  // callback (what every caller does) must still see every distinct term.
+  std::vector<std::string> copied;
+  loaded->enumerate_terms_with_prefix(
+      U"ap", [&](const auto &str) { copied.push_back(u8(str)); });
+  std::sort(copied.begin(), copied.end());
+  EXPECT_EQ((std::vector<std::string>{"apple", "application", "apricot"}),
+            copied);
+}
+
+TEST(FstTermDictionaryTest, RejectsEmptyTermWithADiagnosis) {
+  // A Normalizer may map a token to the empty string, which the Plain format
+  // tolerates but an FST cannot represent. The error has to say so.
+  InMemoryInvertedIndex<TextRange> invidx;
+  {
+    Normalizer erase_apple = [](const std::u32string &str) {
+      return str == U"apple" ? U"" : str;
+    };
+    InMemoryIndexer indexer(invidx, erase_apple);
+    indexer.index_document(0, UTF8PlainTextTokenizer("apple banana"));
+  }
+  ASSERT_TRUE(invidx.term_exists(U""));
+
+  std::stringstream plain(std::ios::in | std::ios::out | std::ios::binary);
+  EXPECT_NO_THROW(invidx.save(plain));
+
+  std::stringstream compressed(std::ios::in | std::ios::out |
+                               std::ios::binary);
+  try {
+    invidx.save(compressed, {}, IndexFormat::Compressed);
+    FAIL() << "expected an exception";
+  } catch (const std::runtime_error &e) {
+    EXPECT_NE(std::string(e.what()).find("empty term"), std::string::npos)
+        << e.what();
+  }
+}

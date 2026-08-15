@@ -76,10 +76,20 @@ index.enumerate_terms_with_prefix(U"app", [](const auto &term) {
 });
 ```
 
-Both current backends answer it with a full dictionary scan (their term
-dictionaries are hash maps), so its cost is linear in the vocabulary size.
+The two backends have different cost shapes. The writable in-memory index
+scans its whole dictionary (a hash map), so it pays for the entire vocabulary
+no matter how selective the prefix is. An index loaded with
+`load_compressed_index` descends the FST its dictionary is stored as, so it
+pays per matching term instead.
+
+On the KJV corpus (12,594 terms) that is a fixed ~85us for the hash map
+against ~60ns per match for the FST, so the FST is far faster for the
+selective prefixes real queries use (about 11x for a 148-term prefix, 100x for
+a 4-term one) and only loses once the prefix matches more than roughly a tenth
+of the vocabulary.
+
 `perform_search` enumerates once per query, but the scoring functions take an
-expression per hit, so scoring a prefix query directly repeats that scan for
+expression per hit, so scoring a prefix query directly repeats that lookup for
 every hit. Expand once up front instead:
 
 ```cpp
@@ -134,10 +144,36 @@ invidx.save(os, [](std::ostream &os, const T &v) { /* write v */ });
 loaded.load(is, [](std::istream &is) -> T { /* read and return a T */ });
 ```
 
-The on-disk format is a "plain" host-native dump (`format_type` 0) tagged with
-a `format_type`/`schema_version` header, leaving room for compressed or
-mmap-friendly backends later. It is intended to be loaded on the same platform
-that wrote it.
+The default on-disk format is a "plain" host-native dump (`format_type` 0)
+tagged with a `format_type`/`schema_version` header. It is intended to be
+loaded on the same platform that wrote it.
+
+### Compressed format
+
+`IndexFormat::Compressed` (`format_type` 2) stores the postings and text
+ranges as Elias-Fano sequences and the term dictionary as an FST, which on
+the KJV corpus brings the index down to about 20% of the plain size:
+
+```cpp
+invidx.save("index.bin", {}, IndexFormat::Compressed);
+```
+
+It can be read back into a normal `InMemoryInvertedIndex` with `load`, or
+opened as an immutable, memory-lean index that answers queries straight off
+the compressed structures without expanding them:
+
+```cpp
+auto index = load_compressed_index("index.bin");
+```
+
+Being immutable, it is safe to share across reader threads without external
+locking.
+
+The FST dictionary is what makes this backend both small and good at prefix
+search: on KJV it holds the same 12,594 terms in 54KB instead of 459KB, and
+answers a selective prefix 11x to 100x faster than a hash scan. The trade is
+exact term lookup, which walks the FST instead of hashing once: 181ns against
+20.5ns, so about 160ns more per lookup.
 
 ## Multi-field schema
 
