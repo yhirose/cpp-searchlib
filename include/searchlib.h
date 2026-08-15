@@ -711,10 +711,24 @@ public:
     Postings postings;
   };
 
+  // Registers (or replaces) a document's term count. Always go through this
+  // rather than assigning into documents_ directly, so that the running total
+  // behind average_document_term_count() stays correct.
+  void set_document_term_count(size_t document_id, size_t term_count);
+
   std::unordered_map<size_t /*document_id*/, Document> documents_;
   std::unordered_map<std::u32string /*str*/, Term> term_dictionary_;
   std::unordered_set<size_t /*document_id*/> removed_document_ids_;
   std::shared_ptr<detail::ScopeIndexData> scope_data_;
+
+  // Sum of every documents_ entry's term_count, maintained on write so that
+  // average_document_term_count() is O(1). It used to walk documents_ on
+  // every call, which bm25_score makes once per scored hit -- that turned
+  // scoring into O(hits * documents) and dominated every ranked query.
+  // Updated eagerly rather than cached lazily because the accessor is const
+  // and runs under ThreadSafeInvertedIndex's shared_lock, where a mutable
+  // cache would be a data race.
+  size_t total_document_term_count_ = 0;
 };
 
 template <typename T>
@@ -996,7 +1010,7 @@ public:
       term_count++;
     });
 
-    index_.base_.documents_[document_id] = {term_count};
+    index_.base_.set_document_term_count(document_id, term_count);
   }
 
 private:

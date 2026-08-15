@@ -338,26 +338,19 @@ private:
     return &terms_[ordinal];
   }
 
-  // Same overflow-safe accumulation as
-  // InMemoryInvertedIndexBase::average_document_term_count, evaluated once
-  // at load time since the index never changes afterwards.
+  // Evaluated once at load time, since the index never changes afterwards.
+  // Matches InMemoryInvertedIndexBase::average_document_term_count, including
+  // the 0.0 it returns for an empty index.
   double compute_average_document_term_count_() const {
-    auto buffs = std::vector<std::pair<size_t, size_t>>{{0, 0}};
+    if (documents_.empty()) {
+      return 0.0;
+    }
+    size_t total = 0;
     for (const auto &[_, term_count] : documents_) {
-      if (term_count < std::numeric_limits<size_t>::max() - buffs.back().first) {
-        buffs.back().first += term_count;
-        buffs.back().second += 1;
-      } else {
-        buffs.emplace_back(std::pair(term_count, 1));
-      }
+      total += term_count;
     }
-
-    double avg = 0.0;
-    for (const auto [term_count, document_count] : buffs) {
-      avg +=
-          static_cast<double>(term_count) / static_cast<double>(document_count);
-    }
-    return avg;
+    return static_cast<double>(total) /
+           static_cast<double>(documents_.size());
   }
 
   std::unordered_map<size_t /*document_id*/, size_t /*term_count*/> documents_;

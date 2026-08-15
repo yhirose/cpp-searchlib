@@ -1784,3 +1784,69 @@ TEST(FstTermDictionaryTest, RejectsEmptyTermWithADiagnosis) {
         << e.what();
   }
 }
+
+//-----------------------------------------------------------------------------
+// average_document_term_count is maintained incrementally
+//-----------------------------------------------------------------------------
+
+// The running total behind it has to survive every path that writes
+// documents_, or bm25 scores silently drift.
+TEST(AverageDocumentTermCountTest, TracksIndexing) {
+  InMemoryInvertedIndex<TextRange> invidx;
+  EXPECT_DOUBLE_EQ(0.0, invidx.average_document_term_count());
+
+  InMemoryIndexer indexer(invidx, normalizer);
+  indexer.index_document(0, UTF8PlainTextTokenizer("one two three"));
+  EXPECT_DOUBLE_EQ(3.0, invidx.average_document_term_count());
+
+  indexer.index_document(1, UTF8PlainTextTokenizer("one"));
+  EXPECT_DOUBLE_EQ(2.0, invidx.average_document_term_count()); // (3+1)/2
+}
+
+TEST(AverageDocumentTermCountTest, ReindexingReplacesTheOldCount) {
+  InMemoryInvertedIndex<TextRange> invidx;
+  InMemoryIndexer indexer(invidx, normalizer);
+
+  indexer.index_document(0, UTF8PlainTextTokenizer("one two three four"));
+  indexer.index_document(1, UTF8PlainTextTokenizer("one two"));
+  EXPECT_DOUBLE_EQ(3.0, invidx.average_document_term_count()); // (4+2)/2
+
+  // Re-indexing the same document_id must subtract the previous count, not
+  // add to it.
+  indexer.index_document(0, UTF8PlainTextTokenizer("one"));
+  EXPECT_EQ(2, invidx.document_count());
+  EXPECT_DOUBLE_EQ(1.5, invidx.average_document_term_count()); // (1+2)/2
+}
+
+TEST(AverageDocumentTermCountTest, SurvivesSaveLoadOnBothFormats) {
+  auto invidx = sample_index();
+  auto expected = invidx.average_document_term_count();
+  EXPECT_GT(expected, 0.0);
+
+  for (auto format : {IndexFormat::Plain, IndexFormat::Compressed}) {
+    std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+    invidx.save(ss, {}, format);
+
+    InMemoryInvertedIndex<TextRange> loaded;
+    loaded.load(ss);
+    EXPECT_DOUBLE_EQ(expected, loaded.average_document_term_count());
+
+    // Loading twice must not double-count.
+    std::stringstream again(std::ios::in | std::ios::out | std::ios::binary);
+    invidx.save(again, {}, format);
+    loaded.load(again);
+    EXPECT_DOUBLE_EQ(expected, loaded.average_document_term_count());
+  }
+}
+
+TEST(AverageDocumentTermCountTest, MatchesTheCompressedBackend) {
+  auto invidx = sample_index();
+
+  std::stringstream compressed(std::ios::in | std::ios::out |
+                               std::ios::binary);
+  invidx.save(compressed, {}, IndexFormat::Compressed);
+  auto loaded = load_compressed_index(compressed);
+
+  EXPECT_DOUBLE_EQ(invidx.average_document_term_count(),
+                   loaded->average_document_term_count());
+}

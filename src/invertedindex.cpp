@@ -326,24 +326,23 @@ InMemoryInvertedIndexBase::document_term_count(size_t document_id) const {
   return documents_.at(document_id).term_count;
 }
 
-double InMemoryInvertedIndexBase::average_document_term_count() const {
-  auto buffs = std::vector<std::pair<size_t, size_t>>{{0.0, 0}};
-  for (const auto &[_, document] : documents_) {
-    if (document.term_count <
-        std::numeric_limits<size_t>::max() - buffs.back().first) {
-      buffs.back().first += document.term_count;
-      buffs.back().second += 1;
-    } else {
-      buffs.emplace_back(std::pair(document.term_count, 1));
-    }
+void InMemoryInvertedIndexBase::set_document_term_count(size_t document_id,
+                                                        size_t term_count) {
+  auto [it, inserted] = documents_.emplace(document_id, Document{term_count});
+  if (!inserted) {
+    // Re-indexing an existing document_id replaces its term count.
+    total_document_term_count_ -= it->second.term_count;
+    it->second.term_count = term_count;
   }
+  total_document_term_count_ += term_count;
+}
 
-  double avg = 0.0;
-  for (const auto [term_count, document_count] : buffs) {
-    avg +=
-        static_cast<double>(term_count) / static_cast<double>(document_count);
+double InMemoryInvertedIndexBase::average_document_term_count() const {
+  if (documents_.empty()) {
+    return 0.0;
   }
-  return avg;
+  return static_cast<double>(total_document_term_count_) /
+         static_cast<double>(documents_.size());
 }
 
 bool InMemoryInvertedIndexBase::term_exists(const std::u32string &str) const {
@@ -571,12 +570,13 @@ void InMemoryInvertedIndexBase::save(std::ostream &os,
 
 void InMemoryInvertedIndexBase::load(std::istream &is, IndexFormat format) {
   documents_.clear();
+  total_document_term_count_ = 0;
   auto document_count = detail::read_scalar<uint64_t>(is);
   documents_.reserve(static_cast<size_t>(document_count));
   for (uint64_t i = 0; i < document_count; i++) {
     auto document_id = static_cast<size_t>(detail::read_scalar<uint64_t>(is));
     auto term_count = static_cast<size_t>(detail::read_scalar<uint64_t>(is));
-    documents_[document_id] = Document{term_count};
+    set_document_term_count(document_id, term_count);
   }
 
   term_dictionary_.clear();
