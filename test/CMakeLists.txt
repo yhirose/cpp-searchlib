@@ -21,6 +21,7 @@ add_executable(
   test_analyzer.cc
   test_succinct.cc
   test_multifieldindex.cc
+  test_perf.cc
   ../src/utils.cpp
   ../src/invertedindex.cpp
   ../src/compressedindex.cpp

@@ -100,10 +100,17 @@ TEST(KJVTest, CompressedPersistenceRoundTrip) {
 
   auto plain_size = plain.str().size();
   auto compressed_size = compressed.str().size();
-  EXPECT_LT(compressed_size, plain_size);
   std::cout << "KJV index size: plain=" << plain_size
             << " compressed=" << compressed_size << " ("
             << (compressed_size * 100.0 / plain_size) << "%)" << std::endl;
+
+  // A real bound rather than just "smaller than plain": the compressed
+  // format measures 20.1% here (Elias-Fano postings and text ranges plus the
+  // FST term dictionary), so 25% leaves room to move while still catching a
+  // section that stopped being compressed.
+  EXPECT_LT(compressed_size, static_cast<size_t>(plain_size * 0.25))
+      << "the compressed format lost ground: " << compressed_size << " / "
+      << plain_size << " = " << (compressed_size * 100.0 / plain_size) << "%";
 
   InMemoryInvertedIndex<TextRange> loaded;
   loaded.load(compressed);
