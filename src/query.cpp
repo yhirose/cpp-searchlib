@@ -143,12 +143,16 @@ std::optional<Expression> parse_query(TermFilter filter,
   // boundaries), then run each split piece through the same TermFilter
   // chain an index-side Analyzer<T> would use.
   auto term_handler = [&](std::string_view token) -> Expression {
-    // A trailing `*` turns the token into a prefix query. This is resolved
-    // here rather than in the grammar so that the star binds tightly to its
-    // token (`foo*` is a prefix, `foo *` is not) without having to fight
-    // %whitespace skipping. A bare `*` is left alone: it stays an ordinary
-    // term that no index can contain, rather than becoming a match-all.
-    auto is_prefix = token.size() > 1 && token.back() == '*';
+    // A trailing `*` turns the token into a prefix query, provided it is the
+    // token's only `*` -- that keeps the common `foo*` case on the cheaper
+    // literal-prefix path (see Operation::Prefix) instead of the general
+    // wildcard automaton below. This is resolved here rather than in the
+    // grammar so that the star binds tightly to its token (`foo*` is a
+    // prefix, `foo *` is not) without having to fight %whitespace skipping.
+    // A bare `*` is left alone: it stays an ordinary term that no index can
+    // contain, rather than becoming a match-all.
+    auto is_prefix = token.size() > 1 && token.back() == '*' &&
+                     token.find('*') == token.size() - 1;
     if (is_prefix) {
       token.remove_suffix(1);
     }
@@ -185,6 +189,52 @@ std::optional<Expression> parse_query(TermFilter filter,
       }
       return emitted;
     };
+
+    // Any other placement of `*` (leading, interior, or more than one) makes
+    // the whole token a wildcard pattern instead of a prefix. Handled
+    // separately from build() below, because UTF8PlainTextTokenizer treats
+    // `*` as a non-letter separator and would otherwise fragment the token
+    // into unrelated words -- the same way it fragments `well-known` -- which
+    // would lose the pattern structure. Each `*`-delimited piece is filtered
+    // as one opaque chunk rather than re-split into its own letter runs, so a
+    // wildcard segment that itself contains punctuation (`well-kno*n`) is not
+    // decomposed the way a plain phrase term would be; out of scope for v1.
+    auto build_wildcard = [&]() -> Expression {
+      std::u32string pattern;
+      size_t start = 0;
+      while (true) {
+        auto star_pos = token.find('*', start);
+        auto segment = token.substr(
+            start, star_pos == std::string_view::npos
+                       ? std::string_view::npos
+                       : star_pos - start);
+        if (!segment.empty()) {
+          auto emitted = run_filter(u32(segment));
+          // A filter that expands one chunk into several (synonyms) has no
+          // sensible meaning inside a wildcard pattern, so only the first
+          // survives; one that drops the chunk (stop word) just closes the
+          // gap, the same treatment build() gives a dropped word.
+          if (!emitted.empty()) {
+            pattern += emitted[0];
+          }
+        }
+        if (star_pos == std::string_view::npos) {
+          break;
+        }
+        // Collapses consecutive/duplicate stars (`a**b`) to one, which is
+        // semantically identical and keeps the automaton's state count down.
+        if (pattern.empty() || pattern.back() != U'*') {
+          pattern += U'*';
+        }
+        start = star_pos + 1;
+      }
+      return Expression{Operation::Wildcard, pattern};
+    };
+
+    if (!is_prefix && token.size() > 1 &&
+        token.find('*') != std::string_view::npos) {
+      return build_wildcard();
+    }
 
     auto to_expression = [](std::vector<std::u32string> emitted) {
       // A single emit is a plain Term; a filter that expanded one token into

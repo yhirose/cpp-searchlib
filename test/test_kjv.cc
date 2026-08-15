@@ -166,11 +166,27 @@ TEST(KJVTest, CompressedBackend) {
   ASSERT_FALSE(expected_terms.empty());
   EXPECT_EQ(expected_terms, collect(*loaded, U"sanctif"));
 
+  // Same parity check for the wildcard path: the compressed backend walks
+  // the FST with a custom automaton instead of scanning a hash map.
+  auto collect_wildcard = [](const IInvertedIndex &index,
+                             const std::u32string &pattern) {
+    std::vector<std::u32string> terms;
+    index.enumerate_terms_with_wildcard(
+        pattern, [&](const auto &str) { terms.push_back(str); });
+    std::sort(terms.begin(), terms.end());
+    return terms;
+  };
+  auto expected_wildcard_terms = collect_wildcard(invidx, U"sanct*fy");
+  ASSERT_FALSE(expected_wildcard_terms.empty());
+  EXPECT_EQ(expected_wildcard_terms, collect_wildcard(*loaded, U"sanct*fy"));
+
   // "apple" stays plain-coded, "the" is EF-coded, the phrase query exercises
-  // is_term_position and multi-term text ranges, and "sanctif*" exercises the
-  // prefix expansion (dictionary scan plus union) on both paths.
+  // is_term_position and multi-term text ranges, "sanctif*" exercises the
+  // prefix expansion (dictionary scan plus union), and "sanct*fy" exercises
+  // the wildcard expansion (automaton walk plus union) on both paths.
   for (const auto *query : {R"( apple )", R"( the )", R"( "apple tree" )",
-                            R"( "the lord" )", R"( sanctif* )"}) {
+                            R"( "the lord" )", R"( sanctif* )",
+                            R"( sanct*fy )"}) {
     auto expr = parse_query(normalizer, query);
     ASSERT_TRUE(expr);
 

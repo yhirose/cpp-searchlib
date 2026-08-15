@@ -175,6 +175,20 @@ public:
       const std::u32string &prefix,
       const std::function<void(const std::u32string &str)> &callback) const = 0;
 
+  // Calls callback once for every term in the dictionary matching `pattern`,
+  // a glob where `*` matches zero or more codepoints and every other
+  // codepoint must match literally (no `?` or character classes). This is
+  // what backs Operation::Wildcard; a pattern with no `*` at all matches only
+  // the identical term, and one that is entirely `*` matches the whole
+  // dictionary.
+  //
+  // Same order/cost/buffer-reuse contract as enumerate_terms_with_prefix: the
+  // enumeration order is unspecified, and the string handed to the callback
+  // is only valid for the duration of that call.
+  virtual void enumerate_terms_with_wildcard(
+      const std::u32string &pattern,
+      const std::function<void(const std::u32string &str)> &callback) const = 0;
+
   // Logical (tombstone) deletion support. Read-only indexes report no
   // removals; searches filter out removed document_ids via these hooks.
   // Overridden by indexes that support IMutableInvertedIndex::remove_document.
@@ -270,13 +284,25 @@ public:
 // Search
 //-----------------------------------------------------------------------------
 
-enum class Operation { Term, And, Adjacent, Or, Near, Not, SameScope, Prefix };
+enum class Operation {
+  Term,
+  And,
+  Adjacent,
+  Or,
+  Near,
+  Not,
+  SameScope,
+  Prefix,
+  Wildcard
+};
 
 struct Expression {
   Operation operation;
 
   // For Operation::Term the term to look up; for Operation::Prefix the prefix
-  // every matching term must start with.
+  // every matching term must start with; for Operation::Wildcard the glob
+  // pattern every matching term must satisfy (see
+  // IInvertedIndex::enumerate_terms_with_wildcard).
   std::u32string term_str;
   size_t near_operation_distance;
   std::vector<Expression> nodes;
@@ -316,6 +342,13 @@ std::shared_ptr<IPostings> perform_search(const IInvertedIndex &invidx,
 // and scoring the result is one enumeration per query instead of one per hit.
 Expression expand_prefixes(const IInvertedIndex &invidx,
                            const Expression &expr);
+
+// Same rationale and mechanics as expand_prefixes, but for Operation::
+// Wildcard nodes and IInvertedIndex::enumerate_terms_with_wildcard. The two
+// expansions are independent: a tree with both Prefix and Wildcard nodes
+// needs both calls to fully expand.
+Expression expand_wildcards(const IInvertedIndex &invidx,
+                            const Expression &expr);
 
 size_t term_count_score(const IInvertedIndex &invidx, const Expression &expr,
                         const IPostings &postings, size_t index);
@@ -638,6 +671,11 @@ public:
       const std::function<void(const std::u32string &str)> &callback)
       const override;
 
+  void enumerate_terms_with_wildcard(
+      const std::u32string &pattern,
+      const std::function<void(const std::u32string &str)> &callback)
+      const override;
+
   bool has_removed_documents() const override;
   bool is_document_removed(size_t document_id) const override;
 
@@ -775,6 +813,13 @@ public:
       const std::function<void(const std::u32string &str)> &callback)
       const override {
     base_.enumerate_terms_with_prefix(prefix, callback);
+  }
+
+  void enumerate_terms_with_wildcard(
+      const std::u32string &pattern,
+      const std::function<void(const std::u32string &str)> &callback)
+      const override {
+    base_.enumerate_terms_with_wildcard(pattern, callback);
   }
 
   bool has_removed_documents() const override {

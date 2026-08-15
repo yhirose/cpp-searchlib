@@ -404,6 +404,53 @@ void InMemoryInvertedIndexBase::enumerate_terms_with_prefix(
   }
 }
 
+namespace {
+
+// True if `term` matches the glob `pattern` (`*` = zero or more codepoints,
+// every other codepoint literal). Standard two-pointer greedy matcher with
+// backtracking to the most recent `*`: linear in practice, quadratic only on
+// adversarial inputs (many stars each forced to backtrack).
+bool matches_wildcard(const std::u32string &pattern,
+                      const std::u32string &term) {
+  size_t p = 0, t = 0;
+  size_t star = std::u32string::npos, star_match = 0;
+  while (t < term.size()) {
+    if (p < pattern.size() &&
+        (pattern[p] == U'*' || pattern[p] == term[t])) {
+      if (pattern[p] == U'*') {
+        star = p++;
+        star_match = t;
+      } else {
+        p++;
+        t++;
+      }
+    } else if (star != std::u32string::npos) {
+      p = star + 1;
+      t = ++star_match;
+    } else {
+      return false;
+    }
+  }
+  while (p < pattern.size() && pattern[p] == U'*') {
+    p++;
+  }
+  return p == pattern.size();
+}
+
+} // namespace
+
+void InMemoryInvertedIndexBase::enumerate_terms_with_wildcard(
+    const std::u32string &pattern,
+    const std::function<void(const std::u32string &str)> &callback) const {
+  // Same full-scan tradeoff as enumerate_terms_with_prefix: term_dictionary_
+  // is a hash map, so every term has to be tested against the pattern.
+  for (const auto &[str, term] : term_dictionary_) {
+    if (matches_wildcard(pattern, str)) {
+      callback(str);
+    }
+  }
+}
+
 bool InMemoryInvertedIndexBase::has_removed_documents() const {
   return !removed_document_ids_.empty();
 }

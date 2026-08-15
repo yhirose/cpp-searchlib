@@ -299,6 +299,18 @@ public:
     term_dictionary_.enumerate_with_prefix(prefix, callback);
   }
 
+  void enumerate_terms_with_wildcard(
+      const std::u32string &pattern,
+      const std::function<void(const std::u32string &str)> &callback)
+      const override {
+    // Unlike enumerate_terms_with_prefix, this can't constrain descent to a
+    // single subtree (a `*` may match anything), so the automaton walks the
+    // whole FST -- still cheaper than the in-memory backend's full term scan
+    // since can_match() prunes every subtree the pattern cannot possibly
+    // match, and no per-term string has to be materialized to test it.
+    term_dictionary_.enumerate_with_wildcard(pattern, callback);
+  }
+
   bool has_removed_documents() const override {
     return !removed_document_ids_.empty();
   }

@@ -1658,6 +1658,239 @@ TEST(PrefixSearchTest, ExpandPrefixesRewritesNestedNodes) {
 }
 
 //-----------------------------------------------------------------------------
+// Wildcard search (roadmap item 14 step 3)
+//-----------------------------------------------------------------------------
+
+// enumerate_terms_with_wildcard leaves the order unspecified, so every
+// assertion here compares sorted vectors.
+static std::vector<std::string>
+terms_with_wildcard(const IInvertedIndex &invidx,
+                    const std::u32string &pattern) {
+  std::vector<std::string> terms;
+  invidx.enumerate_terms_with_wildcard(
+      pattern, [&](const auto &str) { terms.push_back(u8(str)); });
+  std::sort(terms.begin(), terms.end());
+  return terms;
+}
+
+TEST(WildcardSearchTest, EnumerateTermsWithWildcard) {
+  auto invidx = prefix_index();
+
+  EXPECT_EQ((std::vector<std::string>{"apple"}),
+            terms_with_wildcard(invidx, U"a*e"));
+  EXPECT_EQ((std::vector<std::string>{"banana"}),
+            terms_with_wildcard(invidx, U"*ana"));
+  EXPECT_EQ((std::vector<std::string>{"application"}),
+            terms_with_wildcard(invidx, U"app*ion"));
+  EXPECT_EQ((std::vector<std::string>{"apple", "application", "apricot",
+                                      "banana"}),
+            terms_with_wildcard(invidx, U"*a*"));
+  EXPECT_TRUE(terms_with_wildcard(invidx, U"zzz*zzz").empty());
+}
+
+TEST(WildcardSearchTest, EmptyPatternOnlyMatchesTheEmptyTerm) {
+  // No `*` in an empty pattern means it matches nothing but the empty
+  // string, unlike enumerate_terms_with_prefix's empty-prefix-matches-all.
+  auto invidx = prefix_index();
+  EXPECT_TRUE(terms_with_wildcard(invidx, U"").empty());
+}
+
+TEST(WildcardSearchTest, TrailingStarOnlyStillParsesAsPrefix) {
+  // Regression guard: the is_prefix check has to keep routing the common
+  // single-trailing-star case to the cheaper Operation::Prefix path instead
+  // of the general wildcard automaton.
+  auto expr = parse_query(normalizer, "app*");
+  ASSERT_TRUE(expr);
+  EXPECT_EQ(Operation::Prefix, expr->operation);
+  EXPECT_EQ(U"app", expr->term_str);
+}
+
+TEST(WildcardSearchTest, LeadingAndInteriorStarParseAsWildcard) {
+  auto leading = parse_query(normalizer, "*ana");
+  ASSERT_TRUE(leading);
+  EXPECT_EQ(Operation::Wildcard, leading->operation);
+  EXPECT_EQ(U"*ana", leading->term_str);
+
+  auto interior = parse_query(normalizer, "a*e");
+  ASSERT_TRUE(interior);
+  EXPECT_EQ(Operation::Wildcard, interior->operation);
+  EXPECT_EQ(U"a*e", interior->term_str);
+}
+
+TEST(WildcardSearchTest, MultipleStarsCollapseToOne) {
+  // "app**" has more than one star, so it takes the wildcard path rather
+  // than Prefix, but the pattern still collapses to "app*" and matches the
+  // same terms.
+  auto expr = parse_query(normalizer, "app**");
+  ASSERT_TRUE(expr);
+  EXPECT_EQ(Operation::Wildcard, expr->operation);
+  EXPECT_EQ(U"app*", expr->term_str);
+}
+
+TEST(WildcardSearchTest, FilterAppliesToEachLiteralSegment) {
+  // The normalizer (lowercasing) has to run on "AP" and "E" independently,
+  // the same way it would on a plain term.
+  auto expr = parse_query(normalizer, "AP*E");
+  ASSERT_TRUE(expr);
+  EXPECT_EQ(Operation::Wildcard, expr->operation);
+  EXPECT_EQ(U"ap*e", expr->term_str);
+}
+
+TEST(WildcardSearchTest, QueryMatchesEveryTermSatisfyingThePattern) {
+  auto invidx = prefix_index();
+
+  auto expr = parse_query(normalizer, "app*ion");
+  ASSERT_TRUE(expr);
+  EXPECT_EQ(Operation::Wildcard, expr->operation);
+
+  // application (doc 2) only.
+  auto result = perform_search(invidx, *expr);
+  EXPECT_EQ((std::vector<size_t>{2}), hit_document_ids(*result));
+}
+
+TEST(WildcardSearchTest, QueryIsEquivalentToTheExplicitOr) {
+  auto invidx = prefix_index();
+
+  auto wildcard_expr = parse_query(normalizer, "*a*");
+  auto or_expr =
+      parse_query(normalizer, "apple|application|apricot|banana");
+  ASSERT_TRUE(wildcard_expr);
+  ASSERT_TRUE(or_expr);
+
+  auto wildcard_result = perform_search(invidx, *wildcard_expr);
+  auto or_result = perform_search(invidx, *or_expr);
+
+  ASSERT_EQ(or_result->size(), wildcard_result->size());
+  EXPECT_EQ(hit_document_ids(*or_result), hit_document_ids(*wildcard_result));
+
+  // Scoring has to agree too: enumerate_terms expands a Wildcard node into
+  // the same term set the Or spells out by hand.
+  for (size_t i = 0; i < wildcard_result->size(); i++) {
+    EXPECT_AP(bm25_score(invidx, *or_expr, *or_result, i),
+              bm25_score(invidx, *wildcard_expr, *wildcard_result, i));
+  }
+}
+
+TEST(WildcardSearchTest, NoMatchingTermYieldsNoHits) {
+  auto invidx = prefix_index();
+
+  auto expr = parse_query(normalizer, "zzz*zzz");
+  ASSERT_TRUE(expr);
+  EXPECT_EQ(Operation::Wildcard, expr->operation);
+  EXPECT_EQ(0, perform_search(invidx, *expr)->size());
+}
+
+TEST(WildcardSearchTest, CombinesWithOtherOperators) {
+  auto invidx = prefix_index();
+
+  // `a*e banana` == documents holding both an "a...e" term and "banana";
+  // only doc 1 (apple banana) qualifies.
+  auto and_expr = parse_query(normalizer, "a*e banana");
+  ASSERT_TRUE(and_expr);
+  EXPECT_EQ((std::vector<size_t>{1}),
+            hit_document_ids(*perform_search(invidx, *and_expr)));
+
+  // Negation over a wildcard: "banana" but nothing matching "a*e".
+  auto not_expr = parse_query(normalizer, "banana -a*e");
+  ASSERT_TRUE(not_expr);
+  EXPECT_EQ((std::vector<size_t>{3}),
+            hit_document_ids(*perform_search(invidx, *not_expr)));
+}
+
+TEST(WildcardSearchTest, ExcludesLogicallyDeletedDocuments) {
+  auto invidx = prefix_index();
+  invidx.remove_document(0); // apple apricot
+
+  auto expr = parse_query(normalizer, "a*e");
+  ASSERT_TRUE(expr);
+  EXPECT_EQ((std::vector<size_t>{1}),
+            hit_document_ids(*perform_search(invidx, *expr)));
+}
+
+TEST(WildcardSearchTest, ExpandWildcardsRewritesToAnEquivalentOr) {
+  auto invidx = prefix_index();
+
+  auto parsed = parse_query(normalizer, "*a*");
+  ASSERT_TRUE(parsed);
+  ASSERT_EQ(Operation::Wildcard, parsed->operation);
+
+  auto expanded = expand_wildcards(invidx, *parsed);
+  ASSERT_EQ(Operation::Or, expanded.operation);
+  ASSERT_EQ(4, expanded.nodes.size());
+  // Sorted, so the expansion is reproducible for one pattern and one index.
+  EXPECT_EQ(U"apple", expanded.nodes[0].term_str);
+  EXPECT_EQ(U"application", expanded.nodes[1].term_str);
+  EXPECT_EQ(U"apricot", expanded.nodes[2].term_str);
+  EXPECT_EQ(U"banana", expanded.nodes[3].term_str);
+
+  // Same hits and same scores as searching the unexpanded expression, which
+  // is what makes expanding-before-scoring a pure optimization.
+  auto result = perform_search(invidx, expanded);
+  auto direct = perform_search(invidx, *parsed);
+  ASSERT_EQ(direct->size(), result->size());
+  for (size_t i = 0; i < result->size(); i++) {
+    EXPECT_EQ(direct->document_id(i), result->document_id(i));
+    EXPECT_AP(bm25_score(invidx, *parsed, *direct, i),
+              bm25_score(invidx, expanded, *result, i));
+  }
+}
+
+TEST(WildcardSearchTest, ExpandWildcardsRewritesNestedNodes) {
+  auto invidx = prefix_index();
+
+  auto parsed = parse_query(normalizer, "a*e banana");
+  ASSERT_TRUE(parsed);
+  ASSERT_EQ(Operation::And, parsed->operation);
+
+  auto expanded = expand_wildcards(invidx, *parsed);
+  ASSERT_EQ(Operation::And, expanded.operation);
+  ASSERT_EQ(2, expanded.nodes.size());
+  // The Wildcard child became an Or; the plain Term child is untouched.
+  EXPECT_EQ(Operation::Or, expanded.nodes[0].operation);
+  EXPECT_EQ(Operation::Term, expanded.nodes[1].operation);
+  EXPECT_EQ(U"banana", expanded.nodes[1].term_str);
+
+  EXPECT_EQ((std::vector<size_t>{1}),
+            hit_document_ids(*perform_search(invidx, expanded)));
+}
+
+TEST(WildcardSearchTest, CompressedBackendMatchesInMemory) {
+  auto invidx = prefix_index();
+
+  std::stringstream compressed(std::ios::in | std::ios::out |
+                               std::ios::binary);
+  invidx.save(compressed, {}, IndexFormat::Compressed);
+  auto loaded = load_compressed_index(compressed);
+
+  // The compressed backend walks the FST with a custom automaton while the
+  // in-memory one scans its hash map and tests each term directly, so this
+  // pins the two implementations to the same answer.
+  for (const auto *pattern :
+       {U"*", U"a*e", U"*ana", U"app*ion", U"*a*", U"zzz*zzz"}) {
+    EXPECT_EQ(terms_with_wildcard(invidx, pattern),
+              terms_with_wildcard(*loaded, pattern))
+        << u8(pattern);
+  }
+}
+
+TEST(WildcardSearchTest, CompressedEnumerationReusesItsBuffer) {
+  auto invidx = prefix_index();
+
+  std::stringstream compressed(std::ios::in | std::ios::out |
+                               std::ios::binary);
+  invidx.save(compressed, {}, IndexFormat::Compressed);
+  auto loaded = load_compressed_index(compressed);
+
+  std::vector<std::string> copied;
+  loaded->enumerate_terms_with_wildcard(
+      U"*a*", [&](const auto &str) { copied.push_back(u8(str)); });
+  std::sort(copied.begin(), copied.end());
+  EXPECT_EQ((std::vector<std::string>{"apple", "application", "apricot",
+                                      "banana"}),
+            copied);
+}
+
+//-----------------------------------------------------------------------------
 // FST term dictionary (Compressed format, roadmap item 14 step 2)
 //-----------------------------------------------------------------------------
 

@@ -551,6 +551,20 @@ perform_prefix_operation(const IInvertedIndex &inverted_index,
       inverted_index, expand_prefixes(inverted_index, expr), scope_index);
 }
 
+// A Wildcard node is answered the same way a Prefix node is: expand against
+// the dictionary and union the matches. Kept as its own operation (rather
+// than folding into Prefix) because the two backends answer them with
+// different mechanisms -- literal-prefix descent vs. an automaton walk -- and
+// mixing that behind one enumerate_terms_with_prefix call would lose the
+// cheaper path for the common trailing-`*` case.
+static std::shared_ptr<IPostings>
+perform_wildcard_operation(const IInvertedIndex &inverted_index,
+                           const Expression &expr,
+                           const IScopeIndex *scope_index) {
+  return perform_search_operation(
+      inverted_index, expand_wildcards(inverted_index, expr), scope_index);
+}
+
 static std::shared_ptr<IPostings>
 perform_near_operation(const IInvertedIndex &inverted_index,
                        const Expression &expr,
@@ -748,6 +762,8 @@ perform_search_operation(const IInvertedIndex &inverted_index,
     return perform_same_scope_operation(inverted_index, expr, scope_index);
   case Operation::Prefix:
     return perform_prefix_operation(inverted_index, expr, scope_index);
+  case Operation::Wildcard:
+    return perform_wildcard_operation(inverted_index, expr, scope_index);
   default:
     return nullptr;
   }
@@ -779,6 +795,31 @@ Expression expand_prefixes(const IInvertedIndex &inverted_index,
   return expanded;
 }
 
+Expression expand_wildcards(const IInvertedIndex &inverted_index,
+                            const Expression &expr) {
+  if (expr.operation == Operation::Wildcard) {
+    std::vector<Expression> nodes;
+    inverted_index.enumerate_terms_with_wildcard(
+        expr.term_str, [&](const auto &str) {
+          nodes.push_back(Expression{Operation::Term, str});
+        });
+
+    // enumerate_terms_with_wildcard leaves the order unspecified, same
+    // reproducibility rationale as expand_prefixes.
+    std::sort(nodes.begin(), nodes.end(), [](const auto &a, const auto &b) {
+      return a.term_str < b.term_str;
+    });
+
+    return Expression{Operation::Or, std::u32string(), 0, std::move(nodes)};
+  }
+
+  auto expanded = expr;
+  for (auto &node : expanded.nodes) {
+    node = expand_wildcards(inverted_index, node);
+  }
+  return expanded;
+}
+
 std::shared_ptr<IPostings> perform_search(const IInvertedIndex &inverted_index,
                                           const Expression &expr,
                                           const IScopeIndex *scope_index) {
@@ -801,6 +842,9 @@ void enumerate_terms(const IInvertedIndex &invidx, const Expression &expr,
     // Score a prefix node as the Or it expands to, so that `foo*` and a
     // hand-written Or over the same terms score identically.
     invidx.enumerate_terms_with_prefix(expr.term_str, fn);
+  } else if (expr.operation == Operation::Wildcard) {
+    // Same rationale as Operation::Prefix above.
+    invidx.enumerate_terms_with_wildcard(expr.term_str, fn);
   } else if (expr.operation == Operation::Not) {
     // Excluded terms do not contribute to scores.
   } else {

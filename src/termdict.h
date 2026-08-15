@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <functional>
 #include <memory>
 #include <sstream>
@@ -70,6 +71,72 @@ inline void write_term_dictionary_fst(std::ostream &os,
   write_bytes(os, fst_os.str());
 }
 
+// Drives a glob match ('*' = zero or more codepoints, every other codepoint
+// literal) through an FST via fst::map::custom_search. Modeled on fstlib's
+// own LevenshteinAutomaton: state_[i] tracks whether the codepoints consumed
+// so far can match pattern[0:i), the same subset-construction DP that
+// InMemoryInvertedIndexBase's non-incremental matches_wildcard runs in one
+// shot, just updated one codepoint at a time as custom_search descends the
+// FST. Bytes are buffered until a full UTF-8 codepoint decodes (the FST
+// visits one byte per arc) so a star never gets tested against half a
+// multi-byte character.
+class WildcardAutomaton {
+public:
+  explicit WildcardAutomaton(const std::u32string &pattern)
+      : pattern_(std::make_shared<const std::u32string>(pattern)) {
+    state_.resize(pattern_->size() + 1);
+    state_[0] = true;
+    for (size_t i = 1; i <= pattern_->size(); i++) {
+      state_[i] = state_[i - 1] && (*pattern_)[i - 1] == U'*';
+    }
+  }
+
+  // custom_search's FST traversal copies the automaton once per arc it
+  // visits (fstlib's depth_first_visit, one copy per sibling byte-edge), so
+  // pattern_ is a shared_ptr to keep that copy an atomic refcount bump
+  // instead of a std::u32string deep-copy on every arc.
+  WildcardAutomaton(const WildcardAutomaton &) = default;
+
+  void step(char c) {
+    u8bytes_ += c;
+    char32_t cp;
+    auto consumed =
+        unicode::utf8::decode_codepoint(u8bytes_.data(), u8bytes_.size(), cp);
+    if (consumed == 0) {
+      return; // mid-codepoint; wait for more bytes
+    }
+    u8bytes_.clear();
+
+    // Updated in place, left to right: by the time iteration i runs,
+    // state_[0..i-1] already hold their new (post-step) values and
+    // state_[i..] still hold their old (pre-step) ones, matching what the
+    // DP needs at each position (state_[i-1] for the star case reads the
+    // just-updated neighbor; prev_old for the literal case reads what that
+    // neighbor held before this step). Avoids allocating a second
+    // vector<bool> every codepoint.
+    const auto &pattern = *pattern_;
+    bool prev_old = state_[0];
+    state_[0] = false;
+    for (size_t i = 1; i <= pattern.size(); i++) {
+      bool cur_old = state_[i];
+      state_[i] = pattern[i - 1] == U'*' ? (state_[i - 1] || cur_old)
+                                         : (prev_old && pattern[i - 1] == cp);
+      prev_old = cur_old;
+    }
+  }
+
+  bool is_match() const { return u8bytes_.empty() && state_.back(); }
+
+  bool can_match() const {
+    return std::find(state_.begin(), state_.end(), true) != state_.end();
+  }
+
+private:
+  std::shared_ptr<const std::u32string> pattern_;
+  std::vector<bool> state_;
+  std::string u8bytes_; // bytes of a not-yet-fully-decoded codepoint
+};
+
 // The FST section as read back from a stream. It owns both the byte code and
 // the fst::map built over it; fst::map keeps a bare pointer into the bytes
 // rather than copying them, so the two must never be separated. Hence this
@@ -117,6 +184,21 @@ public:
                               unicode::utf8::decode(key, term);
                               callback(term);
                             });
+  }
+
+  void enumerate_with_wildcard(
+      const std::u32string &pattern,
+      const std::function<void(const std::u32string &str)> &callback) const {
+    if (!map_) {
+      return;
+    }
+    std::u32string term; // reused across hits, same rationale as above
+    map_->custom_search(WildcardAutomaton(pattern),
+                        [&](const std::string &key, const uint32_t &) {
+                          term.clear();
+                          unicode::utf8::decode(key, term);
+                          callback(term);
+                        });
   }
 
   // Recovers the ordinal -> term mapping. Used by readers that need the term

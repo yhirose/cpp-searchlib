@@ -57,6 +57,7 @@ for (size_t i = 0; i < result->size(); i++) {
 | `"apple tree"` | Phrase - adjacent terms |
 | `apple ~ tree` | NEAR - terms within 4 term positions |
 | `app*` | Prefix - every term starting with `app` |
+| `a*e`, `*ana`, `app*ion` | Wildcard - `*` matches zero or more characters anywhere in the term |
 | `( ... )` | Grouping |
 
 Terms are tokenized and normalized in the same way as documents, so Unicode
@@ -99,6 +100,22 @@ auto hits = top_k(*result, 10, [&](size_t i) {
   return bm25_score(index, expr, *result, i);
 });
 ```
+
+A `*` anywhere else in a term -- leading, interior, or more than one -- is a
+wildcard instead of a prefix: `a*e` matches `apple`, `*ana` matches `banana`,
+`app*ion` matches `application`. It is backed by
+`IInvertedIndex::enumerate_terms_with_wildcard` and expanded the same way
+(`expand_wildcards` before scoring). Only `*` is supported, matching zero or
+more characters; there is no `?` or character class.
+
+The two backends answer it differently, same as prefix search: the in-memory
+index tests every term against the pattern, while the compressed backend
+walks the FST with a small automaton (`step`/`is_match`/`can_match`, the same
+shape as fstlib's own `edit_distance_search`) that prunes any subtree the
+pattern cannot match. It still visits more of the FST than a literal prefix
+does -- a `*` can match anything, so descent can't be confined to one subtree
+-- which is why the common single-trailing-`*` case stays on the cheaper
+Prefix path instead of going through the wildcard automaton.
 
 ## Scoring
 
