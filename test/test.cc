@@ -1873,6 +1873,64 @@ TEST(WildcardSearchTest, CompressedBackendMatchesInMemory) {
   }
 }
 
+TEST(WildcardSearchTest, CompressedBackendMatchesInMemoryOffTheEasyPath) {
+  // The compressed backend's automaton keeps its DP row as a bitmask, which
+  // buys three special cases the patterns above never reach: a run of stars
+  // is collapsed to one (the row's star closure is a single shift, which is
+  // only enough when no two star positions are adjacent), a pattern past 63
+  // codepoints spills the row from one inline word onto the heap, and a
+  // non-ASCII literal misses the direct-indexed table and takes the
+  // binary-searched fallback. Each is pinned here against the in-memory
+  // backend, which does none of that.
+  const std::u32string a62(62, U'a');
+  const std::u32string a63(63, U'a');
+  const std::u32string a64(64, U'a');
+
+  InMemoryInvertedIndex<TextRange> invidx;
+  {
+    InMemoryIndexer indexer(invidx, normalizer);
+    size_t document_id = 0;
+    for (const auto &term :
+         {a62, a63, a64, std::u32string(65, U'a'), std::u32string(100, U'a'),
+          a63 + U"b", a64 + U"b", std::u32string(U"apple"),
+          std::u32string(U"banana"), std::u32string(U"café"),
+          std::u32string(U"日本語"), std::u32string(U"あいうえお")}) {
+      indexer.index_document(document_id++, UTF8PlainTextTokenizer(u8(term)));
+    }
+  }
+
+  std::stringstream compressed(std::ios::in | std::ios::out |
+                               std::ios::binary);
+  invidx.save(compressed, {}, IndexFormat::Compressed);
+  auto loaded = load_compressed_index(compressed);
+
+  std::vector<std::u32string> patterns = {
+      // collapsed star runs
+      U"**", U"***", U"a**e", U"**a**", U"a***b",
+      // the row's word boundary, with the star on either side of it
+      a62 + U"*", a63 + U"*", a64 + U"*", U"*" + a63, U"*" + a64,
+      a62 + U"*b", a63 + U"*b", a64 + U"*b",
+      // the same boundary with no star at all, so is_match() has to pick the
+      // accepting bit out of the right word
+      a63, a64,
+      // literals outside the ASCII table
+      U"caf*", U"*é", U"日*語", U"*本*", U"あ*お", U"*う*",
+  };
+  for (const auto &pattern : patterns) {
+    EXPECT_EQ(terms_with_wildcard(invidx, pattern),
+              terms_with_wildcard(*loaded, pattern))
+        << u8(pattern);
+  }
+
+  // Not a tautology only if the patterns actually match something.
+  EXPECT_EQ((std::vector<std::string>{"日本語"}),
+            terms_with_wildcard(*loaded, U"日*語"));
+  EXPECT_EQ((std::vector<std::string>{"apple"}),
+            terms_with_wildcard(*loaded, U"a**e"));
+  EXPECT_EQ((std::vector<std::string>{u8(a64 + U"b"), u8(a63 + U"b")}),
+            terms_with_wildcard(*loaded, a62 + U"*b"));
+}
+
 TEST(WildcardSearchTest, CompressedEnumerationReusesItsBuffer) {
   auto invidx = prefix_index();
 
