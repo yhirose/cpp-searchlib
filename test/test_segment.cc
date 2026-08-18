@@ -183,23 +183,29 @@ TEST(SegmentTest, MalformedUtf8TerminatesInsteadOfHanging) {
   // from documents, so it has to terminate on anything.
   const std::string truncated = "ab\xE3";        // 3-byte sequence cut short
   const std::string bad_continuation = "\xE3\x81\x41";
+  const std::string out_of_range = "\xF7\xBF\xBF\xBF"; // would be U+1FFFFF
 
   // Terminating at all is the assertion; the terms are pinned only to catch a
-  // future "fix" that silently drops the valid text around the bad bytes.
+  // future "fix" that silently drops the valid text around the bad bytes. Only
+  // the well-formed bytes survive: `bad_continuation` keeps its trailing "A",
+  // and `out_of_range` has nothing to keep.
   EXPECT_EQ((std::vector<std::string>{"ab"}),
             terms(tokenize(utf8_plain_text_splitter(), truncated)));
-  EXPECT_EQ(1u, tokenize(utf8_plain_text_splitter(), bad_continuation).size());
+  EXPECT_EQ((std::vector<std::string>{"A"}),
+            terms(tokenize(utf8_plain_text_splitter(), bad_continuation)));
+  EXPECT_TRUE(terms(tokenize(utf8_plain_text_splitter(), out_of_range)).empty());
 
-  // The segmenting splitter must survive it too: bad_continuation decodes to a
-  // Hiragana codepoint, so the CJK gate opens and the raw bytes reach the
-  // model, which rejects them. That path falls back to the unsegmented run.
+  // The segmenting splitter must survive them too. It shares the letter-run
+  // loop, so it sees the same ill-formed bytes before its CJK gate can run.
   EXPECT_NO_THROW({
     tokenize(segmenting_splitter(), truncated);
     tokenize(segmenting_splitter(), bad_continuation);
+    tokenize(segmenting_splitter(), out_of_range);
   });
 
   // And the query side, which is where untrusted input actually arrives.
   EXPECT_NO_THROW(parse_query(segmenting_splitter(), nullptr, truncated));
+  EXPECT_NO_THROW(parse_query(segmenting_splitter(), nullptr, out_of_range));
 }
 
 TEST(SegmentTest, KnownLimitationsCarriedOverFromTheLetterRunRule) {

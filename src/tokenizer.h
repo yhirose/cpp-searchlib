@@ -10,8 +10,8 @@
 #include <string>
 #include <string_view>
 
-#include "lib/unicodelib.h"
-#include "lib/unicodelib_encodings.h"
+#include "unicodelib/unicodelib.h"
+#include "unicodelib/unicodelib_encodings.h"
 #include "searchlib.h"
 
 namespace searchlib {
@@ -29,11 +29,11 @@ namespace detail {
 // A template taking the callback by deduced type, rather than a plain function
 // taking a std::function, because this is the indexing hot path and the
 // indirection dominates it. Tokenizing test/t_kjv.tsv (31103 documents) with
-// UTF8PlainTextTokenizer, clang -O2 -DNDEBUG, best of 5, three interleaved
-// rounds, identical output both ways: 20.0-20.3 ms as written, 31.0-31.2 ms
-// with this same body behind a `const std::function&` parameter instead. So
-// the rule stays defined once, and each caller's lambda still inlines into the
-// loop rather than becoming an indirect call per term.
+// UTF8PlainTextTokenizer and no normalizer, clang -O2 -DNDEBUG, best of 5,
+// three interleaved rounds, identical checksums both ways: 22.4-22.6 ms as
+// written, 34.0-34.3 ms with this same body behind a `const std::function&`
+// parameter instead. So the rule stays defined once, and each caller's lambda
+// still inlines into the loop rather than becoming an indirect call per term.
 // Taken by forwarding reference rather than by value so that a caller handing
 // over a std::function (utf8_plain_text_splitter's `emit`, and parse_query's
 // per-token one) does not pay a copy of it -- that copy heap-allocates,
@@ -52,14 +52,19 @@ void for_each_letter_run(std::string_view text, Callback &&callback) {
       char32_t cp;
       auto len =
           unicode::utf8::decode_codepoint(&text[pos], text.size() - pos, cp);
-      // decode_codepoint returns 0 without writing cp when the bytes are not
-      // a decodable sequence (e.g. a multi-byte sequence truncated by the end
-      // of the input). Both halves of that matter: reading cp would be an
-      // uninitialized read, and `pos += 0` would spin forever. Since text
-      // reaches here straight from a caller's document -- and, via
-      // parse_query, from an end-user's query string -- that hang is
-      // reachable from untrusted input. Step over the byte instead; it cannot
-      // be part of a term either way.
+      // decode_codepoint returns 0 without writing cp for anything that is not
+      // a well-formed UTF-8 sequence: a truncated one, a bad continuation
+      // byte, an overlong encoding, a surrogate, or a value past U+10FFFF.
+      // Both halves of that matter: reading cp would be an uninitialized read,
+      // and `pos += 0` would spin forever. Since text reaches here straight
+      // from a caller's document -- and, via parse_query, from an end-user's
+      // query string -- that hang is reachable from untrusted input. Step over
+      // the byte instead; it cannot be part of a term either way.
+      //
+      // Checking this is also what keeps cp inside the range the property
+      // tables cover. An earlier vendored unicodelib decoded F7 BF BF BF to
+      // U+1FFFFF and is_letter() then read past the end of its table; see
+      // TokenizerTest.IllFormedUtf8IsSkipped.
       if (len == 0) {
         pos++;
         continue;

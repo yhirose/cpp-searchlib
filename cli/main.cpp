@@ -1,7 +1,7 @@
 #include <searchlib.h>
 
 #include "lib/flags.h"
-#include "lib/unicodelib.h"
+#include "unicodelib/unicodelib.h"
 
 #include <algorithm>
 #include <filesystem>

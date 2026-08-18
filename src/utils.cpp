@@ -7,7 +7,7 @@
 
 #include "utils.h"
 
-#include "lib/unicodelib_encodings.h"
+#include "unicodelib/unicodelib_encodings.h"
 
 namespace searchlib {
 

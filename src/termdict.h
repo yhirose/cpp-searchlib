@@ -16,8 +16,8 @@
 #include <string>
 #include <vector>
 
-#include "lib/fstlib.h"
-#include "lib/unicodelib_encodings.h"
+#include "fstlib/fstlib.h"
+#include "unicodelib/unicodelib_encodings.h"
 #include "searchlib.h"
 #include "utils.h"
 

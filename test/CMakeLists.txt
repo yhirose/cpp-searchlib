@@ -33,7 +33,7 @@ add_executable(
   ../src/federatedindex.cpp
 )
 
-target_include_directories(test-main PRIVATE ../include ../src)
+target_include_directories(test-main PRIVATE ../include ../src ../third_party)
 # searchlib-segment carries the only include path to the vendored
 # cpp-segmentlib; linking it does not extend that path to the sources above,
 # which is the point (see the comment on the target).

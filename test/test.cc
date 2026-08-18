@@ -63,6 +63,49 @@ TEST(TokenizerTest, UTF8PlainTextTokenizer) {
   }
 }
 
+TEST(TokenizerTest, IllFormedUtf8IsSkipped) {
+  // The vendored unicodelib validates UTF-8 as of the 2026-07 revision; the
+  // one before it only checked that enough bytes were left, so each of these
+  // decoded to *something*. Two of the results are visible here: "ab\xE3" plus
+  // "cd" came back as the single term "ab㣤", silently swallowing the
+  // "cd", and the bad continuation byte became a Hiragana term.
+  //
+  // "\xF7\xBF\xBF\xBF" is the sharp one. It decoded to U+1FFFFF, past the end
+  // of Unicode, and general_category() indexed its block table with no range
+  // check -- `_blocks[cp / _block_size]` off the end, then a dereference of
+  // whatever pointer that read. Four bytes any client can put in a query
+  // string. It faulted under some builds and quietly returned garbage under
+  // others, which is why this test pins the terms rather than just asking the
+  // call to return.
+  const std::vector<std::pair<const char *, std::string>> ill_formed = {
+      {"truncated", "\xE3"},
+      {"bad continuation", "\xE3\x81\x21"},
+      {"overlong U+0000", "\xC0\x80"},
+      {"surrogate U+D800", "\xED\xA0\x80"},
+      {"past U+10FFFF", "\xF7\xBF\xBF\xBF"},
+      {"invalid lead bytes", "\xFF\xFE"},
+  };
+
+  for (const auto &[what, bytes] : ill_formed) {
+    // Ill-formed bytes are skipped, never turned into terms, and the letters
+    // around them are still found. None of these carries a letter of its own,
+    // so whether the surrounding text comes back as one run or two is left
+    // open; only the letters themselves are pinned.
+    std::vector<std::string> actual;
+    UTF8PlainTextTokenizer tokenizer("ab" + bytes + "cd");
+    tokenizer(nullptr,
+              [&](auto &str, auto, auto) { actual.emplace_back(u8(str)); });
+    std::string joined;
+    for (const auto &term : actual) {
+      joined += term;
+    }
+    EXPECT_EQ("abcd", joined) << what;
+
+    // And the query side, which is the one an untrusted string reaches.
+    EXPECT_NO_THROW(parse_query(normalizer, bytes)) << what;
+  }
+}
+
 TEST(QueryTest, ParsingQuery) {
   const auto &invidx = sample_index();
 

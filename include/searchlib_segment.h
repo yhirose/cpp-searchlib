@@ -14,7 +14,7 @@
 namespace searchlib {
 
 // A TextSplitter that segments Japanese, backed by the vendored cpp-segmentlib
-// (src/lib/segmentlib, see its README). Opt-in: this header is separate from
+// (third_party/segmentlib, see its README). Opt-in: this header is separate from
 // searchlib.h because using it means shipping a model file, and because the
 // single translation unit that implements it is the only one allowed to see
 // segmentlib's own vendored fstlib.

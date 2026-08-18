@@ -5,7 +5,7 @@
 //  MIT License
 //
 
-#include "lib/peglib.h"
+#include "peglib/peglib.h"
 #include "searchlib.h"
 #include "utils.h"
 

@@ -12,7 +12,7 @@ endif()
 # copy of fstlib) is scoped to this single translation unit. Including
 # src/termdict.h alongside those headers fails with `namespace fst`
 # redefinition errors, so the scoping is what makes the collision unreachable;
-# see src/lib/segmentlib/README.md. Declared at the top level rather than under
+# see third_party/segmentlib/README.md. Declared at the top level rather than under
 # test/ because it is a library of this project, not of its test suite; only
 # test/ links it today, but nothing about it is test-specific.
 #
@@ -26,7 +26,7 @@ target_include_directories(searchlib-segment PRIVATE include src)
 # warning-clean at -Wall -Wextra (nine -Wunused-parameter hits). This project
 # sets no warning flags of its own today, so keeping it a system header is what
 # makes a warnings-on build stay quiet whenever someone turns them on.
-target_include_directories(searchlib-segment SYSTEM PRIVATE src/lib)
+target_include_directories(searchlib-segment SYSTEM PRIVATE third_party)
 
 add_subdirectory(cli)
 add_subdirectory(test)

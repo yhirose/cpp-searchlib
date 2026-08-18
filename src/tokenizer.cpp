@@ -43,13 +43,13 @@ UTF8PlainTextTokenizer::UTF8PlainTextTokenizer(std::string_view text)
 // The body below is SplitterTokenizer's null-splitter branch written out
 // again, which is a deliberate few lines of duplication: delegating to
 // SplitterTokenizer(nullptr, text_) measures slower on this, the default
-// indexing path. Tokenizing test/t_kjv.tsv (31103 documents), clang -O2
-// -DNDEBUG, best of 5, three interleaved rounds, identical output both ways:
-// 20.0-20.3 ms direct against 21.8-22.0 ms delegated. The cost is per document
-// rather than per term -- building the temporary and moving the two
-// std::functions into it, plus a call that no longer inlines -- so it does not
-// grow with document length, but it is real and every existing caller of this
-// library takes this path.
+// indexing path. Tokenizing test/t_kjv.tsv (31103 documents) with no
+// normalizer, clang -O2 -DNDEBUG, best of 5, three interleaved rounds,
+// identical checksums both ways: 22.4-22.6 ms direct against 23.2-23.4 ms
+// delegated, about 4%. The cost is per document rather than per term --
+// building the temporary and moving the two std::functions into it, plus a
+// call that no longer inlines -- so it does not grow with document length, but
+// it is real and every existing caller of this library takes this path.
 void UTF8PlainTextTokenizer::operator()(
     Normalizer normalizer,
     std::function<void(const std::u32string &str, size_t term_pos,

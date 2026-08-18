@@ -14,4 +14,4 @@ add_executable(
   ../src/federatedindex.cpp
 )
 
-target_include_directories(searchlib-cli PRIVATE ../include ../src)
+target_include_directories(searchlib-cli PRIVATE ../include ../src ../third_party)

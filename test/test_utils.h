@@ -1,6 +1,6 @@
 #include <sstream>
 
-#include "lib/unicodelib.h"
+#include "unicodelib/unicodelib.h"
 #include "utils.h"
 
 inline bool close_enough(double expect, double actual) {
