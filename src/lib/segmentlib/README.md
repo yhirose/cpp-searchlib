@@ -1,21 +1,25 @@
 # cpp-segmentlib (vendored)
 
 Upstream: https://github.com/yhirose/cpp-segmentlib
-Revision: 5987d9c5762093d6f765921d868dc18845d83eaa
+Revision: v0.1.0 (cb8b73d)
 
 Japanese word segmentation (KyTea-compatible and MLP backends), for the CJK
 tokenization the built-in `UTF8PlainTextTokenizer` cannot do: it splits on
 Unicode letter runs, so a Japanese sentence with no spaces becomes one enormous
 term.
 
-Copied verbatim from that revision's `include/segmentlib/`. Upstream publishes
-no tags, so the revision above is what "current" means here. Update by
-replacing the tree and this line together.
+Copied verbatim from that tag's `include/segmentlib/`. Upstream now tags
+releases (`vX.Y.Z`, `scripts/release.sh`); track a tag here rather than an
+arbitrary commit. Update by replacing the tree and this line together -- the
+diff against the previous vendored revision (5987d9c) was 8 lines, the new
+`SEGMENTLIB_VERSION`/`SEGMENTLIB_VERSION_NUM` macros in `types.h`.
 
 Inference upstream is header-only and targets C++17, which is what makes it
 droppable into this project (peglib/unicodelib/fstlib are here on the same
 terms). Upstream's trainer and CLI need C++23 and are not vendored; models are
-built there and only loaded here.
+built there and only loaded here. Upstream also now bundles a trained MLP
+reference model (`models/mlp/`, CC BY-SA 4.0, see upstream's NOTICE) -- not
+vendored here either, since nothing here loads a model yet.
 
 ## Using it
 
