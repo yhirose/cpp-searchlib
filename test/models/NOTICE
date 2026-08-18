@@ -1,0 +1,34 @@
+The model file in this directory (ja-ud-gsd.mod) is a trained artifact and
+carries the licenses of what it was trained on, separately from this
+repository's MIT-licensed code. This is the same split spaCy uses for its
+ja_core_news models, which are trained on the same treebank.
+
+1. Training corpus: UD_Japanese-GSD
+
+  https://github.com/UniversalDependencies/UD_Japanese-GSD
+  Release r2.18 (commit 33e7310b58308e85fd2b33a2fc3ef3e434f821c7)
+  License: CC BY-SA 4.0
+
+  The model's parameters are derived from this treebank, so the model file
+  is distributed under CC BY-SA 4.0: redistribution or modification of the
+  model file must keep this attribution and the same license. This applies
+  to the model file only; it places no requirement on code that loads it or
+  on segmentation output produced with it.
+
+2. Dictionary: unidic-mecab 2.1.2
+
+  The dictionary word list is compiled into the model file, so the model
+  also derives from:
+
+  unidic-mecab 2.1.2
+  Copyright (c) 2011-2013, The UniDic Consortium
+  https://clrd.ninjal.ac.jp/unidic/
+
+  unidic-mecab is copyrighted free software, released under any of the GPL,
+  the LGPL, or the BSD License, at your option. It is used here under the
+  BSD License, whose conditions this notice satisfies; the full text is in
+  the BSD file of the unidic-mecab source archive (kept under
+  corpus/ud-gsd/.unidic by scripts/fetch_unidic_dict.sh).
+
+  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES ARE DISCLAIMED.

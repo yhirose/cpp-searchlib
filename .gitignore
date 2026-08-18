@@ -19,6 +19,9 @@
 # Fortran module files
 *.mod
 *.smod
+# ... but the segmentation model the tests load is also a .mod, and it has to
+# be in the tree for test_segment.cc to run on a fresh clone.
+!test/models/*.mod
 
 # Compiled Static libraries
 *.lai

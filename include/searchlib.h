@@ -212,6 +212,18 @@ public:
   virtual bool is_document_removed(size_t document_id) const { return false; }
 };
 
+//-----------------------------------------------------------------------------
+// Text Ranges
+//-----------------------------------------------------------------------------
+
+// Byte offsets into the original UTF-8 text a term came from. Declared this
+// early (rather than next to the tokenizers that produce it) because
+// TextSplitter below is spelled in terms of it.
+struct TextRange {
+  size_t position;
+  size_t length;
+};
+
 using Normalizer = std::function<std::u32string(const std::u32string &str)>;
 
 template <typename T>
@@ -224,6 +236,35 @@ using Tokenizer =
                        std::function<void(const std::u32string &str,
                                           size_t term_pos, T text_range)>
                            callback)>;
+
+//-----------------------------------------------------------------------------
+// Text splitting (shared by the index side and the query side)
+//-----------------------------------------------------------------------------
+
+// Splits raw text into the term strings an index should contain, together with
+// the byte range each came from. It is deliberately *not* a Tokenizer<T>: it
+// carries no term positions and no Normalizer, because the query side has no
+// use for either -- which is what lets one splitter be shared by both sides,
+// and is the whole point of the type. Wrap one in SplitterTokenizer to index
+// with it, or pass it to parse_query to parse with it.
+//
+// A splitter must emit strictly non-overlapping ranges in increasing order,
+// each spanning the bytes its term was cut from: the text-range machinery
+// indexes the emitted ranges by term position, so a splitter that reorders or
+// overlaps them corrupts highlighting. The emitted string need not equal those
+// bytes -- SplitterTokenizer applies the Normalizer on top of it, and a
+// splitter may normalize on its own -- but the range must still point at them.
+using TextSplitter = std::function<void(
+    std::string_view text,
+    const std::function<void(const std::u32string &str, TextRange range)>
+        &emit)>;
+
+// The default splitter, and the one every existing entry point already uses
+// implicitly: maximal runs of Unicode letters (`unicode::is_letter`) become
+// terms and everything else separates them. It cannot segment CJK, where a
+// whole space-free sentence is one letter run and therefore one enormous term;
+// see searchlib_segment.h for a splitter that can.
+TextSplitter utf8_plain_text_splitter();
 
 //-----------------------------------------------------------------------------
 // Analyzer pipeline (see docs/analyzer_pipeline_design.ja.md)
@@ -347,6 +388,22 @@ std::optional<Expression> parse_query(Normalizer normalizer,
 // split into several pieces (e.g. `well-known`) still maps to the implicit
 // `Adjacent` phrase, exactly as the Normalizer overload does.
 std::optional<Expression> parse_query(TermFilter filter,
+                                      std::string_view query);
+
+// Same again, but with the raw-token splitting made explicit instead of
+// hardwired to utf8_plain_text_splitter(). Pass the splitter the index was
+// built with (see SplitterTokenizer) so that both sides agree on term
+// boundaries -- without it, a CJK-segmented index can be searched for 東京 but
+// not for 東京タワー, because the query side would leave the latter as one
+// term. A null splitter selects utf8_plain_text_splitter(), making the two
+// overloads above exactly this one with the default.
+//
+// The splitter runs where the raw tokenizer used to, so a query token it
+// splits into several terms becomes the implicit `Adjacent` phrase (東京タワー
+// -> Adjacent(東京, タワー)), while a TermFilter that expands one term into
+// several still becomes an `Or`. It is not applied inside a wildcard pattern,
+// where `*`-delimited pieces are pattern fragments rather than terms.
+std::optional<Expression> parse_query(TextSplitter splitter, TermFilter filter,
                                       std::string_view query);
 
 // scope_index is consulted only for Operation::SameScope nodes; if null,
@@ -537,15 +594,6 @@ public:
 };
 
 //-----------------------------------------------------------------------------
-// Text Ranges
-//-----------------------------------------------------------------------------
-
-struct TextRange {
-  size_t position;
-  size_t length;
-};
-
-//-----------------------------------------------------------------------------
 // Tokenizers
 //-----------------------------------------------------------------------------
 
@@ -559,6 +607,34 @@ public:
                       callback);
 
 private:
+  std::string_view text_;
+};
+
+// Lifts a TextSplitter into a Tokenizer<TextRange>, which is all an index
+// needs: the splitter decides the term boundaries, this adds the 0,1,2,...
+// term positions on top and applies the Normalizer the Tokenizer<T> contract
+// hands it (as stage 0, exactly as UTF8PlainTextTokenizer does -- ignoring it
+// would silently drop a normalizer-equipped InMemoryIndexer's normalization).
+//
+// Indexing with the same splitter a query is parsed with is what keeps the two
+// sides' term boundaries identical:
+//
+//   auto splitter = load_segmenting_splitter("ja-ud-gsd.mod");
+//   indexer.index_document(0, SplitterTokenizer(splitter, text));
+//   auto expr = parse_query(splitter, nullptr, "東京タワー");
+//
+// A null splitter behaves as utf8_plain_text_splitter(), matching parse_query.
+class SplitterTokenizer {
+public:
+  SplitterTokenizer(TextSplitter splitter, std::string_view text);
+
+  void operator()(Normalizer normalizer,
+                  std::function<void(const std::u32string &str, size_t term_pos,
+                                     TextRange text_range)>
+                      callback);
+
+private:
+  TextSplitter splitter_;
   std::string_view text_;
 };
 

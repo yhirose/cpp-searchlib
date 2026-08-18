@@ -18,8 +18,8 @@ Inference upstream is header-only and targets C++17, which is what makes it
 droppable into this project (peglib/unicodelib/fstlib are here on the same
 terms). Upstream's trainer and CLI need C++23 and are not vendored; models are
 built there and only loaded here. Upstream also now bundles a trained MLP
-reference model (`models/mlp/`, CC BY-SA 4.0, see upstream's NOTICE) -- not
-vendored here either, since nothing here loads a model yet.
+reference model (`models/mlp/`, CC BY-SA 4.0, see upstream's NOTICE); a copy of
+it lives in `test/models/` for the test suite, as described below.
 
 ## Using it
 
@@ -32,9 +32,16 @@ The headers refer to each other as `segmentlib/...`, so the include root is
 warning-clean under this project's flags (nine `-Wunused-parameter` hits at
 `-Wall -Wextra`).
 
-Nothing consumes this yet. There is no `Tokenizer<T>` adapter and no build
-target refers to these files, so the vendored tree costs nothing until one is
-written.
+The one consumer is `src/segmentsplitter.cpp`, which implements
+`searchlib::load_segmenting_splitter` (`include/searchlib_segment.h`). It is
+built as its own CMake target, `searchlib-segment`, and that target carries the
+only `-isystem src/lib` in the tree -- see below for why the scoping matters.
+Callers get a `TextSplitter`; no segmentlib type reaches the public header.
+
+Models are not vendored with the headers, since which one to load is the
+caller's choice. `test/models/ja-ud-gsd.mod` is upstream's MLP reference model,
+copied for the test suite together with its NOTICE (it is CC BY-SA 4.0, unlike
+this repository's MIT code).
 
 ## The two cpp-fstlib copies
 
@@ -51,7 +58,12 @@ The two paths never collide on their own -- `cpp-fstlib/fstlib.h` and
 `src/termdict.h` and `segmentlib/segmenter.h` together fails with 20
 redefinition errors.
 
-This does not constrain the adapter that will eventually use this, because the
-public header does not pull in fstlib: `<searchlib.h>` plus
-`segmentlib/segmenter.h` compiles cleanly. Only `src/termdict.h` (and the two
-`.cpp` files that include it) is off limits in the same file as segmentlib.
+This does not constrain the splitter that uses this, because the public header
+does not pull in fstlib: `<searchlib.h>` plus `segmentlib/segmenter.h` compiles
+cleanly. Only `src/termdict.h` (and the two `.cpp` files that include it) is off
+limits in the same file as segmentlib.
+
+The `searchlib-segment` target is how that stays true without relying on anyone
+remembering it: the include path reaching these headers is `PRIVATE` to a
+target holding exactly one source file, so no other translation unit can spell
+`segmentlib/...` at all, let alone alongside `termdict.h`.

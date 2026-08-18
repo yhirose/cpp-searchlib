@@ -22,6 +22,7 @@ add_executable(
   test_succinct.cc
   test_multifieldindex.cc
   test_perf.cc
+  test_segment.cc
   ../src/utils.cpp
   ../src/invertedindex.cpp
   ../src/compressedindex.cpp
@@ -33,7 +34,10 @@ add_executable(
 )
 
 target_include_directories(test-main PRIVATE ../include ../src)
-target_link_libraries(test-main PRIVATE gtest_main)
+# searchlib-segment carries the only include path to the vendored
+# cpp-segmentlib; linking it does not extend that path to the sources above,
+# which is the point (see the comment on the target).
+target_link_libraries(test-main PRIVATE gtest_main searchlib-segment)
 
 include(GoogleTest)
 gtest_discover_tests(test-main)

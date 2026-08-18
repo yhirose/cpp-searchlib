@@ -62,8 +62,10 @@ for (size_t i = 0; i < result->size(); i++) {
 | `( ... )` | Grouping |
 
 Terms are tokenized and normalized in the same way as documents, so Unicode
-terms (e.g. Japanese) work as long as the tokenizer indexed them. `NOT` is
-only valid along with at least one positive term.
+terms work as long as the tokenizer indexed them. Languages written without
+spaces (Japanese, Chinese) need a segmenting splitter on both sides to be
+searchable at all -- see [Japanese word segmentation](#japanese-word-segmentation).
+`NOT` is only valid along with at least one positive term.
 
 A trailing `*` expands against the index's dictionary at search time, so
 `app*` is equivalent to an `OR` over every indexed term starting with `app`,
@@ -250,6 +252,51 @@ auto hits = perform_multi_field_search(index, *expr);
 
 There is no query-string `field:` syntax; field selection is a C++-level
 choice. `MultiFieldIndex::save`/`load` persist every field.
+
+## Japanese word segmentation
+
+The default tokenizer cuts terms at runs of Unicode letters, which does not
+work for a language written without spaces: `私は東京タワーに行った` is one
+letter run, so it indexes as one enormous term and nothing inside it can be
+found. `load_segmenting_splitter` returns a `TextSplitter` that adds word
+boundaries inside such runs, using the vendored
+[cpp-segmentlib](https://github.com/yhirose/cpp-segmentlib):
+
+```cpp
+#include <searchlib_segment.h>
+
+// One splitter, shared by both sides. This is what keeps their term
+// boundaries identical -- using it on only one side gives an index where
+// 東京 can be found but 東京タワー cannot.
+auto splitter = load_segmenting_splitter("ja-ud-gsd.mod");
+
+// Indexing: wrap it in SplitterTokenizer, which adds the term positions.
+indexer.index_document(0, SplitterTokenizer(splitter, "私は東京タワーに行った"));
+// indexed as: 私 / は / 東京 / タワー / に / 行っ / た
+
+// Search: pass the same splitter to parse_query.
+auto expr = parse_query(splitter, nullptr, "東京タワー");
+// -> Adjacent(東京, タワー), an implicit phrase, so it matches the document
+//    above but not a document merely containing 東京 and タワー separately.
+```
+
+A query token the splitter cuts up becomes an implicit phrase, the same
+treatment `well-known` gets. Insert a space to get an `AND` instead.
+
+Only runs containing Han, Hiragana or Katakana go through the model, so text
+with no CJK in it is split byte-for-byte the way the default splitter splits
+it -- a Japanese model would otherwise shred it (`iPhone` into `i`/`Phone`).
+`Analyzer<T>` chains, prefix (`東京タワ*`) and fuzzy (`東京タワー~1`) all
+compose with it as usual.
+
+Note that switching an existing index to a different splitter requires a full
+re-index: the term boundaries change, and with them `document_term_count` and
+every BM25 score.
+
+The model file is supplied by the caller; upstream's 2.1 MB MLP reference
+model is used by the tests as `test/models/ja-ud-gsd.mod`. **It is licensed
+CC BY-SA 4.0, not MIT like this repository's code** (it derives from the
+UD_Japanese-GSD treebank) -- see `test/models/NOTICE` before redistributing it.
 
 ## CLI
 

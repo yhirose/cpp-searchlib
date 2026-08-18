@@ -225,8 +225,20 @@ std::optional<Expression> parse_query(Normalizer normalizer,
 
 std::optional<Expression> parse_query(TermFilter filter,
                                       std::string_view query) {
-  // Tokenize the raw query token with the same splitting logic as
-  // documents (index side and query side always agree on term
+  return parse_query(nullptr, std::move(filter), query);
+}
+
+std::optional<Expression> parse_query(TextSplitter splitter, TermFilter filter,
+                                      std::string_view query) {
+  // A null splitter means "the default", so the rest of this function never
+  // has to test for one. This is what makes the two shorter overloads exactly
+  // this one with utf8_plain_text_splitter().
+  if (!splitter) {
+    splitter = utf8_plain_text_splitter();
+  }
+
+  // Split the raw query token with the same splitter the documents were
+  // indexed with (index side and query side always agree on term
   // boundaries), then run each split piece through the same TermFilter
   // chain an index-side Analyzer<T> would use.
   auto term_handler = [&](std::string_view token) -> Expression {
@@ -256,13 +268,18 @@ std::optional<Expression> parse_query(TermFilter filter,
 
     // Any other placement of `*` (leading, interior, or more than one) makes
     // the whole token a wildcard pattern instead of a prefix. Handled
-    // separately from build() below, because UTF8PlainTextTokenizer treats
-    // `*` as a non-letter separator and would otherwise fragment the token
-    // into unrelated words -- the same way it fragments `well-known` -- which
+    // separately from build() below, because the splitter treats `*` as a
+    // non-letter separator and would otherwise fragment the token into
+    // unrelated words -- the same way it fragments `well-known` -- which
     // would lose the pattern structure. Each `*`-delimited piece is filtered
     // as one opaque chunk rather than re-split into its own letter runs, so a
     // wildcard segment that itself contains punctuation (`well-kno*n`) is not
     // decomposed the way a plain phrase term would be; out of scope for v1.
+    //
+    // The splitter is not applied here for the same reason: a `*`-delimited
+    // piece is a pattern fragment, not a term, and segmenting it would insert
+    // boundaries the pattern never asked for (東京タワ* must stay one prefix
+    // fragment, not become 東京 followed by a pattern starting at タワ).
     auto build_wildcard = [&]() -> Expression {
       std::u32string pattern;
       size_t start = 0;
@@ -317,8 +334,7 @@ std::optional<Expression> parse_query(TermFilter filter,
     auto build = [&]() -> Expression {
       std::vector<Expression> nodes;
       bool split_any = false;
-      UTF8PlainTextTokenizer tokenizer(token);
-      tokenizer(nullptr, [&](const auto &str, auto, auto) {
+      splitter(token, [&](const std::u32string &str, TextRange) {
         split_any = true;
         auto emitted = run_filter(str);
         if (emitted.empty()) {
