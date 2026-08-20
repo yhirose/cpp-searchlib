@@ -167,6 +167,54 @@ TEST(PerfTest, ScorerDoesNotScaleWithVocabulary) {
                         << "re-expanding the prefix per hit";
 }
 
+// Building a union used to put a Position plus two vectors on the heap for
+// every matched document, so the construction cost was dominated by
+// allocation rather than by the merge itself. Walking the finished result is
+// the natural yardstick: both are linear in the hit count, so the ratio
+// between them is flat unless per-hit allocation comes back -- at which point
+// only the construction side moves. A "10x the hits costs 10x the time" check
+// would not catch this, since per-hit allocation is itself linear.
+TEST(PerfTest, UnionConstructionCostsLittleMoreThanWalkingIt) {
+  constexpr size_t kDocuments = 5000;
+
+  InMemoryInvertedIndex<TextRange> invidx;
+  {
+    InMemoryIndexer indexer(invidx, perf_normalizer);
+    for (size_t i = 0; i < kDocuments; i++) {
+      // Both terms in every document, so the union merges two hits per
+      // document rather than passing one straight through.
+      indexer.index_document(i, UTF8PlainTextTokenizer("alpha beta gamma"));
+    }
+  }
+
+  auto expr = parse_query(perf_normalizer, "alpha | beta");
+  ASSERT_TRUE(expr);
+
+  auto result = perform_search(invidx, *expr);
+  ASSERT_EQ(kDocuments, result->size());
+
+  auto build_us = best_of(20, [&] { perform_search(invidx, *expr); });
+  auto walk_us = best_of(20, [&] {
+    size_t sink = 0;
+    for (size_t i = 0; i < result->size(); i++) {
+      sink += result->document_id(i) + result->search_hit_count(i);
+    }
+    EXPECT_GT(sink, 0u);
+  });
+
+  // Most of this ratio is the merge itself -- walking two virtual calls per
+  // hit is far cheaper than producing them -- so the bound is set from
+  // measurement rather than from first principles: 31x on the flat layout
+  // against 70x on the per-hit-allocating one it replaced, both stable to
+  // within a few percent across runs. 50x sits between them.
+  auto ratio = build_us / walk_us;
+  EXPECT_LT(ratio, 50.0) << "building a " << kDocuments
+                         << "-hit union took " << build_us
+                         << "us against " << walk_us
+                         << "us to walk it (" << ratio
+                         << "x) -- the result is allocating per hit again";
+}
+
 // The compressed backend stores its dictionary as an FST specifically so that
 // a prefix lookup descends to the matching subtree. If it ever falls back to
 // testing every term, a selective prefix costs the same as enumerating the
