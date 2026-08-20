@@ -1,7 +1,28 @@
+#include <algorithm>
+#include <chrono>
+#include <limits>
 #include <sstream>
 
 #include "unicodelib/unicodelib.h"
 #include "utils.h"
+
+// Minimum of several runs: the fastest observed run is the one least
+// polluted by scheduling noise, so it is the stablest estimator here.
+// Shared between the perf-regression tests and the benchmark harness so the
+// two always report comparable numbers -- bench/bench.cpp's cross-run
+// comparisons assume this exact estimator.
+template <typename F> double best_of(size_t runs, F f) {
+  f(); // warm up caches and any one-time allocation
+  double best = std::numeric_limits<double>::max();
+  for (size_t i = 0; i < runs; i++) {
+    auto start = std::chrono::steady_clock::now();
+    f();
+    auto end = std::chrono::steady_clock::now();
+    best = std::min(
+        best, std::chrono::duration<double, std::micro>(end - start).count());
+  }
+  return best;
+}
 
 inline bool close_enough(double expect, double actual) {
   auto tolerance = 0.001;

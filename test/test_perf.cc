@@ -22,21 +22,6 @@ namespace {
 
 auto perf_normalizer = [](auto sv) { return unicode::to_lowercase(sv); };
 
-// Minimum of several runs: the fastest observed run is the one least
-// polluted by scheduling noise, so it is the stablest estimator here.
-template <typename F> double best_of(size_t runs, F f) {
-  f(); // warm up caches and any one-time allocation
-  double best = std::numeric_limits<double>::max();
-  for (size_t i = 0; i < runs; i++) {
-    auto start = std::chrono::steady_clock::now();
-    f();
-    auto end = std::chrono::steady_clock::now();
-    best = std::min(
-        best, std::chrono::duration<double, std::micro>(end - start).count());
-  }
-  return best;
-}
-
 // `hit_count` documents contain "rareterm"; the rest are filler, so the
 // postings list being scored is the same length regardless of index size.
 InMemoryInvertedIndex<TextRange> index_with(size_t document_count,

@@ -13,10 +13,11 @@
 // much per-term work is repeated for every hit. A single end-to-end number
 // hides which of the two moved.
 //
-// Timings are the best of N runs, the same min-of-N estimator test_perf.cc
-// uses: the fastest observed run is the one least polluted by scheduling
-// noise. Absolute numbers are only comparable against other runs on the same
-// machine; what carries across machines is the ratio between two rows.
+// Timings are the best of N runs, via the same best_of estimator the
+// perf-regression tests use (shared through test/test_utils.h so the two
+// cannot drift apart). Absolute numbers are only comparable against other
+// runs on the same machine; what carries across machines is the ratio
+// between two rows.
 
 #include <searchlib.h>
 
@@ -24,11 +25,10 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
-#include <limits>
-#include <sstream>
 #include <string>
 #include <vector>
 
+#include "../test/test_utils.h"
 #include "unicodelib/unicodelib.h"
 
 using namespace searchlib;
@@ -36,29 +36,6 @@ using namespace searchlib;
 namespace {
 
 auto normalizer = [](auto sv) { return unicode::to_lowercase(sv); };
-
-std::vector<std::string> split(const std::string &input, char delimiter) {
-  std::istringstream ss(input);
-  std::string field;
-  std::vector<std::string> result;
-  while (std::getline(ss, field, delimiter)) {
-    result.push_back(field);
-  }
-  return result;
-}
-
-template <typename F> double best_of_us(size_t runs, F f) {
-  f(); // warm up caches and any one-time allocation
-  auto best = std::numeric_limits<double>::max();
-  for (size_t i = 0; i < runs; i++) {
-    auto start = std::chrono::steady_clock::now();
-    f();
-    auto end = std::chrono::steady_clock::now();
-    best = std::min(
-        best, std::chrono::duration<double, std::micro>(end - start).count());
-  }
-  return best;
-}
 
 // The KJV corpus, one document per verse (field 4 of the TSV). `repeat`
 // concatenates the whole corpus that many times under fresh document ids,
@@ -162,10 +139,10 @@ int main(int argc, char **argv) {
     const auto &expr = *parsed;
 
     auto search_us =
-        best_of_us(runs, [&] { auto r = perform_search(invidx, expr); });
+        best_of(runs, [&] { auto r = perform_search(invidx, expr); });
 
     auto result = perform_search(invidx, expr);
-    auto score_us = best_of_us(runs, [&] {
+    auto score_us = best_of(runs, [&] {
       double total = 0.0;
       for (size_t i = 0; i < result->size(); i++) {
         total += bm25_score(invidx, expr, *result, i);
@@ -178,7 +155,7 @@ int main(int argc, char **argv) {
 
     // The same scoring work through BM25Scorer, construction included, so
     // the column is a fair swap for score_us rather than a best case.
-    auto scorer_us = best_of_us(runs, [&] {
+    auto scorer_us = best_of(runs, [&] {
       BM25Scorer scorer(invidx, expr);
       double total = 0.0;
       for (size_t i = 0; i < result->size(); i++) {
@@ -191,7 +168,7 @@ int main(int argc, char **argv) {
 
     // Search and rank together: the number a caller actually pays, and the
     // one directly comparable to another engine's top-k latency.
-    auto top10_us = best_of_us(runs, [&] {
+    auto top10_us = best_of(runs, [&] {
       auto r = perform_search(invidx, expr);
       BM25Scorer scorer(invidx, expr);
       auto hits =
