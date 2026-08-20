@@ -391,7 +391,10 @@ static void merge_term_positions(
     // TODO: improve performance by reducing slots
     for (auto slot : slots) {
       auto index = cursors[slot];
-      auto p = positings_list[slot];
+      // By reference: copying the shared_ptr here costs an atomic increment
+      // and decrement, and this runs once per slot for every position
+      // emitted -- the innermost loop of a union.
+      const auto &p = positings_list[slot];
       auto hit_index = search_hit_cursors[slot];
 
       if (hit_index < p->search_hit_count(index)) {
