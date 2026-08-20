@@ -159,13 +159,17 @@ min_slots(const std::vector<std::shared_ptr<IPostings>> &positings_list,
   slots.clear();
   slots.push_back(0);
 
+  // The running minimum only changes when a smaller id resets `slots`, so it
+  // lives in a local instead of being re-read through the virtual interface
+  // on every iteration (this runs once per output document of every union).
+  auto prev = positings_list[0]->document_id(cursors[0]);
   for (size_t slot = 1; slot < positings_list.size(); slot++) {
-    auto prev = positings_list[slots[0]]->document_id(cursors[slots[0]]);
     auto curr = positings_list[slot]->document_id(cursors[slot]);
 
     if (curr < prev) {
       slots.clear();
       slots.push_back(slot);
+      prev = curr;
     } else if (curr == prev) {
       slots.push_back(slot);
     }
@@ -190,6 +194,44 @@ min_max_slots(const std::vector<std::shared_ptr<IPostings>> &positings_list,
   return std::make_pair(min, max);
 }
 
+// First index in [low, high) whose document_id is >= document_id.
+static size_t lower_bound_document_id(const IPostings &postings, size_t low,
+                                      size_t high, size_t document_id) {
+  while (low < high) {
+    auto mid = low + (high - low) / 2;
+    if (postings.document_id(mid) < document_id) {
+      low = mid + 1;
+    } else {
+      high = mid;
+    }
+  }
+  return low;
+}
+
+// First index in (cursor, size] whose document_id is >= document_id, found by
+// galloping forward from cursor: O(log gap) accesses instead of a linear
+// scan's O(gap), which pays off when an AND operand skips far ahead, and
+// instead of a plain binary search's O(log size), which the scorer's
+// step-or-two advances would not amortize. A separate skip-list structure is
+// unnecessary because document_id(index) is O(1) random access. Requires
+// postings.document_id(cursor) < document_id.
+static size_t gallop_lower_bound(const IPostings &postings, size_t cursor,
+                                 size_t size, size_t document_id) {
+  size_t step = 1;
+  auto low = cursor + 1; // document_id(cursor) is known to be < target
+  auto high = cursor + step;
+  while (high < size && postings.document_id(high) < document_id) {
+    low = high + 1;
+    step *= 2;
+    high = cursor + step;
+  }
+  if (high > size) {
+    high = size;
+  }
+  // `high` itself is either a known match or `size`.
+  return lower_bound_document_id(postings, low, high, document_id);
+}
+
 static bool
 skip_cursors(const std::vector<std::shared_ptr<IPostings>> &positings_list,
              std::vector<size_t> &cursors, size_t document_id) {
@@ -198,34 +240,8 @@ skip_cursors(const std::vector<std::shared_ptr<IPostings>> &positings_list,
     auto &cursor = cursors[slot];
     auto size = postings.size();
 
-    // Exponential (galloping) search for the first entry whose document_id
-    // is >= document_id: O(log gap) accesses instead of the former linear
-    // scan's O(gap), which pays off when an AND operand skips far ahead.
-    // A separate skip-list structure is unnecessary because
-    // document_id(index) is O(1) random access.
     if (cursor < size && postings.document_id(cursor) < document_id) {
-      size_t step = 1;
-      auto low = cursor + 1; // document_id(cursor) is known to be < target
-      auto high = cursor + step;
-      while (high < size && postings.document_id(high) < document_id) {
-        low = high + 1;
-        step *= 2;
-        high = cursor + step;
-      }
-      if (high > size) {
-        high = size;
-      }
-      // Binary search within [low, high) for the first match; `high` itself
-      // is either a known match or `size`.
-      while (low < high) {
-        auto mid = low + (high - low) / 2;
-        if (postings.document_id(mid) < document_id) {
-          low = mid + 1;
-        } else {
-          high = mid;
-        }
-      }
-      cursor = low;
+      cursor = gallop_lower_bound(postings, cursor, size, document_id);
     }
 
     if (cursor == size) {
@@ -566,11 +582,16 @@ static std::shared_ptr<IPostings>
 perform_near_operation(const IInvertedIndex &inverted_index,
                        const Expression &expr,
                        const IScopeIndex *scope_index) {
+  // Reused across candidate documents (assign() below), same as the And
+  // path's scratch buffers: the callback runs once per document where all
+  // cursors align, and this was its one remaining per-document allocation.
+  std::vector<size_t> search_hit_cursors;
+
   return intersect_postings(
       positings_list(inverted_index, expr.nodes, scope_index),
       [&](const auto &positings_list, const auto &cursors, size_t &document_id,
           auto &term_positions, auto &term_lengths) {
-        std::vector<size_t> search_hit_cursors(positings_list.size(), 0);
+        search_hit_cursors.assign(positings_list.size(), 0);
 
         auto done = false;
         while (!done) {
@@ -657,6 +678,9 @@ perform_same_scope_operation(const IInvertedIndex &inverted_index,
     return std::make_shared<SearchResult>();
   }
 
+  // Reused across candidate documents; see perform_near_operation.
+  std::vector<size_t> search_hit_cursors;
+
   return intersect_postings(
       positings_list(inverted_index, expr.nodes, scope_index),
       [&](const auto &positings_list, const auto &cursors, size_t &document_id,
@@ -666,7 +690,7 @@ perform_same_scope_operation(const IInvertedIndex &inverted_index,
           return false;
         }
 
-        std::vector<size_t> search_hit_cursors(positings_list.size(), 0);
+        search_hit_cursors.assign(positings_list.size(), 0);
 
         auto done = false;
         while (!done) {
@@ -919,34 +943,21 @@ double bm25_score(const IInvertedIndex &invidx, const Expression &expr,
 
 namespace {
 
-// First index in [low, high) whose document_id is >= document_id.
-size_t lower_bound_document_id(const IPostings &postings, size_t low,
-                               size_t high, size_t document_id) {
-  while (low < high) {
-    auto mid = low + (high - low) / 2;
-    if (postings.document_id(mid) < document_id) {
-      low = mid + 1;
-    } else {
-      high = mid;
-    }
-  }
-  return low;
-}
-
 // find_postings_index_for_document_id_, but resuming from where the previous
 // lookup landed. Scoring walks documents in ascending id order, so the answer
-// is usually at or just past the cursor.
+// is usually at or just past the cursor. `size` is the term's postings size,
+// resolved once at scorer construction rather than re-fetched through the
+// virtual interface on every lookup of every hit.
 //
 // Both `cursor` and `last_document_id` are updated so that the invariant
 // "cursor is the first entry whose document id is >= last_document_id" holds
 // on entry and on exit. That invariant carries the whole optimization: when
 // the walk is moving forward, everything before the cursor is already known
 // to be below the target, so a cursor sitting past the target proves the
-// document is absent without any search at all. Returns postings.size() when
-// the document is absent.
-size_t find_from_cursor(const IPostings &postings, size_t &cursor,
+// document is absent without any search at all. Returns `size` when the
+// document is absent.
+size_t find_from_cursor(const IPostings &postings, size_t size, size_t &cursor,
                         size_t &last_document_id, size_t document_id) {
-  auto size = postings.size();
   if (size == 0) {
     return 0;
   }
@@ -960,19 +971,7 @@ size_t find_from_cursor(const IPostings &postings, size_t &cursor,
     auto high = std::min(cursor + 1, size);
     cursor = lower_bound_document_id(postings, 0, high, document_id);
   } else if (cursor < size && postings.document_id(cursor) < document_id) {
-    // Same exponential-then-binary shape as skip_cursors above.
-    size_t step = 1;
-    auto low = cursor + 1; // document_id(cursor) is known to be < target
-    auto high = cursor + step;
-    while (high < size && postings.document_id(high) < document_id) {
-      low = high + 1;
-      step *= 2;
-      high = cursor + step;
-    }
-    if (high > size) {
-      high = size;
-    }
-    cursor = lower_bound_document_id(postings, low, high, document_id);
+    cursor = gallop_lower_bound(postings, cursor, size, document_id);
   }
   // Otherwise the cursor is already the lower bound for this document: it
   // either sits on it, or sits past it (absent), or the list is exhausted.
@@ -986,15 +985,20 @@ size_t find_from_cursor(const IPostings &postings, size_t &cursor,
 
 BM25Scorer::BM25Scorer(const IInvertedIndex &invidx, const Expression &expr,
                        double k1, double b)
-    : invidx_(invidx), N_(static_cast<double>(invidx.document_count())),
-      avgdl_(invidx.average_document_term_count()), k1_(k1), b_(b) {
+    : invidx_(invidx), avgdl_(invidx.average_document_term_count()), k1_(k1),
+      b_(b) {
+  // A constructor local, not a member: idf bakes the document count into each
+  // term up front, so nothing per-hit ever needs N again.
+  auto N = static_cast<double>(invidx.document_count());
   // The one dictionary walk. enumerate_terms expands Prefix/Wildcard/Fuzzy
   // nodes, which is exactly the work bm25_score repeats for every hit.
   enumerate_terms(invidx, expr, [&](const auto &term) {
     auto postings = invidx.postings(term);
-    auto n = static_cast<double>(postings->size());
-    terms_.push_back(TermState{
-        std::move(postings), std::log2((N_ - n + 0.5) / (n + 0.5)), 0, 0});
+    auto size = postings->size();
+    auto n = static_cast<double>(size);
+    terms_.push_back(TermState{std::move(postings),
+                               std::log2((N - n + 0.5) / (n + 0.5)), size, 0,
+                               0});
   });
 }
 
@@ -1009,9 +1013,9 @@ double BM25Scorer::operator()(const IPostings &postings, size_t index) const {
     // than being skipped, so that a degenerate index (avgdl == 0, making
     // norm NaN) produces the same value bm25_score would.
     double tf = 0.0;
-    auto i = find_from_cursor(*term.postings, term.cursor,
+    auto i = find_from_cursor(*term.postings, term.size, term.cursor,
                               term.last_document_id, document_id);
-    if (i < term.postings->size()) {
+    if (i < term.size) {
       tf = static_cast<double>(term.postings->search_hit_count(i)) / dl;
     }
     score += term.idf * ((tf * (k1_ + 1.0)) / (tf + norm));

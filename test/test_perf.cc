@@ -71,6 +71,16 @@ double score_all_hits(const IInvertedIndex &invidx, const Expression &expr,
   return total;
 }
 
+// The same loop through a prepared scorer, for the tests that pin
+// BM25Scorer's own cost model.
+double score_all_hits(const BM25Scorer &scorer, const IPostings &result) {
+  double total = 0.0;
+  for (size_t i = 0; i < result.size(); i++) {
+    total += scorer(result, i);
+  }
+  return total;
+}
+
 } // namespace
 
 // Scoring a fixed number of hits must not get more expensive just because the
@@ -147,16 +157,10 @@ TEST(PerfTest, ScorerDoesNotScaleWithVocabulary) {
   BM25Scorer small_scorer(small, *expr);
   BM25Scorer large_scorer(large, *expr);
 
-  auto score_all = [](const BM25Scorer &scorer, const IPostings &result) {
-    double total = 0.0;
-    for (size_t i = 0; i < result.size(); i++) {
-      total += scorer(result, i);
-    }
-    return total;
-  };
-
-  auto small_us = best_of(20, [&] { score_all(small_scorer, *small_result); });
-  auto large_us = best_of(20, [&] { score_all(large_scorer, *large_result); });
+  auto small_us =
+      best_of(20, [&] { score_all_hits(small_scorer, *small_result); });
+  auto large_us =
+      best_of(20, [&] { score_all_hits(large_scorer, *large_result); });
 
   // The dictionary is 10x bigger, so a per-hit expansion shows up as roughly
   // 10x. Anything under 2x means the cost is not tracking the vocabulary.
@@ -202,14 +206,6 @@ TEST(PerfTest, ScoringAnOrDoesNotSearchForAbsentTerms) {
   ASSERT_EQ(kHits, or_result->size());
   ASSERT_EQ(kHits - kHits / 10, single_result->size());
 
-  auto score_all = [](const BM25Scorer &scorer, const IPostings &result) {
-    double total = 0.0;
-    for (size_t i = 0; i < result.size(); i++) {
-      total += scorer(result, i);
-    }
-    return total;
-  };
-
   // Built inside the timed region, unlike the vocabulary test above. A
   // scorer's cursors are left at the end of a full pass, so reusing one
   // across runs would start every run but the first with a backwards walk
@@ -217,11 +213,11 @@ TEST(PerfTest, ScoringAnOrDoesNotSearchForAbsentTerms) {
   // Construction here is two postings lookups and two logarithms.
   auto or_us = best_of(20, [&] {
     BM25Scorer scorer(invidx, *or_expr);
-    score_all(scorer, *or_result);
+    score_all_hits(scorer, *or_result);
   });
   auto single_us = best_of(20, [&] {
     BM25Scorer scorer(invidx, *single_expr);
-    score_all(scorer, *single_result);
+    score_all_hits(scorer, *single_result);
   });
 
   // The Or scores 10/9 as many hits and consults two terms per hit instead

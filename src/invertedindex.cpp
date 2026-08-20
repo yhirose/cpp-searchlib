@@ -163,6 +163,9 @@ void InMemoryInvertedIndexBase::Postings::save_compressed(
   document_ids.reserve(document_ids_.size());
   end_offsets.reserve(document_ids_.size());
   bases.reserve(document_ids_.size());
+  // One entry per element of the position arena, whose length the flat
+  // layout has on hand -- and this is the largest of the four vectors.
+  monotonized_positions.reserve(positions_.size());
   uint64_t total_positions = 0;
   uint64_t base = 0;
   for (size_t i = 0; i < document_ids_.size(); i++) {
@@ -205,6 +208,9 @@ void InMemoryInvertedIndexBase::Postings::load_compressed(std::istream &is) {
   positions_.clear();
   document_ids_.reserve(document_ids.size());
   offsets_.reserve(document_ids.size() + 1);
+  // The corrupt-check above pinned monotonized_positions.size() to the total
+  // position count, which is exactly what the decode loop pushes.
+  positions_.reserve(monotonized_positions.size());
   uint64_t begin = 0;
   for (size_t i = 0; i < document_ids.size(); i++) {
     auto end = end_offsets.access(i);

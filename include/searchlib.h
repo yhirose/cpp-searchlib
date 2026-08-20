@@ -477,6 +477,10 @@ private:
   struct TermState {
     std::shared_ptr<const IPostings> postings;
     double idf;
+    // postings->size(), resolved once here: the scorer's contract already
+    // pins the postings for its lifetime, and re-fetching the size through
+    // the virtual interface would otherwise happen once per term per hit.
+    size_t size;
     // Where the last lookup landed in this term's postings, and what it was
     // looking for. Callers walk a result in ascending index order (that is
     // what top_k does) and results are ordered by document id, so the next
@@ -494,7 +498,6 @@ private:
 
   const IInvertedIndex &invidx_;
   std::vector<TermState> terms_;
-  double N_;
   double avgdl_;
   double k1_;
   double b_;

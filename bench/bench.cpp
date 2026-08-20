@@ -86,8 +86,12 @@ std::vector<std::string> read_corpus(const std::string &path, size_t repeat) {
   if (repeat > 1) {
     auto original = texts.size();
     texts.reserve(original * repeat);
+    // Element-wise on purpose: insert()'s preconditions forbid a source
+    // range inside the destination, and push_back is self-reference-safe.
     for (size_t r = 1; r < repeat; r++) {
-      texts.insert(texts.end(), texts.begin(), texts.begin() + original);
+      for (size_t i = 0; i < original; i++) {
+        texts.push_back(texts[i]);
+      }
     }
   }
   return texts;
