@@ -161,11 +161,40 @@ TEST(KJVTest, BM25ScorerMatchesBM25Score) {
     auto postings = perform_search(invidx, *expr);
     ASSERT_TRUE(postings) << query;
 
-    BM25Scorer scorer(invidx, *expr);
-    for (size_t i = 0; i < postings->size(); i++) {
-      EXPECT_DOUBLE_EQ(bm25_score(invidx, *expr, *postings, i),
-                       scorer(*postings, i))
-          << "query " << query << ", hit " << i;
+    // Ascending, the order top_k walks a result in, and the one the scorer's
+    // per-term cursor is optimized for.
+    {
+      BM25Scorer scorer(invidx, *expr);
+      for (size_t i = 0; i < postings->size(); i++) {
+        EXPECT_DOUBLE_EQ(bm25_score(invidx, *expr, *postings, i),
+                         scorer(*postings, i))
+            << "query " << query << ", ascending, hit " << i;
+      }
+    }
+
+    // Descending, which drives every lookup down the cursor's backwards
+    // fallback. Galloping forward from a cursor already past the target
+    // would silently score those hits as misses.
+    {
+      BM25Scorer scorer(invidx, *expr);
+      for (size_t i = postings->size(); i > 0; i--) {
+        EXPECT_DOUBLE_EQ(bm25_score(invidx, *expr, *postings, i - 1),
+                         scorer(*postings, i - 1))
+            << "query " << query << ", descending, hit " << (i - 1);
+      }
+    }
+
+    // And an order that jumps around, alternating the two directions so the
+    // cursor is left both ahead of and behind the next target.
+    {
+      BM25Scorer scorer(invidx, *expr);
+      auto count = postings->size();
+      for (size_t step = 0; step < count; step++) {
+        auto i = (step % 2 == 0) ? step / 2 : count - 1 - step / 2;
+        EXPECT_DOUBLE_EQ(bm25_score(invidx, *expr, *postings, i),
+                         scorer(*postings, i))
+            << "query " << query << ", zigzag, hit " << i;
+      }
     }
   }
 }

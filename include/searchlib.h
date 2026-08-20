@@ -477,6 +477,12 @@ private:
   struct TermState {
     std::shared_ptr<const IPostings> postings;
     double idf;
+    // Where the last hit was found in this term's postings. Callers walk a
+    // result in ascending index order (that is what top_k does) and results
+    // are ordered by document id, so the next lookup almost always resumes
+    // just after this one instead of searching the list again. Scoring out
+    // of order stays correct, just without the shortcut.
+    mutable size_t cursor;
   };
 
   const IInvertedIndex &invidx_;

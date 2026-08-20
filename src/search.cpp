@@ -15,11 +15,6 @@
 
 namespace searchlib {
 
-// Defined in invertedindex.cpp; shared here because BM25Scorer locates a
-// document inside a term's postings the same way tf() does.
-size_t find_postings_index_for_document_id_(const IPostings &p,
-                                            size_t document_id);
-
 class TermSearchResult : public IPostings {
 public:
   TermSearchResult(const IInvertedIndex &inverted_index,
@@ -946,6 +941,65 @@ double bm25_score(const IInvertedIndex &invidx, const Expression &expr,
 
 //-----------------------------------------------------------------------------
 
+namespace {
+
+// First index in [low, high) whose document_id is >= document_id.
+size_t lower_bound_document_id(const IPostings &postings, size_t low,
+                               size_t high, size_t document_id) {
+  while (low < high) {
+    auto mid = low + (high - low) / 2;
+    if (postings.document_id(mid) < document_id) {
+      low = mid + 1;
+    } else {
+      high = mid;
+    }
+  }
+  return low;
+}
+
+// find_postings_index_for_document_id_, but resuming from where the previous
+// lookup landed. Scoring walks documents in ascending id order, so the answer
+// is usually a step or two past the cursor and the galloping branch settles
+// in O(log gap) instead of O(log size).
+//
+// `cursor` is left on the first entry >= document_id (not on the match), so
+// that the next call in an ascending walk resumes correctly whether or not
+// this one hit. Returns postings.size() when the document is absent.
+size_t find_from_cursor(const IPostings &postings, size_t &cursor,
+                        size_t document_id) {
+  auto size = postings.size();
+  if (size == 0) {
+    return 0;
+  }
+
+  if (cursor >= size || postings.document_id(cursor) > document_id) {
+    // The target is at or before the cursor -- an exhausted cursor, or a
+    // caller scoring hits out of ascending order. Searching the prefix
+    // keeps that case correct; galloping forward would never find it.
+    auto high = cursor < size ? cursor + 1 : size;
+    cursor = lower_bound_document_id(postings, 0, high, document_id);
+  } else if (postings.document_id(cursor) < document_id) {
+    // Same exponential-then-binary shape as skip_cursors above.
+    size_t step = 1;
+    auto low = cursor + 1; // document_id(cursor) is known to be < target
+    auto high = cursor + step;
+    while (high < size && postings.document_id(high) < document_id) {
+      low = high + 1;
+      step *= 2;
+      high = cursor + step;
+    }
+    if (high > size) {
+      high = size;
+    }
+    cursor = lower_bound_document_id(postings, low, high, document_id);
+  }
+
+  return (cursor < size && postings.document_id(cursor) == document_id) ? cursor
+                                                                       : size;
+}
+
+} // namespace
+
 BM25Scorer::BM25Scorer(const IInvertedIndex &invidx, const Expression &expr,
                        double k1, double b)
     : invidx_(invidx), N_(static_cast<double>(invidx.document_count())),
@@ -955,8 +1009,8 @@ BM25Scorer::BM25Scorer(const IInvertedIndex &invidx, const Expression &expr,
   enumerate_terms(invidx, expr, [&](const auto &term) {
     auto postings = invidx.postings(term);
     auto n = static_cast<double>(postings->size());
-    terms_.push_back(
-        TermState{std::move(postings), std::log2((N_ - n + 0.5) / (n + 0.5))});
+    terms_.push_back(TermState{
+        std::move(postings), std::log2((N_ - n + 0.5) / (n + 0.5)), 0});
   });
 }
 
@@ -971,7 +1025,7 @@ double BM25Scorer::operator()(const IPostings &postings, size_t index) const {
     // than being skipped, so that a degenerate index (avgdl == 0, making
     // norm NaN) produces the same value bm25_score would.
     double tf = 0.0;
-    auto i = find_postings_index_for_document_id_(*term.postings, document_id);
+    auto i = find_from_cursor(*term.postings, term.cursor, document_id);
     if (i < term.postings->size()) {
       tf = static_cast<double>(term.postings->search_hit_count(i)) / dl;
     }
