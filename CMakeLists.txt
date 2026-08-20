@@ -29,6 +29,7 @@ target_include_directories(searchlib-segment PRIVATE include src)
 target_include_directories(searchlib-segment SYSTEM PRIVATE third_party)
 
 add_subdirectory(cli)
+add_subdirectory(bench)
 add_subdirectory(test)
 
 enable_testing()

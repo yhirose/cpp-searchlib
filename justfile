@@ -22,6 +22,14 @@ test: build
 test-only pattern: build
     cd {{build_dir}}/test && ./test-main --gtest_filter="*{{pattern}}*"
 
+# Run the query benchmark. `repeat` concatenates the KJV corpus that many
+# times under fresh document ids, lengthening every postings list without
+# growing the vocabulary; 10 is the scale the optimization work was measured
+# at. cd into build/bench first: the corpus path is relative to the binary's
+# own directory, same as the tests (see bench/bench.cpp).
+bench repeat="10": build
+    cd {{build_dir}}/bench && ./searchlib-bench --repeat {{repeat}}
+
 # Update vendored third-party code (third_party/, see its README). With no
 # argument, checks and updates fstlib, unicodelib, peglib and segmentlib in
 # turn; pass one of those names to update just it. Never commits -- review
