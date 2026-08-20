@@ -358,79 +358,46 @@ static std::shared_ptr<IPostings> intersect_postings(
   return result;
 }
 
-// One slot's front: how many hits it has left, which one it is on, and the
-// position/length pair sitting there.
-struct MergeFront {
-  size_t remaining;
-  size_t consumed;
-  size_t position;
-  size_t length;
-};
-
-// Merges the slots' term positions for one document into term_positions and
-// term_lengths, ascending.
-//
-// `fronts` is caller-owned scratch that must already hold at least
-// slots.size() entries; merge_term_positions never resizes it. That is the
-// contract and not an accident: a document here carries only one or two
-// positions, so per-document vector housekeeping costs more than the virtual
-// calls it would save. Both callers size it once from their operand count,
-// which slots.size() can never exceed.
 static void merge_term_positions(
     const std::vector<std::shared_ptr<IPostings>> &positings_list,
     const std::vector<size_t> &cursors, const std::vector<size_t> &slots,
     std::vector<size_t> &term_positions, std::vector<size_t> &term_lengths,
-    std::vector<MergeFront> &fronts) {
-  auto slot_count = slots.size();
+    std::vector<size_t> &search_hit_cursors) {
+  search_hit_cursors.assign(positings_list.size(), 0);
 
-  // Load each front once. search_hit_count is fixed for the whole merge --
-  // cursors does not move here -- and a slot's position/length only change
-  // when that slot is the one that advances, so re-reading either through
-  // the virtual interface on every pass was pure repetition.
-  for (size_t i = 0; i < slot_count; i++) {
-    const auto &p = positings_list[slots[i]];
-    auto index = cursors[slots[i]];
-    auto &front = fronts[i];
-    front.remaining = p->search_hit_count(index);
-    front.consumed = 0;
-    if (front.remaining > 0) {
-      front.position = p->term_position(index, 0);
-      front.length = p->term_length(index, 0);
-    }
-  }
-
-  // Ascending by position, ties to the earliest slot -- the strict `<`
-  // against a SIZE_MAX sentinel is what decides that, and is unchanged.
   while (true) {
-    size_t min_i = -1;
+    size_t min_slot = -1;
     size_t min_term_pos = -1;
     size_t min_term_length = -1;
 
-    for (size_t i = 0; i < slot_count; i++) {
-      const auto &front = fronts[i];
-      if (front.remaining > 0 && front.position < min_term_pos) {
-        min_i = i;
-        min_term_pos = front.position;
-        min_term_length = front.length;
+    // TODO: improve performance by reducing slots
+    for (auto slot : slots) {
+      auto index = cursors[slot];
+      // By reference: copying the shared_ptr here costs an atomic increment
+      // and decrement, and this runs once per slot for every position
+      // emitted -- the innermost loop of a union.
+      const auto &p = positings_list[slot];
+      auto hit_index = search_hit_cursors[slot];
+
+      if (hit_index < p->search_hit_count(index)) {
+        auto term_pos = p->term_position(index, hit_index);
+        auto term_length = p->term_length(index, hit_index);
+
+        if (term_pos < min_term_pos) {
+          min_slot = slot;
+          min_term_pos = term_pos;
+          min_term_length = term_length;
+        }
       }
     }
 
-    if (min_i == static_cast<size_t>(-1)) {
+    if (min_slot == -1) {
       break;
     }
 
     term_positions.push_back(min_term_pos);
     term_lengths.push_back(min_term_length);
-
-    // Only the winning slot moves, so only its front is refetched.
-    auto &front = fronts[min_i];
-    front.consumed++;
-    if (--front.remaining > 0) {
-      const auto &p = positings_list[slots[min_i]];
-      auto index = cursors[slots[min_i]];
-      front.position = p->term_position(index, front.consumed);
-      front.length = p->term_length(index, front.consumed);
-    }
+    search_hit_cursors[min_slot]++;
   }
 }
 
@@ -448,13 +415,13 @@ union_postings(std::vector<std::shared_ptr<IPostings>> &&positings_list) {
   std::vector<size_t> slots;
   std::vector<size_t> term_positions;
   std::vector<size_t> term_lengths;
-  std::vector<MergeFront> fronts(positings_list.size());
+  std::vector<size_t> search_hit_cursors;
 
   while (!positings_list.empty()) {
     min_slots(positings_list, cursors, slots);
 
     merge_term_positions(positings_list, cursors, slots, term_positions,
-                         term_lengths, fronts);
+                         term_lengths, search_hit_cursors);
 
     result->push_back(positings_list[slots[0]]->document_id(cursors[slots[0]]),
                       term_positions, term_lengths);
@@ -509,7 +476,7 @@ perform_and_operation(const IInvertedIndex &inverted_index,
   // rebuilt (and reallocated) per document.
   std::vector<size_t> all_slots(positive_nodes.size());
   std::iota(all_slots.begin(), all_slots.end(), 0);
-  std::vector<MergeFront> fronts(positive_nodes.size());
+  std::vector<size_t> search_hit_cursors;
 
   return intersect_postings(
       positings_list(inverted_index, positive_nodes, scope_index),
@@ -531,7 +498,7 @@ perform_and_operation(const IInvertedIndex &inverted_index,
         }
 
         merge_term_positions(positings_list, cursors, all_slots,
-                             term_positions, term_lengths, fronts);
+                             term_positions, term_lengths, search_hit_cursors);
         return true;
       });
 }
