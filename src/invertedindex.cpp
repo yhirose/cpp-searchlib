@@ -48,21 +48,21 @@ public:
 //-----------------------------------------------------------------------------
 
 size_t InMemoryInvertedIndexBase::Postings::size() const {
-  return positions_.size();
+  return document_ids_.size();
 }
 
 size_t InMemoryInvertedIndexBase::Postings::document_id(size_t index) const {
-  return positions_[index].first;
+  return document_ids_[index];
 }
 
 size_t
 InMemoryInvertedIndexBase::Postings::search_hit_count(size_t index) const {
-  return positions_[index].second.size();
+  return offsets_[index + 1] - offsets_[index];
 }
 
 size_t InMemoryInvertedIndexBase::Postings::term_position(
     size_t index, size_t search_hit_index) const {
-  return positions_[index].second[search_hit_index];
+  return positions_[offsets_[index] + search_hit_index];
 }
 
 size_t InMemoryInvertedIndexBase::Postings::term_length(
@@ -72,46 +72,76 @@ size_t InMemoryInvertedIndexBase::Postings::term_length(
 
 bool InMemoryInvertedIndexBase::Postings::is_term_position(
     size_t index, size_t term_pos) const {
-  const auto &positions = positions_[index].second;
-  return std::binary_search(positions.begin(), positions.end(), term_pos);
+  return std::binary_search(positions_.begin() + offsets_[index],
+                            positions_.begin() + offsets_[index + 1], term_pos);
 }
 
 void InMemoryInvertedIndexBase::Postings::add_term_position(size_t document_id,
                                                             size_t term_pos) {
-  auto it = std::lower_bound(
-      positions_.begin(), positions_.end(), document_id,
-      [](const auto &entry, size_t doc_id) { return entry.first < doc_id; });
-  if (it != positions_.end() && it->first == document_id) {
-    it->second.push_back(term_pos);
+  // Indexing walks documents in ascending id order and emits each document's
+  // positions in ascending order, so these two appends are the hot path and
+  // both are O(1) amortized. The general insert below only runs for a caller
+  // that indexes out of order, or re-indexes a document already present.
+  if (!document_ids_.empty() && document_ids_.back() == document_id) {
+    positions_.push_back(term_pos);
+    offsets_.back() = positions_.size();
+    return;
+  }
+  if (document_ids_.empty() || document_ids_.back() < document_id) {
+    document_ids_.push_back(document_id);
+    positions_.push_back(term_pos);
+    offsets_.push_back(positions_.size());
+    return;
+  }
+
+  auto it =
+      std::lower_bound(document_ids_.begin(), document_ids_.end(), document_id);
+  auto index = static_cast<size_t>(it - document_ids_.begin());
+
+  if (it != document_ids_.end() && *it == document_id) {
+    // Append to this document's slice, as pushing onto its own vector used
+    // to, and shift the slices after it along.
+    positions_.insert(positions_.begin() + offsets_[index + 1], term_pos);
+    for (auto i = index + 1; i < offsets_.size(); i++) {
+      offsets_[i]++;
+    }
   } else {
-    positions_.insert(it, Entry{document_id, {term_pos}});
+    document_ids_.insert(it, document_id);
+    positions_.insert(positions_.begin() + offsets_[index], term_pos);
+    offsets_.insert(offsets_.begin() + index + 1, offsets_[index] + 1);
+    for (auto i = index + 2; i < offsets_.size(); i++) {
+      offsets_[i]++;
+    }
   }
 }
 
 void InMemoryInvertedIndexBase::Postings::save(std::ostream &os) const {
-  detail::write_scalar<uint64_t>(os, positions_.size());
-  for (const auto &[document_id, positions] : positions_) {
-    detail::write_scalar<uint64_t>(os, document_id);
-    detail::write_scalar<uint64_t>(os, positions.size());
-    for (auto position : positions) {
-      detail::write_scalar<uint64_t>(os, position);
+  detail::write_scalar<uint64_t>(os, document_ids_.size());
+  for (size_t i = 0; i < document_ids_.size(); i++) {
+    detail::write_scalar<uint64_t>(os, document_ids_[i]);
+    detail::write_scalar<uint64_t>(os, offsets_[i + 1] - offsets_[i]);
+    for (auto j = offsets_[i]; j < offsets_[i + 1]; j++) {
+      detail::write_scalar<uint64_t>(os, positions_[j]);
     }
   }
 }
 
 void InMemoryInvertedIndexBase::Postings::load(std::istream &is) {
   auto entry_count = detail::read_scalar<uint64_t>(is);
+  document_ids_.clear();
+  offsets_.assign(1, 0);
   positions_.clear();
-  positions_.reserve(static_cast<size_t>(entry_count));
+  document_ids_.reserve(static_cast<size_t>(entry_count));
+  offsets_.reserve(static_cast<size_t>(entry_count) + 1);
   for (uint64_t i = 0; i < entry_count; i++) {
-    auto document_id = static_cast<size_t>(detail::read_scalar<uint64_t>(is));
+    document_ids_.push_back(
+        static_cast<size_t>(detail::read_scalar<uint64_t>(is)));
     auto position_count = detail::read_scalar<uint64_t>(is);
-    std::vector<size_t> positions;
-    positions.reserve(static_cast<size_t>(position_count));
     for (uint64_t j = 0; j < position_count; j++) {
-      positions.push_back(static_cast<size_t>(detail::read_scalar<uint64_t>(is)));
+      positions_.push_back(
+          static_cast<size_t>(detail::read_scalar<uint64_t>(is)));
     }
-    positions_.emplace_back(document_id, std::move(positions));
+    offsets_.push_back(positions_.size());
   }
 }
 
@@ -130,18 +160,18 @@ void InMemoryInvertedIndexBase::Postings::save_compressed(
   std::vector<uint64_t> end_offsets;
   std::vector<uint64_t> bases;
   std::vector<uint64_t> monotonized_positions;
-  document_ids.reserve(positions_.size());
-  end_offsets.reserve(positions_.size());
-  bases.reserve(positions_.size());
+  document_ids.reserve(document_ids_.size());
+  end_offsets.reserve(document_ids_.size());
+  bases.reserve(document_ids_.size());
   uint64_t total_positions = 0;
   uint64_t base = 0;
-  for (const auto &[document_id, positions] : positions_) {
-    document_ids.push_back(document_id);
-    total_positions += positions.size();
+  for (size_t i = 0; i < document_ids_.size(); i++) {
+    document_ids.push_back(document_ids_[i]);
+    total_positions += offsets_[i + 1] - offsets_[i];
     end_offsets.push_back(total_positions);
     bases.push_back(base);
-    for (auto position : positions) {
-      monotonized_positions.push_back(base + position);
+    for (auto j = offsets_[i]; j < offsets_[i + 1]; j++) {
+      monotonized_positions.push_back(base + positions_[j]);
     }
     base = monotonized_positions.back() + 1;
   }
@@ -170,8 +200,11 @@ void InMemoryInvertedIndexBase::Postings::load_compressed(std::istream &is) {
     throw std::runtime_error("searchlib: corrupt compressed postings");
   }
 
+  document_ids_.clear();
+  offsets_.assign(1, 0);
   positions_.clear();
-  positions_.reserve(document_ids.size());
+  document_ids_.reserve(document_ids.size());
+  offsets_.reserve(document_ids.size() + 1);
   uint64_t begin = 0;
   for (size_t i = 0; i < document_ids.size(); i++) {
     auto end = end_offsets.access(i);
@@ -179,17 +212,15 @@ void InMemoryInvertedIndexBase::Postings::load_compressed(std::istream &is) {
     if (end < begin) {
       throw std::runtime_error("searchlib: corrupt compressed postings");
     }
-    std::vector<size_t> positions;
-    positions.reserve(static_cast<size_t>(end - begin));
     for (auto j = begin; j < end; j++) {
       auto value = monotonized_positions.access(static_cast<size_t>(j));
       if (value < base) {
         throw std::runtime_error("searchlib: corrupt compressed postings");
       }
-      positions.push_back(static_cast<size_t>(value - base));
+      positions_.push_back(static_cast<size_t>(value - base));
     }
-    positions_.emplace_back(static_cast<size_t>(document_ids.access(i)),
-                            std::move(positions));
+    document_ids_.push_back(static_cast<size_t>(document_ids.access(i)));
+    offsets_.push_back(positions_.size());
     begin = end;
   }
 }

@@ -896,11 +896,19 @@ public:
     void load_compressed(std::istream &is);
 
   private:
-    // Kept sorted by document_id ascending so that document_id(index) is
-    // O(1) and lookups by document_id can binary-search.
-    using Entry =
-        std::pair<size_t /*document_id*/, std::vector<size_t /*position*/>>;
-    std::vector<Entry> positions_;
+    // Document ids ascending, so that document_id(index) is O(1) and lookups
+    // by document_id can binary-search; each document's term positions are
+    // the slice [offsets_[i], offsets_[i + 1]) of one concatenated array.
+    //
+    // The three arrays exist instead of a vector of
+    // (document_id, vector<position>) pairs because that shape put a 24-byte
+    // vector header beside every 8-byte document id. Walking or galloping
+    // over the document ids then strode 32 bytes and pulled in three
+    // quarters of a cache line it never read, which is the dominant cost of
+    // an And over a high-df term.
+    std::vector<size_t> document_ids_;
+    std::vector<size_t> offsets_{0}; // document_ids_.size() + 1 entries
+    std::vector<size_t> positions_;  // every position, concatenated
   };
 
   struct Document {
