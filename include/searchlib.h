@@ -477,12 +477,19 @@ private:
   struct TermState {
     std::shared_ptr<const IPostings> postings;
     double idf;
-    // Where the last hit was found in this term's postings. Callers walk a
-    // result in ascending index order (that is what top_k does) and results
-    // are ordered by document id, so the next lookup almost always resumes
-    // just after this one instead of searching the list again. Scoring out
+    // Where the last lookup landed in this term's postings, and what it was
+    // looking for. Callers walk a result in ascending index order (that is
+    // what top_k does) and results are ordered by document id, so the next
+    // lookup almost always resumes at or just after this one instead of
+    // searching the list again.
+    //
+    // The invariant `cursor` is the first entry whose document id is >=
+    // `last_document_id` is what lets a forward lookup answer "this document
+    // does not carry the term" without searching at all -- the common case
+    // for an Or, where most hits match only some of its terms. Scoring out
     // of order stays correct, just without the shortcut.
     mutable size_t cursor;
+    mutable size_t last_document_id;
   };
 
   const IInvertedIndex &invidx_;

@@ -954,26 +954,31 @@ size_t lower_bound_document_id(const IPostings &postings, size_t low,
 
 // find_postings_index_for_document_id_, but resuming from where the previous
 // lookup landed. Scoring walks documents in ascending id order, so the answer
-// is usually a step or two past the cursor and the galloping branch settles
-// in O(log gap) instead of O(log size).
+// is usually at or just past the cursor.
 //
-// `cursor` is left on the first entry >= document_id (not on the match), so
-// that the next call in an ascending walk resumes correctly whether or not
-// this one hit. Returns postings.size() when the document is absent.
+// Both `cursor` and `last_document_id` are updated so that the invariant
+// "cursor is the first entry whose document id is >= last_document_id" holds
+// on entry and on exit. That invariant carries the whole optimization: when
+// the walk is moving forward, everything before the cursor is already known
+// to be below the target, so a cursor sitting past the target proves the
+// document is absent without any search at all. Returns postings.size() when
+// the document is absent.
 size_t find_from_cursor(const IPostings &postings, size_t &cursor,
-                        size_t document_id) {
+                        size_t &last_document_id, size_t document_id) {
   auto size = postings.size();
   if (size == 0) {
     return 0;
   }
 
-  if (cursor >= size || postings.document_id(cursor) > document_id) {
-    // The target is at or before the cursor -- an exhausted cursor, or a
-    // caller scoring hits out of ascending order. Searching the prefix
-    // keeps that case correct; galloping forward would never find it.
-    auto high = cursor < size ? cursor + 1 : size;
+  if (document_id < last_document_id) {
+    // The caller is scoring out of ascending order, so the invariant says
+    // nothing about entries before the cursor and they have to be searched.
+    // Galloping forward would never find the target either. The clamp
+    // matters: an exhausted cursor sits at size, and cursor + 1 would run
+    // the search one entry past the end.
+    auto high = std::min(cursor + 1, size);
     cursor = lower_bound_document_id(postings, 0, high, document_id);
-  } else if (postings.document_id(cursor) < document_id) {
+  } else if (cursor < size && postings.document_id(cursor) < document_id) {
     // Same exponential-then-binary shape as skip_cursors above.
     size_t step = 1;
     auto low = cursor + 1; // document_id(cursor) is known to be < target
@@ -988,6 +993,9 @@ size_t find_from_cursor(const IPostings &postings, size_t &cursor,
     }
     cursor = lower_bound_document_id(postings, low, high, document_id);
   }
+  // Otherwise the cursor is already the lower bound for this document: it
+  // either sits on it, or sits past it (absent), or the list is exhausted.
+  last_document_id = document_id;
 
   return (cursor < size && postings.document_id(cursor) == document_id) ? cursor
                                                                        : size;
@@ -1005,7 +1013,7 @@ BM25Scorer::BM25Scorer(const IInvertedIndex &invidx, const Expression &expr,
     auto postings = invidx.postings(term);
     auto n = static_cast<double>(postings->size());
     terms_.push_back(TermState{
-        std::move(postings), std::log2((N_ - n + 0.5) / (n + 0.5)), 0});
+        std::move(postings), std::log2((N_ - n + 0.5) / (n + 0.5)), 0, 0});
   });
 }
 
@@ -1020,7 +1028,8 @@ double BM25Scorer::operator()(const IPostings &postings, size_t index) const {
     // than being skipped, so that a degenerate index (avgdl == 0, making
     // norm NaN) produces the same value bm25_score would.
     double tf = 0.0;
-    auto i = find_from_cursor(*term.postings, term.cursor, document_id);
+    auto i = find_from_cursor(*term.postings, term.cursor,
+                              term.last_document_id, document_id);
     if (i < term.postings->size()) {
       tf = static_cast<double>(term.postings->search_hit_count(i)) / dl;
     }

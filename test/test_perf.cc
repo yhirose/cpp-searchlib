@@ -167,6 +167,75 @@ TEST(PerfTest, ScorerDoesNotScaleWithVocabulary) {
                         << "re-expanding the prefix per hit";
 }
 
+// Most hits of an Or carry only some of its terms, so "this document does not
+// have this term" is the common answer, not the rare one. The scorer's cursor
+// invariant is what makes it free: walking forward, everything before the
+// cursor is already known to be below the target, so a cursor sitting past
+// the target settles the question without searching. Lose that and every
+// absent lookup falls back to a binary search over an ever-growing prefix.
+TEST(PerfTest, ScoringAnOrDoesNotSearchForAbsentTerms) {
+  constexpr size_t kHits = 100000;
+
+  // The layout has to leave the absent term's cursor *ahead* of the target,
+  // with entries on both sides of it -- that is the only shape the invariant
+  // saves, and it is the shape a real scattered term has. Two layouts that
+  // look plausible do not produce it: interleaving the terms leaves the
+  // cursor trailing the target (the galloping branch), and giving beta a
+  // contiguous block leaves it exhausted past the end (already O(1)).
+  // Sprinkling beta every tenth document does, for 90% of the hits.
+  InMemoryInvertedIndex<TextRange> invidx;
+  {
+    InMemoryIndexer indexer(invidx, perf_normalizer);
+    for (size_t i = 0; i < kHits; i++) {
+      indexer.index_document(i, UTF8PlainTextTokenizer(
+                                    i % 10 == 0 ? "beta filler" : "alpha filler"));
+    }
+  }
+
+  auto or_expr = parse_query(perf_normalizer, "alpha | beta");
+  auto single_expr = parse_query(perf_normalizer, "alpha");
+  ASSERT_TRUE(or_expr);
+  ASSERT_TRUE(single_expr);
+
+  auto or_result = perform_search(invidx, *or_expr);
+  auto single_result = perform_search(invidx, *single_expr);
+  ASSERT_EQ(kHits, or_result->size());
+  ASSERT_EQ(kHits - kHits / 10, single_result->size());
+
+  auto score_all = [](const BM25Scorer &scorer, const IPostings &result) {
+    double total = 0.0;
+    for (size_t i = 0; i < result.size(); i++) {
+      total += scorer(result, i);
+    }
+    return total;
+  };
+
+  // Built inside the timed region, unlike the vocabulary test above. A
+  // scorer's cursors are left at the end of a full pass, so reusing one
+  // across runs would start every run but the first with a backwards walk
+  // and measure the fallback instead of the forward path this test is about.
+  // Construction here is two postings lookups and two logarithms.
+  auto or_us = best_of(20, [&] {
+    BM25Scorer scorer(invidx, *or_expr);
+    score_all(scorer, *or_result);
+  });
+  auto single_us = best_of(20, [&] {
+    BM25Scorer scorer(invidx, *single_expr);
+    score_all(scorer, *single_result);
+  });
+
+  // The Or scores 10/9 as many hits and consults two terms per hit instead
+  // of one, so a bit over twice the single-term work is the honest floor.
+  // Measured at 1.8x with O(1) absent lookups and 3.4x when they fall back
+  // to searching, both steady across runs; 2.5x sits between them.
+  auto ratio = or_us / single_us;
+  EXPECT_LT(ratio, 2.5) << "scoring " << kHits << " Or hits took "
+                        << or_us << "us against " << single_us
+                        << "us for " << single_result->size()
+                        << " single-term hits ("
+                        << ratio << "x) -- absent-term lookups are searching";
+}
+
 // Building a union used to put a Position plus two vectors on the heap for
 // every matched document, so the construction cost was dominated by
 // allocation rather than by the merge itself. Walking the finished result is
