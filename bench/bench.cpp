@@ -146,8 +146,8 @@ int main(int argc, char **argv) {
                 std::chrono::duration<double, std::milli>(end - start).count());
   }
 
-  std::printf("%-15s %8s %10s %10s %10s\n", "query", "hits", "search_us",
-              "score_us", "top10_us");
+  std::printf("%-15s %8s %10s %10s %10s %10s\n", "query", "hits", "search_us",
+              "score_us", "scorer_us", "top10_us");
 
   for (const auto &query : kQueries) {
     auto parsed = parse_query(normalizer, query.text);
@@ -172,20 +172,33 @@ int main(int argc, char **argv) {
       }
     });
 
+    // The same scoring work through BM25Scorer, construction included, so
+    // the column is a fair swap for score_us rather than a best case.
+    auto scorer_us = best_of_us(runs, [&] {
+      BM25Scorer scorer(invidx, expr);
+      double total = 0.0;
+      for (size_t i = 0; i < result->size(); i++) {
+        total += scorer(*result, i);
+      }
+      if (total == -1.0) {
+        std::printf(" ");
+      }
+    });
+
     // Search and rank together: the number a caller actually pays, and the
     // one directly comparable to another engine's top-k latency.
     auto top10_us = best_of_us(runs, [&] {
       auto r = perform_search(invidx, expr);
-      auto hits = top_k(*r, 10, [&](size_t i) {
-        return bm25_score(invidx, expr, *r, i);
-      });
+      BM25Scorer scorer(invidx, expr);
+      auto hits =
+          top_k(*r, 10, [&](size_t i) { return scorer(*r, i); });
       if (hits.size() == 999) {
         std::printf(" ");
       }
     });
 
-    std::printf("%-15s %8zu %10.2f %10.2f %10.2f\n", query.name,
-                result->size(), search_us, score_us, top10_us);
+    std::printf("%-15s %8zu %10.2f %10.2f %10.2f %10.2f\n", query.name,
+                result->size(), search_us, score_us, scorer_us, top10_us);
   }
 
   return 0;

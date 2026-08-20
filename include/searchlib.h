@@ -445,6 +445,48 @@ double bm25_score(const IInvertedIndex &invidx, const Expression &expr,
                   const IPostings &postings, size_t index, double k1 = 1.2,
                   double b = 0.75);
 
+// Same BM25 score as bm25_score, but with the per-term state -- the postings
+// list and the idf -- resolved once at construction rather than once per
+// scored hit. bm25_score reaches both through the term dictionary on every
+// call, so ranking H hits of a T-term query hashes a variable-length
+// u32string 2*T*H times and recomputes the same T logarithms H times.
+//
+//   BM25Scorer scorer(invidx, expr);
+//   auto hits = top_k(*result, 10,
+//                     [&](size_t i) { return scorer(*result, i); });
+//
+// A Prefix/Wildcard/Fuzzy node is expanded against the dictionary here too,
+// once, so scoring one no longer re-enumerates the dictionary for every hit
+// and callers need not run expand_prefixes() up front just to keep ranking
+// affordable (perform_search expands internally either way).
+//
+// Lifetime: the scorer borrows invidx and expr, and holds postings that do
+// NOT keep the index alive -- IInvertedIndex::postings hands back an
+// aliasing shared_ptr with no deleter. Keep it within the index's lifetime,
+// and do not use one across a mutation of the index: under
+// ThreadSafeInvertedIndex that means constructing, using and destroying it
+// inside a single read() callback. One instance per query per thread.
+class BM25Scorer {
+public:
+  BM25Scorer(const IInvertedIndex &invidx, const Expression &expr,
+             double k1 = 1.2, double b = 0.75);
+
+  double operator()(const IPostings &postings, size_t index) const;
+
+private:
+  struct TermState {
+    std::shared_ptr<const IPostings> postings;
+    double idf;
+  };
+
+  const IInvertedIndex &invidx_;
+  std::vector<TermState> terms_;
+  double N_;
+  double avgdl_;
+  double k1_;
+  double b_;
+};
+
 //-----------------------------------------------------------------------------
 // Ranking support: bounded top-k collection
 //-----------------------------------------------------------------------------

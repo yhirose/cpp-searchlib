@@ -15,6 +15,11 @@
 
 namespace searchlib {
 
+// Defined in invertedindex.cpp; shared here because BM25Scorer locates a
+// document inside a term's postings the same way tf() does.
+size_t find_postings_index_for_document_id_(const IPostings &p,
+                                            size_t document_id);
+
 class TermSearchResult : public IPostings {
 public:
   TermSearchResult(const IInvertedIndex &inverted_index,
@@ -936,6 +941,42 @@ double bm25_score(const IInvertedIndex &invidx, const Expression &expr,
     score +=
         idf * ((tf * (k1 + 1.0)) / (tf + k1 * (1.0 - b + b * (dl / avgdl))));
   });
+  return score;
+}
+
+//-----------------------------------------------------------------------------
+
+BM25Scorer::BM25Scorer(const IInvertedIndex &invidx, const Expression &expr,
+                       double k1, double b)
+    : invidx_(invidx), N_(static_cast<double>(invidx.document_count())),
+      avgdl_(invidx.average_document_term_count()), k1_(k1), b_(b) {
+  // The one dictionary walk. enumerate_terms expands Prefix/Wildcard/Fuzzy
+  // nodes, which is exactly the work bm25_score repeats for every hit.
+  enumerate_terms(invidx, expr, [&](const auto &term) {
+    auto postings = invidx.postings(term);
+    auto n = static_cast<double>(postings->size());
+    terms_.push_back(
+        TermState{std::move(postings), std::log2((N_ - n + 0.5) / (n + 0.5))});
+  });
+}
+
+double BM25Scorer::operator()(const IPostings &postings, size_t index) const {
+  auto document_id = postings.document_id(index);
+  auto dl = static_cast<double>(invidx_.document_term_count(document_id));
+  auto norm = k1_ * (1.0 - b_ + b_ * (dl / avgdl_));
+
+  double score = 0.0;
+  for (const auto &term : terms_) {
+    // A term the document does not carry contributes with tf == 0 rather
+    // than being skipped, so that a degenerate index (avgdl == 0, making
+    // norm NaN) produces the same value bm25_score would.
+    double tf = 0.0;
+    auto i = find_postings_index_for_document_id_(*term.postings, document_id);
+    if (i < term.postings->size()) {
+      tf = static_cast<double>(term.postings->search_hit_count(i)) / dl;
+    }
+    score += term.idf * ((tf * (k1_ + 1.0)) / (tf + norm));
+  }
   return score;
 }
 

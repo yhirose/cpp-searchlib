@@ -133,18 +133,19 @@ int cmd_search(const std::string &index_path, const std::string &query_str,
     return error("invalid query: " + query_str);
   }
 
-  // Every hit gets scored below, and scoring a Prefix node enumerates the
-  // dictionary each time, so expand the prefixes once up front.
-  auto expr = expand_prefixes(invidx, *parsed);
+  const auto &expr = *parsed;
 
   auto result = perform_search(invidx, expr);
   if (verbose) {
     std::cout << result->size() << " matching document(s)" << std::endl;
   }
 
-  auto hits = top_k(*result, limit, [&](size_t i) {
-    return bm25_score(invidx, expr, *result, i);
-  });
+  // The scorer expands any Prefix/Wildcard/Fuzzy node against the dictionary
+  // once, so scoring every hit below no longer re-walks it per hit -- which
+  // is what expand_prefixes() used to be called up front to avoid.
+  BM25Scorer scorer(invidx, expr);
+  auto hits =
+      top_k(*result, limit, [&](size_t i) { return scorer(*result, i); });
 
   size_t rank = 1;
   for (const auto &hit : hits) {

@@ -134,6 +134,42 @@ TEST(KJVTest, CompressedPersistenceRoundTrip) {
   }
 }
 
+// BM25Scorer is an optimization of bm25_score, not a variant of it: it exists
+// only to hoist the per-term lookups out of the per-hit loop. The two must
+// therefore agree exactly -- not approximately -- on every hit of every query
+// shape, including the ones whose terms come from a dictionary expansion.
+TEST(KJVTest, BM25ScorerMatchesBM25Score) {
+  const auto &invidx = kjv_index();
+
+  const char *queries[] = {
+      "apple",           // single term
+      "zzzznotaterm",    // no hits at all
+      "apple tree",      // And
+      "apple | tree",    // Or
+      R"("apple tree")", // Adjacent (phrase)
+      "apple ~ tree",    // Near
+      "tree -apple",     // Not
+      "appl*",           // Prefix: terms come from a dictionary walk
+      "ap*le",           // Wildcard
+      "apple~1",         // Fuzzy
+  };
+
+  for (const auto *query : queries) {
+    auto expr = parse_query(normalizer, query);
+    ASSERT_TRUE(expr) << query;
+
+    auto postings = perform_search(invidx, *expr);
+    ASSERT_TRUE(postings) << query;
+
+    BM25Scorer scorer(invidx, *expr);
+    for (size_t i = 0; i < postings->size(); i++) {
+      EXPECT_DOUBLE_EQ(bm25_score(invidx, *expr, *postings, i),
+                       scorer(*postings, i))
+          << "query " << query << ", hit " << i;
+    }
+  }
+}
+
 TEST(KJVTest, CompressedBackend) {
   const auto &invidx = kjv_index();
 

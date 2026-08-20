@@ -34,10 +34,11 @@ for (const auto &doc : documents) {
 // Search...
 auto expr = parse_query(normalizer, R"( document -third )");
 auto result = perform_search(invidx, *expr);
+BM25Scorer scorer(invidx, *expr);
 
 for (size_t i = 0; i < result->size(); i++) {
   auto document_id = result->document_id(i);
-  auto score = bm25_score(invidx, *expr, *result, i);
+  auto score = scorer(*result, i);
 
   for (size_t hit = 0; hit < result->search_hit_count(i); hit++) {
     // Text range for highlighting (UTF-8 byte position and length)
@@ -92,16 +93,15 @@ selective prefixes real queries use (about 11x for a 148-term prefix, 100x for
 a 4-term one) and only loses once the prefix matches more than roughly a tenth
 of the vocabulary.
 
-`perform_search` enumerates once per query, but the scoring functions take an
-expression per hit, so scoring a prefix query directly repeats that lookup for
-every hit. Expand once up front instead:
+`perform_search` enumerates once per query, but `bm25_score` takes an
+expression per hit, so scoring a prefix query with it repeats that lookup for
+every hit. `BM25Scorer` expands once at construction instead:
 
 ```cpp
-auto expr = expand_prefixes(index, *parse_query(normalizer, "app*"));
+auto expr = *parse_query(normalizer, "app*");
 auto result = perform_search(index, expr);
-auto hits = top_k(*result, 10, [&](size_t i) {
-  return bm25_score(index, expr, *result, i);
-});
+BM25Scorer scorer(index, expr);
+auto hits = top_k(*result, 10, [&](size_t i) { return scorer(*result, i); });
 ```
 
 A `*` anywhere else in a term -- leading, interior, or more than one -- is a
@@ -160,9 +160,8 @@ each search result. Ranking is up to the caller.
 (`O(n log k)` instead of scoring and sorting every hit):
 
 ```cpp
-auto hits = top_k(*result, 10, [&](size_t i) {
-  return bm25_score(invidx, *expr, *result, i);
-});
+BM25Scorer scorer(invidx, *expr);
+auto hits = top_k(*result, 10, [&](size_t i) { return scorer(*result, i); });
 
 for (const auto &hit : hits) {
   auto document_id = result->document_id(hit.index);

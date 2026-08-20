@@ -105,6 +105,68 @@ TEST(PerfTest, ScoringDoesNotScaleWithDocumentCount) {
                         << "the document count";
 }
 
+// bm25_score answers a Prefix node by enumerating the dictionary on every
+// call, so ranking a prefix query with it costs O(hits * vocabulary).
+// BM25Scorer expands the node once, at construction. If that expansion ever
+// moves back into the per-hit path, scoring starts tracking the vocabulary
+// size again -- which is the whole reason the scorer exists.
+TEST(PerfTest, ScorerDoesNotScaleWithVocabulary) {
+  constexpr size_t kHits = 200;
+
+  // Five "zqx..." terms spread over kHits documents, plus `vocabulary`
+  // single-use filler terms. The postings actually being scored are
+  // identical in both indexes; only the surrounding dictionary differs.
+  auto build = [](size_t vocabulary) {
+    InMemoryInvertedIndex<TextRange> invidx;
+    InMemoryIndexer indexer(invidx, perf_normalizer);
+    size_t document_id = 0;
+    for (size_t i = 0; i < vocabulary; i++) {
+      indexer.index_document(document_id++,
+                             UTF8PlainTextTokenizer(alpha_term("term", i)));
+    }
+    for (size_t i = 0; i < kHits; i++) {
+      indexer.index_document(document_id++,
+                             UTF8PlainTextTokenizer(alpha_term("zqx", i % 5)));
+    }
+    return invidx;
+  };
+
+  auto small = build(500);
+  auto large = build(5000);
+
+  auto expr = parse_query(perf_normalizer, "zqx*");
+  ASSERT_TRUE(expr);
+
+  auto small_result = perform_search(small, *expr);
+  auto large_result = perform_search(large, *expr);
+  ASSERT_EQ(kHits, small_result->size());
+  ASSERT_EQ(kHits, large_result->size());
+
+  // Built outside the timed region deliberately: the one-time expansion is
+  // allowed to cost more on a bigger dictionary, the per-hit scoring is not.
+  BM25Scorer small_scorer(small, *expr);
+  BM25Scorer large_scorer(large, *expr);
+
+  auto score_all = [](const BM25Scorer &scorer, const IPostings &result) {
+    double total = 0.0;
+    for (size_t i = 0; i < result.size(); i++) {
+      total += scorer(result, i);
+    }
+    return total;
+  };
+
+  auto small_us = best_of(20, [&] { score_all(small_scorer, *small_result); });
+  auto large_us = best_of(20, [&] { score_all(large_scorer, *large_result); });
+
+  // The dictionary is 10x bigger, so a per-hit expansion shows up as roughly
+  // 10x. Anything under 2x means the cost is not tracking the vocabulary.
+  auto ratio = large_us / small_us;
+  EXPECT_LT(ratio, 2.0) << "scoring " << kHits << " prefix hits took "
+                        << small_us << "us against a 500-term vocabulary but "
+                        << large_us << "us against 5,000 -- the scorer is "
+                        << "re-expanding the prefix per hit";
+}
+
 // The compressed backend stores its dictionary as an FST specifically so that
 // a prefix lookup descends to the matching subtree. If it ever falls back to
 // testing every term, a selective prefix costs the same as enumerating the
