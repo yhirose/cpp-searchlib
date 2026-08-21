@@ -351,24 +351,48 @@ is_adjacent(const std::vector<std::shared_ptr<IPostings>> &positings_list,
   return ret;
 }
 
+// The document-id walk shared by every intersecting operation: advances the
+// cursors in ascending document id order and calls
+// fn(positings_list, cursors, document_id) once for each document that
+// appears in all of them, with every cursor parked on that document so fn
+// can read the operands' hits without searching for it again.
+//
+// Separate from intersect_postings because not every And-shaped operation
+// wants a materialized result: an And only needs the ids, while
+// Adjacent/Near/SameScope also synthesize positions per document.
 template <typename T>
-static std::shared_ptr<IPostings> intersect_postings(
-    const std::vector<std::shared_ptr<IPostings>> &positings_list,
-    T make_positions) {
-  auto result = std::make_shared<SearchResult>();
-
+static void for_each_intersection(
+    const std::vector<std::shared_ptr<IPostings>> &positings_list, T fn) {
   if (positings_list.empty()) {
-    return result;
+    return;
   }
 
   // An empty postings list never intersects with others.
   for (const auto &postings : positings_list) {
     if (postings->size() == 0) {
-      return result;
+      return;
     }
   }
 
   std::vector<size_t> cursors(positings_list.size(), 0);
+
+  auto done = false;
+  while (!done) {
+    auto [min, max] = min_max_slots(positings_list, cursors);
+    if (min == max) {
+      fn(positings_list, cursors, min);
+      done = increment_all_cursors(positings_list, cursors);
+    } else {
+      done = skip_cursors(positings_list, cursors, max);
+    }
+  }
+}
+
+template <typename T>
+static std::shared_ptr<IPostings> intersect_postings(
+    const std::vector<std::shared_ptr<IPostings>> &positings_list,
+    T make_positions) {
+  auto result = std::make_shared<SearchResult>();
 
   // Filled and cleared once per matched document rather than reallocated:
   // make_positions appends into these and reports whether the document
@@ -376,23 +400,17 @@ static std::shared_ptr<IPostings> intersect_postings(
   std::vector<size_t> term_positions;
   std::vector<size_t> term_lengths;
 
-  auto done = false;
-  while (!done) {
-    auto [min, max] = min_max_slots(positings_list, cursors);
-    if (min == max) {
-      size_t document_id = 0;
-      if (make_positions(positings_list, cursors, document_id, term_positions,
-                         term_lengths)) {
-        result->push_back(document_id, term_positions, term_lengths);
-      } else {
-        term_positions.clear();
-        term_lengths.clear();
-      }
-      done = increment_all_cursors(positings_list, cursors);
+  for_each_intersection(positings_list, [&](const auto &positings_list,
+                                            const auto &cursors,
+                                            size_t document_id) {
+    if (make_positions(positings_list, cursors, document_id, term_positions,
+                       term_lengths)) {
+      result->push_back(document_id, term_positions, term_lengths);
     } else {
-      done = skip_cursors(positings_list, cursors, max);
+      term_positions.clear();
+      term_lengths.clear();
     }
-  }
+  });
 
   return result;
 }
@@ -519,10 +537,8 @@ perform_and_operation(const IInvertedIndex &inverted_index,
 
   return intersect_postings(
       positings_list(inverted_index, positive_nodes, scope_index),
-      [&](const auto &positings_list, const auto &cursors, size_t &document_id,
+      [&](const auto &positings_list, const auto &cursors, size_t document_id,
           auto &term_positions, auto &term_lengths) {
-        document_id = positings_list[0]->document_id(cursors[0]);
-
         // Exclude documents that appear in any negative postings. Both sides
         // are iterated in ascending document id order.
         for (size_t slot = 0; slot < negative_postings_list.size(); slot++) {
@@ -548,8 +564,8 @@ perform_adjacent_operation(const IInvertedIndex &inverted_index,
                            const IScopeIndex *scope_index) {
   return intersect_postings(
       positings_list(inverted_index, expr.nodes, scope_index),
-      [](const auto &positings_list, const auto &cursors, size_t &document_id,
-         auto &term_positions, auto &term_lengths) {
+      [](const auto &positings_list, const auto &cursors,
+         size_t /*document_id*/, auto &term_positions, auto &term_lengths) {
         auto target_slot = shortest_slot(positings_list, cursors);
 
         auto count =
@@ -565,11 +581,7 @@ perform_adjacent_operation(const IInvertedIndex &inverted_index,
           }
         }
 
-        if (term_positions.empty()) {
-          return false;
-        }
-        document_id = positings_list[0]->document_id(cursors[0]);
-        return true;
+        return !term_positions.empty();
       });
 }
 
@@ -628,8 +640,8 @@ perform_near_operation(const IInvertedIndex &inverted_index,
 
   return intersect_postings(
       positings_list(inverted_index, expr.nodes, scope_index),
-      [&](const auto &positings_list, const auto &cursors, size_t &document_id,
-          auto &term_positions, auto &term_lengths) {
+      [&](const auto &positings_list, const auto &cursors,
+          size_t /*document_id*/, auto &term_positions, auto &term_lengths) {
         search_hit_cursors.assign(positings_list.size(), 0);
 
         auto done = false;
@@ -695,11 +707,7 @@ perform_near_operation(const IInvertedIndex &inverted_index,
           }
         }
 
-        if (term_positions.empty()) {
-          return false;
-        }
-        document_id = positings_list[0]->document_id(cursors[0]);
-        return true;
+        return !term_positions.empty();
       });
 }
 
@@ -722,9 +730,8 @@ perform_same_scope_operation(const IInvertedIndex &inverted_index,
 
   return intersect_postings(
       positings_list(inverted_index, expr.nodes, scope_index),
-      [&](const auto &positings_list, const auto &cursors, size_t &document_id,
+      [&](const auto &positings_list, const auto &cursors, size_t document_id,
           auto &term_positions, auto &term_lengths) {
-        document_id = positings_list[0]->document_id(cursors[0]);
         if (!scope_index->has_scope(expr.scope_name, document_id)) {
           return false;
         }
