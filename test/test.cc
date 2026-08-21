@@ -963,6 +963,102 @@ TEST(PersistenceTest, RoundTrip) {
   }
 }
 
+// An index built with TextRangeStorage::Skip has to be indistinguishable
+// from one built with Store on every axis except text_range(): the whole
+// point is that a caller who never highlights pays nothing for the ranges
+// and gives up nothing else.
+TEST(TextRangeStorageTest, SkippingRangesChangesNothingButTextRange) {
+  auto stored = sample_index();
+
+  InMemoryInvertedIndex<TextRange> skipped;
+  {
+    InMemoryIndexer indexer(skipped, normalizer, TextRangeStorage::Skip);
+    size_t document_id = 0;
+    for (const auto &doc : sample_documents) {
+      indexer.index_document(document_id++, UTF8PlainTextTokenizer(doc));
+    }
+  }
+
+  EXPECT_EQ(stored.document_count(), skipped.document_count());
+  EXPECT_EQ(stored.average_document_term_count(),
+            skipped.average_document_term_count());
+
+  for (const auto *query : {"the", "document", "the | second",
+                            "the document", R"("the second")", "doc*"}) {
+    auto expr = parse_query(normalizer, query);
+    ASSERT_TRUE(expr) << query;
+    auto a = perform_search(stored, *expr);
+    auto b = perform_search(skipped, *expr);
+    ASSERT_EQ(a->size(), b->size()) << query;
+    for (size_t i = 0; i < a->size(); i++) {
+      EXPECT_EQ(a->document_id(i), b->document_id(i)) << query;
+      EXPECT_EQ(a->search_hit_count(i), b->search_hit_count(i)) << query;
+      // Term positions come from the postings, not from the ranges, so they
+      // survive too -- only the byte offsets are gone.
+      for (size_t h = 0; h < a->search_hit_count(i); h++) {
+        EXPECT_EQ(a->term_position(i, h), b->term_position(i, h)) << query;
+      }
+      EXPECT_AP(bm25_score(stored, *expr, *a, i),
+                bm25_score(skipped, *expr, *b, i));
+    }
+  }
+}
+
+TEST(TextRangeStorageTest, SkippedIndexSaysSoInsteadOfMisreporting) {
+  InMemoryInvertedIndex<TextRange> skipped;
+  {
+    InMemoryIndexer indexer(skipped, normalizer, TextRangeStorage::Skip);
+    indexer.index_document(0, UTF8PlainTextTokenizer(sample_documents[0]));
+  }
+
+  auto expr = parse_query(normalizer, "the");
+  auto postings = perform_search(skipped, *expr);
+  ASSERT_EQ(1, postings->size());
+  EXPECT_THROW(skipped.text_range(*postings, 0, 0), std::runtime_error);
+}
+
+// Both on-disk formats have a text-range section; with Skip it is simply
+// empty, which has to survive a round trip rather than tripping the
+// structural checks the compressed section makes.
+TEST(TextRangeStorageTest, EmptyTextRangeSectionRoundTrips) {
+  InMemoryInvertedIndex<TextRange> skipped;
+  {
+    InMemoryIndexer indexer(skipped, normalizer, TextRangeStorage::Skip);
+    size_t document_id = 0;
+    for (const auto &doc : sample_documents) {
+      indexer.index_document(document_id++, UTF8PlainTextTokenizer(doc));
+    }
+  }
+
+  auto expr = parse_query(normalizer, "the | document");
+  auto expected = perform_search(skipped, *expr);
+
+  for (auto format : {IndexFormat::Plain, IndexFormat::Compressed}) {
+    std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+    skipped.save(ss, {}, format);
+
+    InMemoryInvertedIndex<TextRange> loaded;
+    loaded.load(ss);
+    EXPECT_EQ(skipped.document_count(), loaded.document_count());
+
+    auto actual = perform_search(loaded, *expr);
+    ASSERT_EQ(expected->size(), actual->size());
+    for (size_t i = 0; i < expected->size(); i++) {
+      EXPECT_EQ(expected->document_id(i), actual->document_id(i));
+    }
+    EXPECT_THROW(loaded.text_range(*actual, 0, 0), std::runtime_error);
+  }
+
+  // And through the read-only backend, which parses the same bytes with its
+  // own reader (see the note on load_compressed_index).
+  std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+  skipped.save(ss, {}, IndexFormat::Compressed);
+  auto read_only = load_compressed_index(ss);
+  EXPECT_EQ(skipped.document_count(), read_only->document_count());
+  auto actual = perform_search(*read_only, *expr);
+  EXPECT_EQ(expected->size(), actual->size());
+}
+
 TEST(PersistenceTest, UnicodeTermSurvives) {
   auto invidx = sample_index();
 
