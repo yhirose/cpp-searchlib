@@ -157,8 +157,11 @@ static auto positings_list(const IInvertedIndex &inverted_index,
 }
 
 // Collects into `slots` (reused across documents rather than returned by
-// value) every slot whose cursor sits on the smallest document id.
-static void
+// value) every slot whose cursor sits on the smallest document id, and
+// returns that id: the caller needs it and the scan has it in hand, so
+// re-reading it through the virtual interface afterwards would be a second
+// lookup per output document of every union.
+static size_t
 min_slots(const std::vector<std::shared_ptr<IPostings>> &positings_list,
           const std::vector<size_t> &cursors, std::vector<size_t> &slots) {
   slots.clear();
@@ -179,6 +182,8 @@ min_slots(const std::vector<std::shared_ptr<IPostings>> &positings_list,
       slots.push_back(slot);
     }
   }
+
+  return prev;
 }
 
 static std::pair<size_t /*min*/, size_t /*max*/>
@@ -339,12 +344,10 @@ public:
   // The sum of the operands' counts, no merge needed: merging reorders the
   // hits, it never adds or drops one.
   size_t search_hit_count(size_t index) const override {
+    locate_row(index);
     size_t count = 0;
-    for (size_t slot = 0; slot < operands_.size(); slot++) {
-      auto i = locate(slot, document_ids_[index]);
-      if (i < cursors_[slot].size) {
-        count += operands_[slot]->search_hit_count(i);
-      }
+    for (const auto &row : row_slots_) {
+      count += row.hit_count;
     }
     return count;
   }
@@ -364,10 +367,11 @@ public:
   // Worth keeping off the memo path because Adjacent asks this once per
   // candidate position of its shortest operand.
   bool is_term_position(size_t index, size_t term_pos) const override {
+    locate_row(index);
     for (size_t slot = 0; slot < operands_.size(); slot++) {
-      auto i = locate(slot, document_ids_[index]);
-      if (i < cursors_[slot].size &&
-          operands_[slot]->is_term_position(i, term_pos)) {
+      const auto &row = row_slots_[slot];
+      if (row.hit_count > 0 &&
+          operands_[slot]->is_term_position(row.index, term_pos)) {
         return true;
       }
     }
@@ -387,12 +391,42 @@ private:
     size_t last_document_id = 0;
   };
 
+  // One operand's state for the row being merged: where its entry for this
+  // document sits, how many hits that entry has, and how many of them the
+  // merge has already emitted.
+  struct RowSlot {
+    size_t index;
+    size_t hit_count;
+    size_t hit_cursor;
+  };
+
   // This operand's index for `document_id`, or its size if the operand does
   // not carry the document -- possible under Or, never under And.
   size_t locate(size_t slot, size_t document_id) const {
     auto &cursor = cursors_[slot];
     return find_from_cursor(*operands_[slot], cursor.size, cursor.cursor,
                             cursor.last_document_id, document_id);
+  }
+
+  // Resolves every operand's entry for one document, and its hit count,
+  // into row_slots_ -- unless they are already there. Every method that
+  // reads hits needs exactly this, and a consumer touches one document many
+  // times in a row (Adjacent probes one position at a time), so it is
+  // memoized on its own rather than recomputed per call or folded into the
+  // merge that only term_position/term_length need.
+  void locate_row(size_t index) const {
+    if (located_index_ == index) {
+      return;
+    }
+
+    row_slots_.clear();
+    for (size_t slot = 0; slot < operands_.size(); slot++) {
+      auto i = locate(slot, document_ids_[index]);
+      auto count =
+          i < cursors_[slot].size ? operands_[slot]->search_hit_count(i) : 0;
+      row_slots_.push_back(RowSlot{i, count, 0});
+    }
+    located_index_ = index;
   }
 
   // Merges one document's hits into row_positions_/row_lengths_, unless they
@@ -407,10 +441,9 @@ private:
     auto slot_count = operands_.size();
     row_positions_.clear();
     row_lengths_.clear();
-    row_indices_.clear();
-    row_hit_cursors_.assign(slot_count, 0);
-    for (size_t slot = 0; slot < slot_count; slot++) {
-      row_indices_.push_back(locate(slot, document_ids_[index]));
+    locate_row(index);
+    for (auto &row : row_slots_) {
+      row.hit_cursor = 0;
     }
 
     while (true) {
@@ -419,23 +452,20 @@ private:
       size_t min_term_length = 0;
 
       for (size_t slot = 0; slot < slot_count; slot++) {
-        auto i = row_indices_[slot];
-        if (i == cursors_[slot].size) {
+        const auto &row = row_slots_[slot];
+        if (row.hit_cursor == row.hit_count) {
           continue;
         }
 
         // By reference: copying the shared_ptr costs an atomic increment and
         // decrement, and this is the innermost loop of the merge.
         const auto &p = operands_[slot];
-        auto hit_index = row_hit_cursors_[slot];
 
-        if (hit_index < p->search_hit_count(i)) {
-          auto term_pos = p->term_position(i, hit_index);
-          if (term_pos < min_term_pos) {
-            min_slot = slot;
-            min_term_pos = term_pos;
-            min_term_length = p->term_length(i, hit_index);
-          }
+        auto term_pos = p->term_position(row.index, row.hit_cursor);
+        if (term_pos < min_term_pos) {
+          min_slot = slot;
+          min_term_pos = term_pos;
+          min_term_length = p->term_length(row.index, row.hit_cursor);
         }
       }
 
@@ -445,7 +475,7 @@ private:
 
       row_positions_.push_back(min_term_pos);
       row_lengths_.push_back(min_term_length);
-      row_hit_cursors_[min_slot]++;
+      row_slots_[min_slot].hit_cursor++;
     }
 
     cached_index_ = index;
@@ -457,22 +487,23 @@ private:
   mutable std::vector<OperandCursor> cursors_;
 
   // The memoized row and the scratch the merge that produced it used.
+  mutable size_t located_index_ = kNone;
   mutable size_t cached_index_ = kNone;
   mutable std::vector<size_t> row_positions_;
   mutable std::vector<size_t> row_lengths_;
-  mutable std::vector<size_t> row_indices_;
-  mutable std::vector<size_t> row_hit_cursors_;
+  mutable std::vector<RowSlot> row_slots_;
 };
 
 //-----------------------------------------------------------------------------
 
 static bool
 skip_cursors(const std::vector<std::shared_ptr<IPostings>> &positings_list,
-             std::vector<size_t> &cursors, size_t document_id) {
+             const std::vector<size_t> &sizes, std::vector<size_t> &cursors,
+             size_t document_id) {
   for (size_t slot = 0; slot < positings_list.size(); slot++) {
     const auto &postings = *positings_list[slot];
     auto &cursor = cursors[slot];
-    auto size = postings.size();
+    auto size = sizes[slot];
 
     if (cursor < size && postings.document_id(cursor) < document_id) {
       cursor = gallop_lower_bound(postings, cursor, size, document_id);
@@ -485,12 +516,11 @@ skip_cursors(const std::vector<std::shared_ptr<IPostings>> &positings_list,
   return false;
 }
 
-static bool increment_all_cursors(
-    const std::vector<std::shared_ptr<IPostings>> &positings_list,
-    std::vector<size_t> &cursors) {
-  for (size_t slot = 0; slot < positings_list.size(); slot++) {
+static bool increment_all_cursors(const std::vector<size_t> &sizes,
+                                  std::vector<size_t> &cursors) {
+  for (size_t slot = 0; slot < sizes.size(); slot++) {
     cursors[slot]++;
-    if (cursors[slot] == positings_list[slot]->size()) {
+    if (cursors[slot] == sizes[slot]) {
       return true;
     }
   }
@@ -499,13 +529,14 @@ static bool increment_all_cursors(
 
 static void
 increment_cursors(std::vector<std::shared_ptr<IPostings>> &positings_list,
-                  std::vector<size_t> &cursors,
+                  std::vector<size_t> &sizes, std::vector<size_t> &cursors,
                   const std::vector<size_t> &slots) {
   for (int i = slots.size() - 1; i >= 0; i--) {
     auto slot = slots[i];
     cursors[slot]++;
-    if (cursors[slot] == positings_list[slot]->size()) {
+    if (cursors[slot] == sizes[slot]) {
       cursors.erase(cursors.begin() + slot);
+      sizes.erase(sizes.begin() + slot);
       positings_list.erase(positings_list.begin() + slot);
     }
   }
@@ -562,11 +593,17 @@ static void for_each_intersection(
     return;
   }
 
-  // An empty postings list never intersects with others.
+  // An empty postings list never intersects with others. The sizes are
+  // resolved once here rather than re-fetched through the virtual interface
+  // by every cursor advance of every iteration.
+  std::vector<size_t> sizes;
+  sizes.reserve(positings_list.size());
   for (const auto &postings : positings_list) {
-    if (postings->size() == 0) {
+    auto size = postings->size();
+    if (size == 0) {
       return;
     }
+    sizes.push_back(size);
   }
 
   std::vector<size_t> cursors(positings_list.size(), 0);
@@ -576,9 +613,9 @@ static void for_each_intersection(
     auto [min, max] = min_max_slots(positings_list, cursors);
     if (min == max) {
       fn(positings_list, cursors, min);
-      done = increment_all_cursors(positings_list, cursors);
+      done = increment_all_cursors(sizes, cursors);
     } else {
-      done = skip_cursors(positings_list, cursors, max);
+      done = skip_cursors(positings_list, sizes, cursors, max);
     }
   }
 }
@@ -625,12 +662,18 @@ union_postings(std::vector<std::shared_ptr<IPostings>> &&positings_list) {
   auto result = std::make_shared<LazyMergeResult>(positings_list);
 
   std::vector<size_t> cursors(positings_list.size(), 0);
+  // Resolved once, then kept in step with the list as operands are dropped:
+  // the walk's exhaustion check runs once per slot per output document.
+  std::vector<size_t> sizes;
+  sizes.reserve(positings_list.size());
+  for (const auto &postings : positings_list) {
+    sizes.push_back(postings->size());
+  }
   std::vector<size_t> slots; // reused across documents
 
   while (!positings_list.empty()) {
-    min_slots(positings_list, cursors, slots);
-    result->push_back(positings_list[slots[0]]->document_id(cursors[slots[0]]));
-    increment_cursors(positings_list, cursors, slots);
+    result->push_back(min_slots(positings_list, cursors, slots));
+    increment_cursors(positings_list, sizes, cursors, slots);
     assert(positings_list.size() == cursors.size());
   }
 
