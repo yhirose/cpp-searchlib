@@ -418,6 +418,12 @@ std::optional<Expression> parse_query(TextSplitter splitter, TermFilter filter,
 // before indexing or removing anything. Under ThreadSafeInvertedIndex this
 // is already the documented rule: run the query and consume its results
 // inside one read() scope.
+//
+// One result per thread, for the same reason BM25Scorer wants one instance
+// per query per thread: an And/Or result answers positions from cursors and
+// a memoized row it keeps inside itself, so its const methods write to it.
+// Two threads reading one result race even though neither touches the index.
+// Concurrent queries each build their own result, so this costs nothing.
 std::shared_ptr<IPostings> perform_search(const IInvertedIndex &invidx,
                                           const Expression &expr,
                                           const IScopeIndex *scope_index = nullptr);

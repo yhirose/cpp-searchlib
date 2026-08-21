@@ -255,6 +255,7 @@ static size_t gallop_lower_bound(const IPostings &postings, size_t cursor,
 // to be below the target, so a cursor sitting past the target proves the
 // document is absent without any search at all. Returns `size` when the
 // document is absent.
+//
 // The inlining is pinned rather than left to the compiler. Both callers are
 // hot loops -- BM25Scorer's per-hit term lookup and LazyMergeResult's
 // per-method operand lookup -- and with one caller clang inlined this on its
@@ -262,7 +263,7 @@ static size_t gallop_lower_bound(const IPostings &postings, size_t cursor,
 // 172-instruction body into a 68-instruction one plus a call and costing 22%
 // of the scoring phase of a two-term Or, on a change that touched no scoring
 // code at all.
-SEARCHLIB_ALWAYS_INLINE static size_t
+static SEARCHLIB_ALWAYS_INLINE size_t
 find_from_cursor(const IPostings &postings, size_t size, size_t &cursor,
                  size_t &last_document_id, size_t document_id) {
   if (size == 0) {
@@ -270,7 +271,7 @@ find_from_cursor(const IPostings &postings, size_t size, size_t &cursor,
   }
 
   if (document_id < last_document_id) {
-    // The caller is scoring out of ascending order, so the invariant says
+    // The caller is walking out of ascending order, so the invariant says
     // nothing about entries before the cursor and they have to be searched.
     // Galloping forward would never find the target either. The clamp
     // matters: an exhausted cursor sits at size, and cursor + 1 would run
@@ -419,6 +420,11 @@ private:
       return;
     }
 
+    // Each memo is dropped before the state it names is touched, not after
+    // the refill finishes: everything in between is a virtual call into an
+    // operand, so "this window cannot end early" would be an assumption
+    // about other IPostings implementations rather than a local fact.
+    located_index_ = kNone;
     row_slots_.clear();
     for (size_t slot = 0; slot < operands_.size(); slot++) {
       auto i = locate(slot, document_ids_[index]);
@@ -439,6 +445,7 @@ private:
     }
 
     auto slot_count = operands_.size();
+    cached_index_ = kNone; // see locate_row
     row_positions_.clear();
     row_lengths_.clear();
     locate_row(index);
@@ -578,10 +585,11 @@ is_adjacent(const std::vector<std::shared_ptr<IPostings>> &positings_list,
 }
 
 // The document-id walk shared by every intersecting operation: advances the
-// cursors in ascending document id order and calls
-// fn(positings_list, cursors, document_id) once for each document that
-// appears in all of them, with every cursor parked on that document so fn
-// can read the operands' hits without searching for it again.
+// cursors in ascending document id order and calls fn(cursors, document_id)
+// once for each document that appears in all of them, with every cursor
+// parked on that document so fn can read the operands' hits without
+// searching for it again. Only the cursors are handed out: they live inside
+// this walk, while every caller already holds the list it passed in.
 //
 // Separate from intersect_postings because not every And-shaped operation
 // wants a materialized result: an And only needs the ids, while
@@ -612,7 +620,7 @@ static void for_each_intersection(
   while (!done) {
     auto [min, max] = min_max_slots(positings_list, cursors);
     if (min == max) {
-      fn(positings_list, cursors, min);
+      fn(cursors, min);
       done = increment_all_cursors(sizes, cursors);
     } else {
       done = skip_cursors(positings_list, sizes, cursors, max);
@@ -632,17 +640,16 @@ static std::shared_ptr<IPostings> intersect_postings(
   std::vector<size_t> term_positions;
   std::vector<size_t> term_lengths;
 
-  for_each_intersection(positings_list, [&](const auto &positings_list,
-                                            const auto &cursors,
-                                            size_t document_id) {
-    if (make_positions(positings_list, cursors, document_id, term_positions,
-                       term_lengths)) {
-      result->push_back(document_id, term_positions, term_lengths);
-    } else {
-      term_positions.clear();
-      term_lengths.clear();
-    }
-  });
+  for_each_intersection(
+      positings_list, [&](const auto &cursors, size_t document_id) {
+        if (make_positions(positings_list, cursors, document_id, term_positions,
+                           term_lengths)) {
+          result->push_back(document_id, term_positions, term_lengths);
+        } else {
+          term_positions.clear();
+          term_lengths.clear();
+        }
+      });
 
   return result;
 }
@@ -722,24 +729,23 @@ perform_and_operation(const IInvertedIndex &inverted_index,
       positings_list(inverted_index, positive_nodes, scope_index);
   auto result = std::make_shared<LazyMergeResult>(positive_postings_list);
 
-  for_each_intersection(positive_postings_list, [&](const auto &,
-                                                    const auto &,
-                                                    size_t document_id) {
-    // Exclude documents that appear in any negative postings. Both sides
-    // are iterated in ascending document id order.
-    for (size_t slot = 0; slot < negative_postings_list.size(); slot++) {
-      const auto &p = negative_postings_list[slot];
-      auto &cursor = negative_cursors[slot];
-      while (cursor < p->size() && p->document_id(cursor) < document_id) {
-        cursor++;
-      }
-      if (cursor < p->size() && p->document_id(cursor) == document_id) {
-        return;
-      }
-    }
+  for_each_intersection(
+      positive_postings_list, [&](const auto &, size_t document_id) {
+        // Exclude documents that appear in any negative postings. Both sides
+        // are iterated in ascending document id order.
+        for (size_t slot = 0; slot < negative_postings_list.size(); slot++) {
+          const auto &p = negative_postings_list[slot];
+          auto &cursor = negative_cursors[slot];
+          while (cursor < p->size() && p->document_id(cursor) < document_id) {
+            cursor++;
+          }
+          if (cursor < p->size() && p->document_id(cursor) == document_id) {
+            return;
+          }
+        }
 
-    result->push_back(document_id);
-  });
+        result->push_back(document_id);
+      });
 
   return result;
 }
