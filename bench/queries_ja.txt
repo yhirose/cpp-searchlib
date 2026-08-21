@@ -1,0 +1,13 @@
+# Both engines index the same pre-segmented terms, so a query is written in
+# already-segmented form too. Shapes mirror the English set, plus two that
+# exist to stress top-k selection: a term matching nearly every document, and
+# an Or over two of them. That is where block-max pruning pays, so it is where
+# the two engines are expected to diverge.
+single_common	人間
+single_rare	長屋
+and_two	人間 世界
+or_two	都会 | 田舎
+phrase	"日本 の 文学"
+single_verycommon	の
+or_verycommon	の | に
+and_verycommon	の に
