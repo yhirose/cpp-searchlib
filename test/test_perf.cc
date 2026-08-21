@@ -254,9 +254,10 @@ TEST(PerfTest, BuildingAUnionCostsLittleMoreThanEnumeratingItsDocumentIds) {
   });
 
   // Both sides are one virtual call per document plus the merge, so the
-  // bound comes from measurement rather than first principles: 6.0-6.2x on
-  // the view against 27-30x when the same walk also built every document's
-  // positions, both flat from 5,000 to 50,000 documents. 12x sits between.
+  // bound comes from measurement rather than first principles: this ratio
+  // reads 3.9-5.2x on the view against 27.4x when the same walk also built
+  // every document's positions. 12x sits between, with better than 2x of
+  // margin on either side.
   auto ratio = build_us / walk_us;
   EXPECT_LT(ratio, 12.0) << "building a " << kDocuments
                          << "-hit union took " << build_us << "us against "
@@ -311,12 +312,19 @@ TEST(PerfTest, ReadingAUnionsPositionsResumesInsteadOfSearching) {
   auto term_us = read_every_position(*term_result);
 
   // The union reads twice the positions and merges them, so a single-digit
-  // multiple is the honest floor and the bound is measured: 17.2-17.8x as it
-  // stands, flat from 5,000 to 50,000 documents, against 47-55x -- and
-  // climbing with the document count -- with either the operand cursors or
-  // the row memo taken out. 30x sits between.
+  // multiple is the honest floor and the bound is measured: this ratio reads
+  // 13.2-13.3x as it stands, against 33.8x with the operand cursors taken
+  // out and 49.1x with the row memo taken out. Only the healthy one is flat
+  // in the document count; both broken ones climb with it, which is the
+  // property being pinned.
+  //
+  // 22x sits between, 1.6x above the healthy number and 1.5x below the
+  // nearest broken one. The cursor margin is the tighter of the two because
+  // the row memo absorbs most of a lost cursor: it collapses a document's
+  // repeated lookups into one, so the fallback pays one search per operand
+  // per document rather than one per probe.
   auto ratio = union_us / term_us;
-  EXPECT_LT(ratio, 30.0) << "reading every position of a " << kDocuments
+  EXPECT_LT(ratio, 22.0) << "reading every position of a " << kDocuments
                          << "-hit union took " << union_us << "us against "
                          << term_us << "us for the same scan over a term's "
                          << "postings (" << ratio << "x) -- the operands are "
