@@ -8,7 +8,6 @@
 #include <array>
 #include <cassert>
 #include <iostream>
-#include <numeric>
 
 #include "./utils.h"
 #include "searchlib.h"
@@ -271,6 +270,189 @@ static size_t find_from_cursor(const IPostings &postings, size_t size,
                                                                        : size;
 }
 
+//-----------------------------------------------------------------------------
+
+// Result of an And/Or operation: the document ids that matched, viewed over
+// the operand postings they matched in.
+//
+// Positions are never copied out. BM25 ranking reads only document_id from a
+// result -- it takes each term's frequency from that term's own postings --
+// and the consumers that do read positions (text_range for highlighting, a
+// nested Adjacent/Near) touch a handful of documents each. Building them all
+// up front, the way SearchResult does, was measured at 37% of the search
+// phase of a two-term And and 57% of a two-term Or, nearly all of it thrown
+// away. This is the same move that made a bare-term result stop wrapping the
+// term's postings, one level up.
+//
+// What a view costs instead is finding the document again in each operand.
+// Two things keep that from being a search:
+//
+//   - One forward cursor per operand, exactly BM25Scorer::TermState's
+//     mechanism: every consumer walks a result in ascending index order, so
+//     locating a document resumes from the previous one. Without it a full
+//     walk would pay k binary searches per document.
+//   - A one-row memo, because a document's hits are always read together: a
+//     term_position(index, 0..n) run costs one merge rather than n.
+//
+// Only term_position/term_length need that merge at all; size, document_id,
+// search_hit_count and is_term_position are answered from the operands
+// directly.
+//
+// Unlike SearchResult, this aliases its operands rather than owning a
+// snapshot of them, so it stays valid only as long as the index does -- the
+// same lifetime a bare-term result has always had. See the note on
+// perform_search in searchlib.h.
+class LazyMergeResult : public IPostings {
+public:
+  explicit LazyMergeResult(std::vector<std::shared_ptr<IPostings>> operands)
+      : operands_(std::move(operands)), cursors_(operands_.size()) {
+    for (size_t slot = 0; slot < operands_.size(); slot++) {
+      cursors_[slot].size = operands_[slot]->size();
+    }
+  }
+
+  ~LazyMergeResult() override = default;
+
+  // Appends one matched document. Callers append in ascending id order,
+  // which is the order the operand cursors are built to exploit.
+  void push_back(size_t document_id) { document_ids_.push_back(document_id); }
+
+  size_t size() const override { return document_ids_.size(); }
+
+  size_t document_id(size_t index) const override {
+    return document_ids_[index];
+  }
+
+  // The sum of the operands' counts, no merge needed: merging reorders the
+  // hits, it never adds or drops one.
+  size_t search_hit_count(size_t index) const override {
+    size_t count = 0;
+    for (size_t slot = 0; slot < operands_.size(); slot++) {
+      auto i = locate(slot, document_ids_[index]);
+      if (i < cursors_[slot].size) {
+        count += operands_[slot]->search_hit_count(i);
+      }
+    }
+    return count;
+  }
+
+  size_t term_position(size_t index, size_t search_hit_index) const override {
+    merge_row(index);
+    return row_positions_[search_hit_index];
+  }
+
+  size_t term_length(size_t index, size_t search_hit_index) const override {
+    merge_row(index);
+    return row_lengths_[search_hit_index];
+  }
+
+  // A merged row is the union of the operands' positions as a *set*, so
+  // membership is answerable operand by operand -- again without merging.
+  // Worth keeping off the memo path because Adjacent asks this once per
+  // candidate position of its shortest operand.
+  bool is_term_position(size_t index, size_t term_pos) const override {
+    for (size_t slot = 0; slot < operands_.size(); slot++) {
+      auto i = locate(slot, document_ids_[index]);
+      if (i < cursors_[slot].size &&
+          operands_[slot]->is_term_position(i, term_pos)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+private:
+  static constexpr size_t kNone = static_cast<size_t>(-1);
+
+  // Where this operand's entry for the last document asked about sits, and
+  // which document that was; see find_from_cursor for the invariant tying
+  // the two together. `size` is the operand's size, resolved once here
+  // rather than re-fetched through the virtual interface per lookup.
+  struct OperandCursor {
+    size_t size = 0;
+    size_t cursor = 0;
+    size_t last_document_id = 0;
+  };
+
+  // This operand's index for `document_id`, or its size if the operand does
+  // not carry the document -- possible under Or, never under And.
+  size_t locate(size_t slot, size_t document_id) const {
+    auto &cursor = cursors_[slot];
+    return find_from_cursor(*operands_[slot], cursor.size, cursor.cursor,
+                            cursor.last_document_id, document_id);
+  }
+
+  // Merges one document's hits into row_positions_/row_lengths_, unless they
+  // are already there. Ascending by position with ties going to the earlier
+  // operand: the order the eager merge emitted, which the operations that
+  // consume positions (and a materialized row's binary search) relied on.
+  void merge_row(size_t index) const {
+    if (cached_index_ == index) {
+      return;
+    }
+
+    auto slot_count = operands_.size();
+    row_positions_.clear();
+    row_lengths_.clear();
+    row_indices_.clear();
+    row_hit_cursors_.assign(slot_count, 0);
+    for (size_t slot = 0; slot < slot_count; slot++) {
+      row_indices_.push_back(locate(slot, document_ids_[index]));
+    }
+
+    while (true) {
+      auto min_slot = kNone;
+      size_t min_term_pos = kNone;
+      size_t min_term_length = 0;
+
+      for (size_t slot = 0; slot < slot_count; slot++) {
+        auto i = row_indices_[slot];
+        if (i == cursors_[slot].size) {
+          continue;
+        }
+
+        // By reference: copying the shared_ptr costs an atomic increment and
+        // decrement, and this is the innermost loop of the merge.
+        const auto &p = operands_[slot];
+        auto hit_index = row_hit_cursors_[slot];
+
+        if (hit_index < p->search_hit_count(i)) {
+          auto term_pos = p->term_position(i, hit_index);
+          if (term_pos < min_term_pos) {
+            min_slot = slot;
+            min_term_pos = term_pos;
+            min_term_length = p->term_length(i, hit_index);
+          }
+        }
+      }
+
+      if (min_slot == kNone) {
+        break;
+      }
+
+      row_positions_.push_back(min_term_pos);
+      row_lengths_.push_back(min_term_length);
+      row_hit_cursors_[min_slot]++;
+    }
+
+    cached_index_ = index;
+  }
+
+  std::vector<size_t> document_ids_;
+  std::vector<std::shared_ptr<IPostings>> operands_;
+
+  mutable std::vector<OperandCursor> cursors_;
+
+  // The memoized row and the scratch the merge that produced it used.
+  mutable size_t cached_index_ = kNone;
+  mutable std::vector<size_t> row_positions_;
+  mutable std::vector<size_t> row_lengths_;
+  mutable std::vector<size_t> row_indices_;
+  mutable std::vector<size_t> row_hit_cursors_;
+};
+
+//-----------------------------------------------------------------------------
+
 static bool
 skip_cursors(const std::vector<std::shared_ptr<IPostings>> &positings_list,
              std::vector<size_t> &cursors, size_t document_id) {
@@ -415,49 +597,6 @@ static std::shared_ptr<IPostings> intersect_postings(
   return result;
 }
 
-static void merge_term_positions(
-    const std::vector<std::shared_ptr<IPostings>> &positings_list,
-    const std::vector<size_t> &cursors, const std::vector<size_t> &slots,
-    std::vector<size_t> &term_positions, std::vector<size_t> &term_lengths,
-    std::vector<size_t> &search_hit_cursors) {
-  search_hit_cursors.assign(positings_list.size(), 0);
-
-  while (true) {
-    size_t min_slot = -1;
-    size_t min_term_pos = -1;
-    size_t min_term_length = -1;
-
-    // TODO: improve performance by reducing slots
-    for (auto slot : slots) {
-      auto index = cursors[slot];
-      // By reference: copying the shared_ptr here costs an atomic increment
-      // and decrement, and this runs once per slot for every position
-      // emitted -- the innermost loop of a union.
-      const auto &p = positings_list[slot];
-      auto hit_index = search_hit_cursors[slot];
-
-      if (hit_index < p->search_hit_count(index)) {
-        auto term_pos = p->term_position(index, hit_index);
-        auto term_length = p->term_length(index, hit_index);
-
-        if (term_pos < min_term_pos) {
-          min_slot = slot;
-          min_term_pos = term_pos;
-          min_term_length = term_length;
-        }
-      }
-    }
-
-    if (min_slot == -1) {
-      break;
-    }
-
-    term_positions.push_back(min_term_pos);
-    term_lengths.push_back(min_term_length);
-    search_hit_cursors[min_slot]++;
-  }
-}
-
 static std::shared_ptr<IPostings>
 union_postings(std::vector<std::shared_ptr<IPostings>> &&positings_list) {
   positings_list.erase(
@@ -465,24 +604,19 @@ union_postings(std::vector<std::shared_ptr<IPostings>> &&positings_list) {
                      [](const auto &postings) { return postings->size() == 0; }),
       positings_list.end());
 
-  auto result = std::make_shared<SearchResult>();
-  std::vector<size_t> cursors(positings_list.size(), 0);
+  // The result views every operand, so it takes its own copy of the list
+  // before the walk below starts dropping the ones that run out
+  // (increment_cursors erases them). Built from the leftovers instead, it
+  // would answer with the positions of only the terms that survived to the
+  // end. The copy is k shared_ptrs, once per query.
+  auto result = std::make_shared<LazyMergeResult>(positings_list);
 
-  // All reused across documents; see intersect_postings.
-  std::vector<size_t> slots;
-  std::vector<size_t> term_positions;
-  std::vector<size_t> term_lengths;
-  std::vector<size_t> search_hit_cursors;
+  std::vector<size_t> cursors(positings_list.size(), 0);
+  std::vector<size_t> slots; // reused across documents
 
   while (!positings_list.empty()) {
     min_slots(positings_list, cursors, slots);
-
-    merge_term_positions(positings_list, cursors, slots, term_positions,
-                         term_lengths, search_hit_cursors);
-
-    result->push_back(positings_list[slots[0]]->document_id(cursors[slots[0]]),
-                      term_positions, term_lengths);
-
+    result->push_back(positings_list[slots[0]]->document_id(cursors[slots[0]]));
     increment_cursors(positings_list, cursors, slots);
     assert(positings_list.size() == cursors.size());
   }
@@ -528,34 +662,30 @@ perform_and_operation(const IInvertedIndex &inverted_index,
       positings_list(inverted_index, negative_nodes, scope_index);
   std::vector<size_t> negative_cursors(negative_postings_list.size(), 0);
 
-  // Every positive operand contributes its hits to every matched document, so
-  // the slot list is the same for all of them: built once here rather than
-  // rebuilt (and reallocated) per document.
-  std::vector<size_t> all_slots(positive_nodes.size());
-  std::iota(all_slots.begin(), all_slots.end(), 0);
-  std::vector<size_t> search_hit_cursors;
+  auto positive_postings_list =
+      positings_list(inverted_index, positive_nodes, scope_index);
+  auto result = std::make_shared<LazyMergeResult>(positive_postings_list);
 
-  return intersect_postings(
-      positings_list(inverted_index, positive_nodes, scope_index),
-      [&](const auto &positings_list, const auto &cursors, size_t document_id,
-          auto &term_positions, auto &term_lengths) {
-        // Exclude documents that appear in any negative postings. Both sides
-        // are iterated in ascending document id order.
-        for (size_t slot = 0; slot < negative_postings_list.size(); slot++) {
-          const auto &p = negative_postings_list[slot];
-          auto &cursor = negative_cursors[slot];
-          while (cursor < p->size() && p->document_id(cursor) < document_id) {
-            cursor++;
-          }
-          if (cursor < p->size() && p->document_id(cursor) == document_id) {
-            return false;
-          }
-        }
+  for_each_intersection(positive_postings_list, [&](const auto &,
+                                                    const auto &,
+                                                    size_t document_id) {
+    // Exclude documents that appear in any negative postings. Both sides
+    // are iterated in ascending document id order.
+    for (size_t slot = 0; slot < negative_postings_list.size(); slot++) {
+      const auto &p = negative_postings_list[slot];
+      auto &cursor = negative_cursors[slot];
+      while (cursor < p->size() && p->document_id(cursor) < document_id) {
+        cursor++;
+      }
+      if (cursor < p->size() && p->document_id(cursor) == document_id) {
+        return;
+      }
+    }
 
-        merge_term_positions(positings_list, cursors, all_slots,
-                             term_positions, term_lengths, search_hit_cursors);
-        return true;
-      });
+    result->push_back(document_id);
+  });
+
+  return result;
 }
 
 static std::shared_ptr<IPostings>

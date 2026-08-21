@@ -409,6 +409,15 @@ std::optional<Expression> parse_query(TextSplitter splitter, TermFilter filter,
 // scope_index is consulted only for Operation::SameScope nodes; if null,
 // such nodes contribute no matches (the same "no match" treatment as an
 // empty And/Or operand), rather than throwing.
+//
+// Lifetime: the result is a view over invidx, not a snapshot of it. A
+// bare-term result has always been the term's own postings, and an And/Or
+// result reads its operands' positions on demand rather than copying them
+// out, so every result stays valid only while invidx is unchanged. Consume
+// it -- including bm25_score and text_range, which read invidx anyway --
+// before indexing or removing anything. Under ThreadSafeInvertedIndex this
+// is already the documented rule: run the query and consume its results
+// inside one read() scope.
 std::shared_ptr<IPostings> perform_search(const IInvertedIndex &invidx,
                                           const Expression &expr,
                                           const IScopeIndex *scope_index = nullptr);
