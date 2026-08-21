@@ -62,7 +62,12 @@ auto normalizer = [](auto sv) { return unicode::to_lowercase(sv); };
 // rather than asserted on: it is the number that decides whether a corpus can
 // be indexed at all on a given machine, and it is not comparable across
 // operating systems.
-size_t resident_mib() {
+//
+// Signed, because a caller subtracts two samples and the second can be the
+// smaller one: freeing the source corpus, or an allocator returning pages,
+// makes the delta negative, and an unsigned subtraction turns that into
+// 18 exabytes rather than into "nothing to report".
+long long resident_mib() {
 #if defined(__APPLE__)
   mach_task_basic_info info;
   mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
@@ -70,15 +75,16 @@ size_t resident_mib() {
                 reinterpret_cast<task_info_t>(&info), &count) != KERN_SUCCESS) {
     return 0;
   }
-  return info.resident_size / (1024 * 1024);
+  return static_cast<long long>(info.resident_size / (1024 * 1024));
 #elif defined(__linux__)
   std::ifstream is("/proc/self/statm");
   size_t total_pages = 0, resident_pages = 0;
   if (!(is >> total_pages >> resident_pages)) {
     return 0;
   }
-  return resident_pages * static_cast<size_t>(sysconf(_SC_PAGESIZE)) /
-         (1024 * 1024);
+  return static_cast<long long>(resident_pages *
+                                static_cast<size_t>(sysconf(_SC_PAGESIZE)) /
+                                (1024 * 1024));
 #else
   return 0;
 #endif
@@ -286,7 +292,7 @@ int main(int argc, char **argv) {
                 text_ranges == TextRangeStorage::Skip ? "skip" : "store");
     std::printf("build      %.1f ms\n", build_ms);
     if (build_mib > 0 && tokens > 0) {
-      std::printf("build RSS  %zu MiB (%.1f bytes/token)\n", build_mib,
+      std::printf("build RSS  %lld MiB (%.1f bytes/token)\n", build_mib,
                   build_mib * 1048576.0 / tokens);
     }
   }
@@ -313,9 +319,15 @@ int main(int argc, char **argv) {
     std::printf("load       %.1f ms\n", std::chrono::duration<double, std::milli>(
                                             load_end - load_start)
                                             .count());
+    // Only meaningful when it grew, and even then only as a lower bound: the
+    // in-memory index and the corpus are both still alive here, so the
+    // allocator satisfies much of this load out of pages it already holds.
+    // Measured from a clean process the compressed backend wants about 1.4x
+    // its file size; measured here it under-reports by several times. Read
+    // this column as "at least", not as the footprint.
     auto load_mib = resident_mib() - before_load;
     if (load_mib > 0) {
-      std::printf("load RSS   %zu MiB\n", load_mib);
+      std::printf("load RSS   %lld MiB\n", load_mib);
     }
   }
   const IInvertedIndex &index =
