@@ -12,6 +12,12 @@
 #include "./utils.h"
 #include "searchlib.h"
 
+#if defined(_MSC_VER)
+#define SEARCHLIB_ALWAYS_INLINE __forceinline
+#else
+#define SEARCHLIB_ALWAYS_INLINE inline __attribute__((always_inline))
+#endif
+
 namespace searchlib {
 
 //-----------------------------------------------------------------------------
@@ -244,9 +250,16 @@ static size_t gallop_lower_bound(const IPostings &postings, size_t cursor,
 // to be below the target, so a cursor sitting past the target proves the
 // document is absent without any search at all. Returns `size` when the
 // document is absent.
-static size_t find_from_cursor(const IPostings &postings, size_t size,
-                               size_t &cursor, size_t &last_document_id,
-                               size_t document_id) {
+// The inlining is pinned rather than left to the compiler. Both callers are
+// hot loops -- BM25Scorer's per-hit term lookup and LazyMergeResult's
+// per-method operand lookup -- and with one caller clang inlined this on its
+// own. Adding the second made it decide otherwise, turning the scorer's
+// 172-instruction body into a 68-instruction one plus a call and costing 22%
+// of the scoring phase of a two-term Or, on a change that touched no scoring
+// code at all.
+SEARCHLIB_ALWAYS_INLINE static size_t
+find_from_cursor(const IPostings &postings, size_t size, size_t &cursor,
+                 size_t &last_document_id, size_t document_id) {
   if (size == 0) {
     return 0;
   }
