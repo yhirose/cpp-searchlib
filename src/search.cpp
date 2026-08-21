@@ -232,6 +232,45 @@ static size_t gallop_lower_bound(const IPostings &postings, size_t cursor,
   return lower_bound_document_id(postings, low, high, document_id);
 }
 
+// find_postings_index_for_document_id_, but resuming from where the previous
+// lookup landed. Every caller walks documents in ascending id order, so the
+// answer is usually at or just past the cursor. `size` is the postings size,
+// resolved once by the caller rather than re-fetched through the virtual
+// interface on every lookup.
+//
+// Both `cursor` and `last_document_id` are updated so that the invariant
+// "cursor is the first entry whose document id is >= last_document_id" holds
+// on entry and on exit. That invariant carries the whole optimization: when
+// the walk is moving forward, everything before the cursor is already known
+// to be below the target, so a cursor sitting past the target proves the
+// document is absent without any search at all. Returns `size` when the
+// document is absent.
+static size_t find_from_cursor(const IPostings &postings, size_t size,
+                               size_t &cursor, size_t &last_document_id,
+                               size_t document_id) {
+  if (size == 0) {
+    return 0;
+  }
+
+  if (document_id < last_document_id) {
+    // The caller is scoring out of ascending order, so the invariant says
+    // nothing about entries before the cursor and they have to be searched.
+    // Galloping forward would never find the target either. The clamp
+    // matters: an exhausted cursor sits at size, and cursor + 1 would run
+    // the search one entry past the end.
+    auto high = std::min(cursor + 1, size);
+    cursor = lower_bound_document_id(postings, 0, high, document_id);
+  } else if (cursor < size && postings.document_id(cursor) < document_id) {
+    cursor = gallop_lower_bound(postings, cursor, size, document_id);
+  }
+  // Otherwise the cursor is already the lower bound for this document: it
+  // either sits on it, or sits past it (absent), or the list is exhausted.
+  last_document_id = document_id;
+
+  return (cursor < size && postings.document_id(cursor) == document_id) ? cursor
+                                                                       : size;
+}
+
 static bool
 skip_cursors(const std::vector<std::shared_ptr<IPostings>> &positings_list,
              std::vector<size_t> &cursors, size_t document_id) {
@@ -940,48 +979,6 @@ double bm25_score(const IInvertedIndex &invidx, const Expression &expr,
 }
 
 //-----------------------------------------------------------------------------
-
-namespace {
-
-// find_postings_index_for_document_id_, but resuming from where the previous
-// lookup landed. Scoring walks documents in ascending id order, so the answer
-// is usually at or just past the cursor. `size` is the term's postings size,
-// resolved once at scorer construction rather than re-fetched through the
-// virtual interface on every lookup of every hit.
-//
-// Both `cursor` and `last_document_id` are updated so that the invariant
-// "cursor is the first entry whose document id is >= last_document_id" holds
-// on entry and on exit. That invariant carries the whole optimization: when
-// the walk is moving forward, everything before the cursor is already known
-// to be below the target, so a cursor sitting past the target proves the
-// document is absent without any search at all. Returns `size` when the
-// document is absent.
-size_t find_from_cursor(const IPostings &postings, size_t size, size_t &cursor,
-                        size_t &last_document_id, size_t document_id) {
-  if (size == 0) {
-    return 0;
-  }
-
-  if (document_id < last_document_id) {
-    // The caller is scoring out of ascending order, so the invariant says
-    // nothing about entries before the cursor and they have to be searched.
-    // Galloping forward would never find the target either. The clamp
-    // matters: an exhausted cursor sits at size, and cursor + 1 would run
-    // the search one entry past the end.
-    auto high = std::min(cursor + 1, size);
-    cursor = lower_bound_document_id(postings, 0, high, document_id);
-  } else if (cursor < size && postings.document_id(cursor) < document_id) {
-    cursor = gallop_lower_bound(postings, cursor, size, document_id);
-  }
-  // Otherwise the cursor is already the lower bound for this document: it
-  // either sits on it, or sits past it (absent), or the list is exhausted.
-  last_document_id = document_id;
-
-  return (cursor < size && postings.document_id(cursor) == document_id) ? cursor
-                                                                       : size;
-}
-
-} // namespace
 
 BM25Scorer::BM25Scorer(const IInvertedIndex &invidx, const Expression &expr,
                        double k1, double b)
