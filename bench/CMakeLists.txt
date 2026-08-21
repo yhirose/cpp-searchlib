@@ -15,3 +15,8 @@ add_executable(
 )
 
 target_include_directories(searchlib-bench PRIVATE ../include ../src ../third_party)
+
+# For --splitter. Same arrangement as test/: searchlib-segment carries the only
+# include path to the vendored cpp-segmentlib, and linking it does not extend
+# that path to bench.cpp, which sees just include/searchlib_segment.h.
+target_link_libraries(searchlib-bench PRIVATE searchlib-segment)
