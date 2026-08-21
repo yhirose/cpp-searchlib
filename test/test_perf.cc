@@ -217,22 +217,21 @@ TEST(PerfTest, ScoringAnOrDoesNotSearchForAbsentTerms) {
                         << ratio << "x) -- absent-term lookups are searching";
 }
 
-// Building a union used to put a Position plus two vectors on the heap for
-// every matched document, so the construction cost was dominated by
-// allocation rather than by the merge itself. Walking the finished result is
-// the natural yardstick: both are linear in the hit count, so the ratio
-// between them is flat unless per-hit allocation comes back -- at which point
-// only the construction side moves. A "10x the hits costs 10x the time" check
-// would not catch this, since per-hit allocation is itself linear.
-TEST(PerfTest, UnionConstructionCostsLittleMoreThanWalkingIt) {
+// An And/Or result is a view: it keeps the matched document ids and reads
+// the operands' positions on demand. So building one has to stay proportional
+// to the number of documents it matched, with nothing per hit -- which is
+// what enumerating those document ids afterwards measures. Materializing the
+// positions during the walk, as the result used to, shows up here and nowhere
+// else, since no other part of a query reads them.
+TEST(PerfTest, BuildingAUnionCostsLittleMoreThanEnumeratingItsDocumentIds) {
   constexpr size_t kDocuments = 5000;
 
   InMemoryInvertedIndex<TextRange> invidx;
   {
     InMemoryIndexer indexer(invidx, perf_normalizer);
     for (size_t i = 0; i < kDocuments; i++) {
-      // Both terms in every document, so the union merges two hits per
-      // document rather than passing one straight through.
+      // Both terms in every document, so the union has two hits per document
+      // to merge rather than one to pass straight through.
       indexer.index_document(i, UTF8PlainTextTokenizer("alpha beta gamma"));
     }
   }
@@ -244,25 +243,84 @@ TEST(PerfTest, UnionConstructionCostsLittleMoreThanWalkingIt) {
   ASSERT_EQ(kDocuments, result->size());
 
   auto build_us = best_of(20, [&] { perform_search(invidx, *expr); });
+  // document_id only. search_hit_count would drag the operand lookups into
+  // the denominator and hide exactly what this test is about.
   auto walk_us = best_of(20, [&] {
     size_t sink = 0;
     for (size_t i = 0; i < result->size(); i++) {
-      sink += result->document_id(i) + result->search_hit_count(i);
+      sink += result->document_id(i);
     }
     EXPECT_GT(sink, 0u);
   });
 
-  // Most of this ratio is the merge itself -- walking two virtual calls per
-  // hit is far cheaper than producing them -- so the bound is set from
-  // measurement rather than from first principles: 31x on the flat layout
-  // against 70x on the per-hit-allocating one it replaced, both stable to
-  // within a few percent across runs. 50x sits between them.
+  // Both sides are one virtual call per document plus the merge, so the
+  // bound comes from measurement rather than first principles: 6.0-6.2x on
+  // the view against 27-30x when the same walk also built every document's
+  // positions, both flat from 5,000 to 50,000 documents. 12x sits between.
   auto ratio = build_us / walk_us;
-  EXPECT_LT(ratio, 50.0) << "building a " << kDocuments
-                         << "-hit union took " << build_us
-                         << "us against " << walk_us
-                         << "us to walk it (" << ratio
-                         << "x) -- the result is allocating per hit again";
+  EXPECT_LT(ratio, 12.0) << "building a " << kDocuments
+                         << "-hit union took " << build_us << "us against "
+                         << walk_us << "us to enumerate its document ids ("
+                         << ratio << "x) -- construction is doing per-hit work";
+}
+
+// The other side of that bargain: a view has to find each document again in
+// each operand before it can answer a position. Two things keep that from
+// being a search -- a forward cursor per operand, and a one-row memo so that
+// a document's hits cost one merge rather than one each -- and losing either
+// turns a full position scan superlinear.
+//
+// The yardstick is the same scan over a bare term's postings, which is a
+// plain array walk. A ratio against it is flat in the hit count when both
+// mechanisms hold and grows without them.
+TEST(PerfTest, ReadingAUnionsPositionsResumesInsteadOfSearching) {
+  constexpr size_t kDocuments = 20000;
+
+  InMemoryInvertedIndex<TextRange> invidx;
+  {
+    InMemoryIndexer indexer(invidx, perf_normalizer);
+    for (size_t i = 0; i < kDocuments; i++) {
+      indexer.index_document(i, UTF8PlainTextTokenizer("alpha beta gamma"));
+    }
+  }
+
+  auto union_expr = parse_query(perf_normalizer, "alpha | beta");
+  auto term_expr = parse_query(perf_normalizer, "gamma");
+  ASSERT_TRUE(union_expr);
+  ASSERT_TRUE(term_expr);
+
+  auto union_result = perform_search(invidx, *union_expr);
+  auto term_result = perform_search(invidx, *term_expr);
+  ASSERT_EQ(kDocuments, union_result->size());
+  ASSERT_EQ(kDocuments, term_result->size());
+
+  auto read_every_position = [](const IPostings &postings) {
+    return best_of(20, [&] {
+      size_t sink = 0;
+      for (size_t i = 0; i < postings.size(); i++) {
+        auto count = postings.search_hit_count(i);
+        for (size_t h = 0; h < count; h++) {
+          sink += postings.term_position(i, h) + postings.term_length(i, h);
+        }
+      }
+      EXPECT_GT(sink, 0u);
+    });
+  };
+
+  auto union_us = read_every_position(*union_result);
+  auto term_us = read_every_position(*term_result);
+
+  // The union reads twice the positions and merges them, so a single-digit
+  // multiple is the honest floor and the bound is measured: 17.2-17.8x as it
+  // stands, flat from 5,000 to 50,000 documents, against 47-55x -- and
+  // climbing with the document count -- with either the operand cursors or
+  // the row memo taken out. 30x sits between.
+  auto ratio = union_us / term_us;
+  EXPECT_LT(ratio, 30.0) << "reading every position of a " << kDocuments
+                         << "-hit union took " << union_us << "us against "
+                         << term_us << "us for the same scan over a term's "
+                         << "postings (" << ratio << "x) -- the operands are "
+                         << "being searched per lookup";
 }
 
 // The compressed backend stores its dictionary as an FST specifically so that
