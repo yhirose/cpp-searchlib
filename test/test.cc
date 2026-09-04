@@ -20,7 +20,7 @@ std::vector<std::string> sample_documents = {
     "A well-known example.",
 };
 
-auto normalizer = [](auto sv) { return unicode::to_lowercase(sv); };
+static auto normalizer = [](auto sv) { return unicode::to_lowercase(sv); };
 
 auto sample_index() {
   InMemoryInvertedIndex<TextRange> invidx;
@@ -92,7 +92,8 @@ TEST(TokenizerTest, IllFormedUtf8IsSkipped) {
     // so whether the surrounding text comes back as one run or two is left
     // open; only the letters themselves are pinned.
     std::vector<std::string> actual;
-    UTF8PlainTextTokenizer tokenizer("ab" + bytes + "cd");
+    auto text = "ab" + bytes + "cd";
+    UTF8PlainTextTokenizer tokenizer(text);
     tokenizer(nullptr,
               [&](auto &str, auto, auto) { actual.emplace_back(u8(str)); });
     std::string joined;

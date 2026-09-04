@@ -11,7 +11,7 @@ using namespace searchlib;
 
 const auto KJV_PATH = "../../test/t_kjv.tsv";
 
-auto normalizer = [](auto sv) { return unicode::to_lowercase(sv); };
+static auto normalizer = [](auto sv) { return unicode::to_lowercase(sv); };
 
 static auto kjv_index() {
   InMemoryInvertedIndex<TextRange> invidx;
