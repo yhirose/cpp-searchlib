@@ -301,6 +301,33 @@ model is used by the tests as `test/models/ja-ud-gsd.mod`. **It is licensed
 CC BY-SA 4.0, not MIT like this repository's code** (it derives from the
 UD_Japanese-GSD treebank) -- see `test/models/NOTICE` before redistributing it.
 
+## Cutting words into subwords
+
+A language written with spaces is already cut into words by the default
+splitter; what a morphological analyzer for it adds is cutting each word into
+its morphemes. That is a `string -> list<string>` function, and
+`subword_splitter` lifts one into a `TextSplitter`, giving every piece its
+own position and byte range:
+
+```cpp
+auto splitter = subword_splitter(nullptr, [](std::string_view word) {
+  return my_analyzer.morphemes(word);   // e.g. 한국어를 -> 한국어, 를
+});
+
+indexer.index_document(0, SplitterTokenizer(splitter, text));
+auto expr = parse_query(splitter, nullptr, "한국어를");   // -> Adjacent(한국어, 를)
+```
+
+The pieces are a sequence, so a query for the whole word becomes an implicit
+phrase over them, the same way a token the segmenting splitter cuts up does.
+This is the difference from a `TermFilter` that emits several times: those
+outputs are alternatives (a synonym set), which `parse_query` turns into an
+`OR` and which the index side refuses, since alternatives have no place at
+consecutive positions. The pieces must be the word's own bytes in order (an
+analyzer that answers with a lemma rather than the surface form should be a
+`TextSplitter` of its own, carrying its offsets); an empty answer drops the
+word.
+
 ## CLI
 
 `cli/` builds a small `searchlib-cli` executable exercising the library:

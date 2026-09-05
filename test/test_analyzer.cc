@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 #include <searchlib.h>
 
+#include <cctype>
+
 #include "test_utils.h"
 
 using namespace searchlib;
@@ -47,6 +49,26 @@ std::vector<size_t> search_ids(const IInvertedIndex &index,
     ids.push_back(postings->document_ordinal(i));
   }
   return ids;
+}
+
+// Stands in for a word-level morphological analyzer over a space-written
+// language: it cuts the one compound these tests use, drops one word, and
+// leaves everything else whole.
+std::vector<std::string> demo_decompose(std::string_view term) {
+  // A decomposer sees the surface bytes, before any normalizer, so it
+  // matches case-insensitively and answers with the term's own bytes -- the
+  // only thing a range can point at.
+  std::string lower(term);
+  for (auto &c : lower) {
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
+  if (lower == "helloworld") {
+    return {std::string(term.substr(0, 5)), std::string(term.substr(5))};
+  }
+  if (lower == "dropme") {
+    return {};
+  }
+  return {std::string(term)};
 }
 
 } // namespace
@@ -165,6 +187,8 @@ TEST(AnalyzerTest, DropsCloseThePositionGap) {
 
 TEST(AnalyzerTest, IndexSideOneToManyThrows) {
   // A filter that emits twice for one token (index-time synonym expansion).
+  // Alternatives have no place at consecutive positions; a *sequence* of
+  // pieces is what subword_splitter is for (see SubwordSplitterTest).
   TermFilter duplicating = [](const std::u32string &s,
                               std::function<void(std::u32string)> emit) {
     emit(s);
@@ -213,4 +237,82 @@ TEST(AnalyzerTest, ComposeIsLeftToRightAndEmptyIsIdentity) {
   compose({drop_foo, lowercase_filter()})(U"Foo",
                                           [&](std::u32string s) { out.push_back(s); });
   EXPECT_EQ((std::vector<std::u32string>{U"foo"}), out);
+}
+
+TEST(SubwordSplitterTest, PiecesGetConsecutivePositionsAndExactRanges) {
+  auto splitter = subword_splitter(nullptr, demo_decompose);
+
+  InMemoryInvertedIndex<TextRange> index;
+  InMemoryIndexer indexer(index, lc_normalizer);
+  std::string text = "Say HelloWorld dropme now";
+  indexer.index_document(0, SplitterTokenizer(splitter, text));
+
+  // say@0 hello@1 world@2 now@3: the compound became two terms at the
+  // positions one term would have taken plus one, and the dropped word
+  // closed its gap, as a dropped stop word does.
+  EXPECT_EQ(4u, index.document_term_count(*index.document_ordinal(0)));
+  EXPECT_FALSE(index.term_exists(U"helloworld"));
+  EXPECT_FALSE(index.term_exists(U"dropme"));
+  auto hello = index.postings(U"hello");
+  auto world = index.postings(U"world");
+  auto now = index.postings(U"now");
+  ASSERT_EQ(1u, hello->size());
+  ASSERT_EQ(1u, world->size());
+  EXPECT_EQ(1u, hello->term_position(0, 0));
+  EXPECT_EQ(2u, world->term_position(0, 0));
+  EXPECT_EQ(3u, now->term_position(0, 0));
+
+  // Each piece highlights its own bytes -- the reason this is a splitter and
+  // not a filter, which would have had to give both pieces the word's range.
+  auto range = index.text_range(*hello, 0, 0);
+  EXPECT_EQ("Hello", text.substr(range.position, range.length));
+  range = index.text_range(*world, 0, 0);
+  EXPECT_EQ("World", text.substr(range.position, range.length));
+
+  // The same splitter on the query side turns the compound into an implicit
+  // phrase over its pieces, which is exactly where they sit.
+  auto query = [&](const char *q) {
+    return parse_query(splitter, to_term_filter(lc_normalizer), q);
+  };
+  auto expr = query("HelloWorld");
+  ASSERT_TRUE(expr);
+  EXPECT_EQ(Operation::Adjacent, expr->operation);
+  EXPECT_EQ(1u, perform_search(index, *expr)->size());
+  EXPECT_EQ(1u, perform_search(index, *query("world"))->size());
+  EXPECT_EQ(1u, perform_search(index, *query("\"say helloworld now\""))->size());
+  EXPECT_EQ(0u, perform_search(index, *query("dropme"))->size());
+
+  // The ranges survive both on-disk formats.
+  for (auto format : {IndexFormat::Plain, IndexFormat::Compressed}) {
+    std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+    index.save(ss, {}, format);
+    InMemoryInvertedIndex<TextRange> loaded;
+    loaded.load(ss);
+    auto loaded_world = loaded.postings(U"world");
+    auto r = loaded.text_range(*loaded_world, 0, 0);
+    EXPECT_EQ("World", text.substr(r.position, r.length));
+  }
+}
+
+TEST(SubwordSplitterTest, RejectsAPieceOutsideItsTerm) {
+  // A piece the term does not contain (from the previous piece on) has no
+  // range to point at, and guessing one would corrupt highlighting.
+  auto bad = subword_splitter(
+      nullptr, [](std::string_view) -> std::vector<std::string> {
+        return {"xyz"};
+      });
+  InMemoryInvertedIndex<TextRange> index;
+  InMemoryIndexer indexer(index, nullptr);
+  EXPECT_THROW(indexer.index_document(0, SplitterTokenizer(bad, "hello")),
+               std::invalid_argument);
+
+  auto reordered = subword_splitter(
+      nullptr, [](std::string_view) -> std::vector<std::string> {
+        return {"world", "hello"};
+      });
+  EXPECT_THROW(
+      indexer.index_document(1, SplitterTokenizer(reordered, "helloworld")),
+      std::invalid_argument);
+
+  EXPECT_THROW(subword_splitter(nullptr, nullptr), std::invalid_argument);
 }

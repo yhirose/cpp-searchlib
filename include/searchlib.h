@@ -275,6 +275,28 @@ using TextSplitter = std::function<void(
 // see searchlib_segment.h for a splitter that can.
 TextSplitter utf8_plain_text_splitter();
 
+// Cuts every term `base` emits into the pieces `decompose` returns for it,
+// each with its own byte range. This is the shape a word-level morphological
+// analyzer plugs in as: for a language written with spaces the default
+// splitter has already cut the text into words, and `decompose` turns each
+// word into its morphemes. They are a sequence, so they take consecutive
+// positions and a query for the whole word becomes an implicit phrase over
+// them (see parse_query) -- which is also why this is a splitter and not a
+// TermFilter: a filter's several outputs mean alternatives (synonyms), and
+// those belong query-side.
+//
+// `decompose` sees the term's bytes, not the string `base` emitted for it,
+// and must answer with pieces that are those bytes in order (a segmentation,
+// possibly leaving bytes out between pieces); that is what makes the ranges
+// exact, and a piece not found in the term at or after the previous one is
+// an error rather than a guessed range. An analyzer that emits forms unlike
+// the surface text (a lemma for an inflected verb) should be wrapped as a
+// TextSplitter of its own, with the analyzer's offsets. An empty answer
+// drops the term. A null `base` means utf8_plain_text_splitter().
+using Decomposer =
+    std::function<std::vector<std::string>(std::string_view term)>;
+TextSplitter subword_splitter(TextSplitter base, Decomposer decompose);
+
 //-----------------------------------------------------------------------------
 // Analyzer pipeline (see docs/analyzer_pipeline_design.ja.md)
 //-----------------------------------------------------------------------------
@@ -287,9 +309,12 @@ TextSplitter utf8_plain_text_splitter();
 // Tokenizer<T>.
 //
 // Note: the type can express 1->N, but the index-side Analyzer<T> supports
-// only 1->0 / 1->1 (v1); 1->N is reserved for query-side expansion. It is
-// intentionally independent of the text-range type T so that the same string
-// logic can be reused by parse_query (design section 6).
+// only 1->0 / 1->1: several outputs from a filter mean alternatives (a
+// synonym set), which parse_query turns into an Or and which have no place
+// at consecutive index positions. Splitting one word into a *sequence* of
+// pieces is subword_splitter's job. It is intentionally independent of the
+// text-range type T so that the same string logic can be reused by
+// parse_query (design section 6).
 using TermFilter =
     std::function<void(const std::u32string &str,
                        std::function<void(std::u32string)> emit)>;
@@ -817,7 +842,9 @@ private:
 // If a filter emits more than once for one token (1->N), operator() throws:
 // silently accepting it would break the same invariant and make text_range
 // read out of bounds. Index-side synonym expansion is intentionally
-// unsupported; do it query-side (design section 5).
+// unsupported; do it query-side (design section 5). Cutting a word into a
+// sequence of pieces is a different thing and has its own home,
+// subword_splitter, where each piece gets a position and a range.
 //
 // The text_range from base_tokenizer is carried through to the emitted
 // output unchanged (offsets are into the original text, so filtering the
@@ -843,7 +870,8 @@ public:
         if (++emit_count > 1) {
           throw std::runtime_error(
               "searchlib: Analyzer does not support 1->N (synonym) expansion "
-              "on the index side; expand synonyms query-side instead");
+              "on the index side; expand synonyms query-side instead, or use "
+              "subword_splitter to cut a word into a sequence of pieces");
         }
         callback(out, term_pos, text_range);
       };

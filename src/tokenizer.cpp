@@ -8,6 +8,7 @@
 #include "tokenizer.h"
 
 #include "searchlib.h"
+#include "utils.h"
 
 namespace searchlib {
 
@@ -32,6 +33,45 @@ TextRange text_range(const TextRangeList<TextRange> &text_range_list,
 TextSplitter utf8_plain_text_splitter() {
   return [](std::string_view text, const auto &emit) {
     detail::for_each_letter_run(text, emit);
+  };
+}
+
+TextSplitter subword_splitter(TextSplitter base, Decomposer decompose) {
+  if (!decompose) {
+    throw std::invalid_argument("searchlib: subword_splitter needs a decomposer");
+  }
+  if (!base) {
+    base = utf8_plain_text_splitter();
+  }
+  // Held through a shared_ptr for the same reason load_segmenting_splitter
+  // does it: a TextSplitter is copied into every SplitterTokenizer and every
+  // parse_query call, and the two callables need not be copied with it.
+  struct Stages {
+    TextSplitter base;
+    Decomposer decompose;
+  };
+  auto stages = std::make_shared<Stages>(Stages{std::move(base), std::move(decompose)});
+  return [stages](std::string_view text, const auto &emit) {
+    stages->base(text, [&](const std::u32string &, TextRange range) {
+      // The decomposer sees the term's own bytes, so that the pieces it hands
+      // back can be located in them; what `base` emitted for the term may
+      // already be normalized and is not what a range points at.
+      auto term = text.substr(range.position, range.length);
+      auto pieces = stages->decompose(term);
+      size_t cursor = 0;
+      for (const auto &piece : pieces) {
+        auto at = piece.empty() ? std::string_view::npos : term.find(piece, cursor);
+        if (at == std::string_view::npos) {
+          throw std::invalid_argument(
+              "searchlib: subword_splitter: piece '" + piece +
+              "' is not part of its term '" + std::string(term) +
+              "' (from the previous piece on); an analyzer whose output is "
+              "not the surface text should be a TextSplitter of its own");
+        }
+        emit(u32(piece), TextRange{range.position + at, piece.size()});
+        cursor = at + piece.size();
+      }
+    });
   };
 }
 
