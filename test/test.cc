@@ -1497,6 +1497,70 @@ TEST(CompressedPersistenceTest, RoundTrip) {
   }
 }
 
+TEST(CompressedPersistenceTest, BlockReadsAgreeWithElementReads) {
+  // The block primitives -- read_ordinals, read_hit_counts,
+  // read_term_positions, advance -- against the per-element calls they
+  // stand in for, on the Elias-Fano postings a compressed save produces and
+  // on the in-memory ones. Irregular hit counts and gaps between documents,
+  // so a block never lines up with the data by accident.
+  InMemoryInvertedIndex<TextRange> invidx;
+  {
+    InMemoryIndexer indexer(invidx, normalizer);
+    for (size_t i = 0; i < 300; i++) {
+      std::string text;
+      switch (i % 5) {
+      case 0: text = "common x common y common"; break;
+      case 1: text = "x common"; break;
+      case 2: text = "x y"; break;
+      case 3: text = "common"; break;
+      case 4: text = "x y z common w common"; break;
+      }
+      indexer.index_document(i, UTF8PlainTextTokenizer(text));
+    }
+  }
+  std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+  invidx.save(ss, {}, IndexFormat::Compressed);
+  auto loaded = load_compressed_index(ss);
+
+  auto plain = invidx.postings(U"common");
+  auto ef = loaded->postings(U"common");
+  ASSERT_TRUE(ef->prefers_block_reads());
+  ASSERT_EQ(plain->size(), ef->size());
+  auto n = ef->size();
+
+  for (const auto &p : {plain, ef}) {
+    for (size_t index = 0; index < n; index += 3) {
+      size_t ordinals[7], counts[7];
+      auto got = p->read_ordinals(index, ordinals, 7);
+      EXPECT_EQ(got, p->read_hit_counts(index, counts, 7));
+      EXPECT_EQ(std::min<size_t>(7, n - index), got);
+      for (size_t i = 0; i < got; i++) {
+        EXPECT_EQ(p->document_ordinal(index + i), ordinals[i]);
+        EXPECT_EQ(p->search_hit_count(index + i), counts[i]);
+      }
+
+      std::vector<size_t> positions(p->search_hit_count(index));
+      p->read_term_positions(index, positions.data());
+      for (size_t h = 0; h < positions.size(); h++) {
+        EXPECT_EQ(p->term_position(index, h), positions[h]);
+      }
+    }
+
+    // advance(from, ordinal) is the first index past `from` at or beyond
+    // `ordinal`; the scan is the definition.
+    for (size_t from = 0; from + 1 < n; from += 7) {
+      for (auto gap : {1, 2, 5, 40, 1000}) {
+        auto ordinal = p->document_ordinal(from) + gap;
+        auto expected = from + 1;
+        while (expected < n && p->document_ordinal(expected) < ordinal) {
+          expected++;
+        }
+        EXPECT_EQ(expected, p->advance(from, ordinal)) << from << " " << gap;
+      }
+    }
+  }
+}
+
 TEST(CompressedPersistenceTest, AllTermsBelowThreshold) {
   // sample_index's terms all have tiny postings, so a Compressed save falls
   // back to the plain per-term representation throughout; the format must
