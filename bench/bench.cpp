@@ -274,6 +274,7 @@ int main(int argc, char **argv) {
     }
     auto end = std::chrono::steady_clock::now();
 
+    // Keys 0..n-1 were indexed in that order, so ordinal i is document i.
     size_t tokens = 0;
     for (size_t i = 0; i < texts.size(); i++) {
       tokens += invidx.document_term_count(i);

@@ -32,7 +32,7 @@ std::vector<size_t> search_ids(const IInvertedIndex &index,
   if (!expr) return ids;
   auto postings = perform_search(index, *expr);
   for (size_t i = 0; i < postings->size(); i++) {
-    ids.push_back(postings->document_id(i));
+    ids.push_back(postings->document_ordinal(i));
   }
   return ids;
 }
@@ -44,7 +44,7 @@ std::vector<size_t> search_ids(const IInvertedIndex &index,
   if (!expr) return ids;
   auto postings = perform_search(index, *expr);
   for (size_t i = 0; i < postings->size(); i++) {
-    ids.push_back(postings->document_id(i));
+    ids.push_back(postings->document_ordinal(i));
   }
   return ids;
 }
@@ -129,8 +129,8 @@ TEST(AnalyzerTest, LowercaseAndStopWordChain) {
   EXPECT_FALSE(index.term_exists(U"a"));
 
   // Dropped tokens are not counted toward document length (design 4.3).
-  EXPECT_EQ(3u, index.document_term_count(0)); // quick brown fox
-  EXPECT_EQ(2u, index.document_term_count(1)); // lazy dog
+  EXPECT_EQ(3u, index.document_term_count(*index.document_ordinal(0))); // quick brown fox
+  EXPECT_EQ(2u, index.document_term_count(*index.document_ordinal(1))); // lazy dog
 }
 
 TEST(AnalyzerTest, DropsCloseThePositionGap) {

@@ -79,16 +79,16 @@ int cmd_index(const std::string &source, const std::string &index_path,
   InMemoryInvertedIndex<TextRange> invidx;
   InMemoryIndexer indexer(invidx, normalizer);
 
-  size_t document_id = 0;
+  size_t document_key = 0;
   for (const auto &path : files) {
     if (verbose) {
-      std::cout << "indexing [" << document_id << "] " << path.string()
+      std::cout << "indexing [" << document_key << "] " << path.string()
                 << std::endl;
     }
     auto content = read_file(path);
     UTF8PlainTextTokenizer tokenizer(content);
-    indexer.index_document(document_id, tokenizer);
-    document_id++;
+    indexer.index_document(document_key, tokenizer);
+    document_key++;
   }
 
   invidx.save(index_path);
@@ -149,9 +149,10 @@ int cmd_search(const std::string &index_path, const std::string &query_str,
 
   size_t rank = 1;
   for (const auto &hit : hits) {
-    auto document_id = result->document_id(hit.index);
-    const auto &path = document_id < document_paths.size()
-                           ? document_paths[document_id]
+    auto document_key =
+        invidx.document_key(result->document_ordinal(hit.index));
+    const auto &path = document_key < document_paths.size()
+                           ? document_paths[document_key]
                            : "<unknown>";
 
     std::cout << rank << ". " << path << "  score=" << hit.score

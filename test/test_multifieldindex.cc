@@ -37,7 +37,7 @@ TEST(MultiFieldIndexTest, FieldQualifiedSearch) {
 
   auto title_hits = perform_search(index.field("title"), *expr);
   ASSERT_EQ(1, title_hits->size());
-  EXPECT_EQ(0, title_hits->document_id(0));
+  EXPECT_EQ(0, title_hits->document_ordinal(0));
 
   auto body_hits = perform_search(index.field("body"), *expr);
   EXPECT_EQ(0, body_hits->size()); // "gatsby" never appears in body
@@ -65,10 +65,11 @@ TEST(MultiFieldIndexTest, CombinedSearchGroupsHitsByDocumentId) {
   // document 0 matches in both title and body; document 1 matches only body.
   ASSERT_EQ(3, hits.size());
 
+  // Grouped by key: each field is its own index with its own ordinals, and
+  // document 1 (body only) would not even share an ordinal across fields.
   std::map<size_t, int> match_count_by_document;
   for (const auto &hit : hits) {
-    auto document_id = hit.postings->document_id(hit.index_in_postings);
-    match_count_by_document[document_id]++;
+    match_count_by_document[hit.document_key]++;
   }
   EXPECT_EQ(2, match_count_by_document[0]);
   EXPECT_EQ(1, match_count_by_document[1]);

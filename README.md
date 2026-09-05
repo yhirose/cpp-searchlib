@@ -25,10 +25,12 @@ auto normalizer = [](const auto &str) { return unicode::to_lowercase(str); };
 InMemoryInvertedIndex<TextRange> invidx;
 InMemoryIndexer<TextRange> indexer(invidx, normalizer);
 
-size_t document_id = 0;
+// The key is yours: any size_t, in any order. The index numbers documents
+// itself underneath (see IPostings::document_ordinal in searchlib.h).
+size_t document_key = 0;
 for (const auto &doc : documents) {
-  indexer.index_document(document_id, UTF8PlainTextTokenizer(doc));
-  document_id++;
+  indexer.index_document(document_key, UTF8PlainTextTokenizer(doc));
+  document_key++;
 }
 
 // Search...
@@ -37,13 +39,14 @@ auto result = perform_search(invidx, *expr);
 BM25Scorer scorer(invidx, *expr);
 
 for (size_t i = 0; i < result->size(); i++) {
-  auto document_id = result->document_id(i);
+  // A result speaks ordinals; the index maps them back to your keys.
+  auto document_key = invidx.document_key(result->document_ordinal(i));
   auto score = scorer(*result, i);
 
   for (size_t hit = 0; hit < result->search_hit_count(i); hit++) {
     // Text range for highlighting (UTF-8 byte position and length)
     auto rng = invidx.text_range(*result, i, hit);
-    // documents[document_id].substr(rng.position, rng.length)
+    // documents[document_key].substr(rng.position, rng.length)
   }
 }
 ```
@@ -164,7 +167,7 @@ BM25Scorer scorer(invidx, *expr);
 auto hits = top_k(*result, 10, [&](size_t i) { return scorer(*result, i); });
 
 for (const auto &hit : hits) {
-  auto document_id = result->document_id(hit.index);
+  auto document_key = invidx.document_key(result->document_ordinal(hit.index));
   // hit.score
 }
 ```
@@ -228,10 +231,11 @@ exact term lookup, which walks the FST instead of hashing once: 181ns against
 ## Multi-field schema
 
 Documents with several distinct text fields (title/body/tags) each get their
-own `InMemoryInvertedIndex`, grouped by name in a `MultiFieldIndex`. Because
-all fields of one document share the same `document_id`, hits from different
-fields for the same document are grouped by a plain `document_id` comparison
--- no per-field id remapping needed:
+own `InMemoryInvertedIndex`, grouped by name in a `MultiFieldIndex`. All
+fields of one document share the same key, and every hit carries it as
+`document_key`, so hits from different fields for the same document are
+grouped by a plain comparison on that -- the fields' own ordinals differ, and
+never need to be compared:
 
 ```cpp
 MultiFieldIndex<TextRange> index;

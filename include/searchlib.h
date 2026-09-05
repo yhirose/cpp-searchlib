@@ -43,19 +43,22 @@ namespace detail {
 // loaded on the same platform that wrote it.
 //
 // format_type identifies peer alternatives (0 = plain fixed-width dump,
-// 2 = Elias-Fano compressed postings, 1 reserved for a future mmap layout;
-// see docs/postings_compression_design.ja.md), while schema_version tracks
+// 1 = Elias-Fano compressed postings; see
+// docs/postings_compression_design.ja.md), while schema_version tracks
 // layout evolution within one format_type, so each format versions
-// independently.
+// independently. Both schema versions restarted from 0 when documents
+// became ordinal-addressed (see the note on IPostings::document_ordinal):
+// nothing had shipped on the earlier numbering, so there is no file to
+// migrate.
 inline constexpr char kIndexMagic[4] = {'S', 'I', 'D', 'X'};
 inline constexpr uint32_t kFormatTypePlain = 0;
-inline constexpr uint32_t kFormatTypeCompressed = 2;
-inline constexpr uint32_t kSchemaVersionPlain = 3;
-inline constexpr uint32_t kSchemaVersionCompressed = 3;
+inline constexpr uint32_t kFormatTypeCompressed = 1;
+inline constexpr uint32_t kSchemaVersionPlain = 0;
+inline constexpr uint32_t kSchemaVersionCompressed = 0;
 
 // Opaque storage for InMemoryInvertedIndexBase's scope data (a map of
 // Elias-Fano encoded position->scope-ordinal sequences, one per
-// (scope_name, document_id)). Defined in invertedindex.cpp, which includes
+// (scope_name, ordinal)). Defined in invertedindex.cpp, which includes
 // succinct.h; kept incomplete here so that succinct machinery stays out of
 // this public header. shared_ptr<incomplete T> is safe as a class member
 // (unlike unique_ptr<incomplete T>) since it never needs T's destructor to
@@ -124,12 +127,17 @@ public:
 
   virtual size_t size() const = 0;
 
-  // document_id is scoped to the IInvertedIndex instance that produced this
-  // IPostings; it is not a globally unique identifier across indexes. Code
-  // that fans out across multiple indexes (e.g. a future federated search
-  // layer) must tag results with their originating index rather than
-  // assuming document_id alone is enough to disambiguate them.
-  virtual size_t document_id(size_t index) const = 0;
+  // A document is addressed two ways. Its *key* is the caller's own
+  // identifier, handed to IIndexer::index_document and stable for the life
+  // of the document. Its *ordinal* is assigned by the index, densely and in
+  // indexing order, and is what postings, text ranges and tombstones are
+  // keyed by -- so a postings list is ascending in it no matter what order
+  // the caller chose keys in, and an index is free to renumber (a future
+  // merge would). Postings only ever speak ordinals; translate back through
+  // the owning index's document_key(). An ordinal is scoped to the
+  // IInvertedIndex that produced this IPostings, so code fanning out across
+  // indexes must tag results with their originating index.
+  virtual size_t document_ordinal(size_t index) const = 0;
   virtual size_t search_hit_count(size_t index) const = 0;
 
   virtual size_t term_position(size_t index, size_t search_hit_index) const = 0;
@@ -143,18 +151,18 @@ public:
 
   virtual size_t document_count() const = 0;
 
-  // document_id here (and everywhere else in this interface) is local to
-  // this IInvertedIndex instance; see the note on IPostings::document_id.
-  virtual size_t document_term_count(size_t document_id) const = 0;
+  // Every document argument in this interface is an ordinal (see the note
+  // on IPostings::document_ordinal), local to this IInvertedIndex instance.
+  virtual size_t document_term_count(size_t ordinal) const = 0;
   virtual double average_document_term_count() const = 0;
 
   virtual bool term_exists(const std::u32string &str) const = 0;
   virtual size_t term_count(const std::u32string &str) const = 0;
   virtual size_t term_count(const std::u32string &str,
-                            size_t document_id) const = 0;
+                            size_t ordinal) const = 0;
 
   virtual size_t df(const std::u32string &str) const = 0;
-  virtual double tf(const std::u32string &str, size_t document_id) const = 0;
+  virtual double tf(const std::u32string &str, size_t ordinal) const = 0;
 
   virtual std::shared_ptr<const IPostings>
   postings(const std::u32string &str) const = 0;
@@ -206,10 +214,10 @@ public:
       const std::function<void(const std::u32string &str)> &callback) const = 0;
 
   // Logical (tombstone) deletion support. Read-only indexes report no
-  // removals; searches filter out removed document_ids via these hooks.
+  // removals; searches filter out removed ordinals via these hooks.
   // Overridden by indexes that support IMutableInvertedIndex::remove_document.
   virtual bool has_removed_documents() const { return false; }
-  virtual bool is_document_removed(size_t document_id) const { return false; }
+  virtual bool is_document_removed(size_t ordinal) const { return false; }
 };
 
 //-----------------------------------------------------------------------------
@@ -228,7 +236,7 @@ using Normalizer = std::function<std::u32string(const std::u32string &str)>;
 
 template <typename T>
 using TextRangeList =
-    std::unordered_map<size_t /*document_id*/, std::vector<T>>;
+    std::unordered_map<size_t /*ordinal*/, std::vector<T>>;
 
 template <typename T>
 using Tokenizer =
@@ -303,8 +311,26 @@ public:
                        size_t search_hit_index) const = 0;
 };
 
+// The key <-> ordinal bridge (see the note on IPostings::document_ordinal),
+// on every index that can answer it. Kept off IInvertedIndex so that the
+// search and scoring layer never has to know what a key looks like: it
+// speaks ordinals only, and callers translate at the edges.
+class IKeyedIndex {
+public:
+  virtual ~IKeyedIndex() = 0;
+
+  // Only defined for an ordinal this index handed out.
+  virtual size_t document_key(size_t ordinal) const = 0;
+
+  // The ordinal a key names -- a removed document's tombstoned ordinal
+  // included, on which is_document_removed is true -- or nullopt for a key
+  // never indexed.
+  virtual std::optional<size_t> document_ordinal(size_t document_key) const = 0;
+};
+
 template <typename T>
 class IInvertedIndexWithTextRange : public IInvertedIndex,
+                                    public IKeyedIndex,
                                     public ITextRange<T> {
 public:
   virtual ~IInvertedIndexWithTextRange(){};
@@ -317,7 +343,7 @@ public:
 // Optional per-index capability, analogous to IMutableInvertedIndex: kept
 // separate from IInvertedIndex (rather than discovered via
 // dynamic_pointer_cast) so callers wire it in explicitly, with no RTTI
-// involved. Maps a (scope_name, document_id, term_pos) triple to the ordinal
+// involved. Maps a (scope_name, document ordinal, term_pos) triple to the id
 // of the structural unit (e.g. paragraph number) that term_pos falls in, so
 // that Operation::SameScope can test whether hits from different sub-queries
 // co-occur within the same unit. scope_name is an opaque caller-chosen
@@ -327,13 +353,14 @@ class IScopeIndex {
 public:
   virtual ~IScopeIndex() = 0;
 
+  // `ordinal` is a document ordinal (see IPostings::document_ordinal).
   virtual bool has_scope(const std::string &scope_name,
-                         size_t document_id) const = 0;
+                         size_t ordinal) const = 0;
 
-  // The scope ordinal at term_pos. term_pos must be < document_term_count(
-  // document_id); behavior is unspecified otherwise. Only meaningful when
-  // has_scope(scope_name, document_id) is true.
-  virtual size_t scope_id(const std::string &scope_name, size_t document_id,
+  // The scope id at term_pos. term_pos must be < document_term_count(
+  // ordinal); behavior is unspecified otherwise. Only meaningful when
+  // has_scope(scope_name, ordinal) is true.
+  virtual size_t scope_id(const std::string &scope_name, size_t ordinal,
                           size_t term_pos) const = 0;
 };
 
@@ -503,12 +530,12 @@ private:
     // searching the list again.
     //
     // The invariant `cursor` is the first entry whose document id is >=
-    // `last_document_id` is what lets a forward lookup answer "this document
+    // `last_ordinal` is what lets a forward lookup answer "this document
     // does not carry the term" without searching at all -- the common case
     // for an Or, where most hits match only some of its terms. Scoring out
     // of order stays correct, just without the shortcut.
     mutable size_t cursor;
-    mutable size_t last_document_id;
+    mutable size_t last_ordinal;
   };
 
   const IInvertedIndex &invidx_;
@@ -593,9 +620,9 @@ class IMutableInvertedIndex {
 public:
   virtual ~IMutableInvertedIndex() = 0;
 
-  // document_id is local to the corresponding IInvertedIndex; see the note
-  // on IPostings::document_id.
-  virtual void remove_document(size_t document_id) = 0;
+  // document_key is the caller's key, as given to IIndexer::index_document.
+  // A key that names no document is a no-op.
+  virtual void remove_document(size_t document_key) = 0;
 };
 
 // One entry in a FederatedIndex. mutable_index is null for read-only
@@ -606,9 +633,10 @@ struct FederationMember {
   std::shared_ptr<IMutableInvertedIndex> mutable_index;
 };
 
-// One hit produced by perform_federated_search. document ids are only
-// meaningful together with `index`, since each member has its own local id
-// space (see the note on IPostings::document_id).
+// One hit produced by perform_federated_search. The hit's ordinal (via
+// postings->document_ordinal(index_in_postings)) is only meaningful together
+// with `index`, since each member has its own ordinal space (see the note on
+// IPostings::document_ordinal).
 struct FederatedHit {
   std::shared_ptr<IInvertedIndex> index;
   std::shared_ptr<IPostings> postings;
@@ -624,13 +652,12 @@ struct FederatedHit {
 // This class only guards its own member list; it does not make any
 // individual IInvertedIndex/IMutableInvertedIndex thread-safe on its own.
 //
-// There is deliberately no federation-level remove_document(document_id):
-// document ids are member-local (see the note on IPostings::document_id), so
-// an id alone does not identify which member to delete from. Callers remove
-// through the owning member's IMutableInvertedIndex
-// (FederationMember::mutable_index->remove_document(id)); a removed document
-// then disappears from perform_federated_search automatically, since each
-// member's perform_search filters its own tombstones.
+// There is deliberately no federation-level remove_document: a key alone
+// does not say which member holds it. Callers remove through the owning
+// member's IMutableInvertedIndex
+// (FederationMember::mutable_index->remove_document(key)); a removed
+// document then disappears from perform_federated_search automatically,
+// since each member's perform_search filters its own tombstones.
 class FederatedIndex {
 public:
   void add(std::shared_ptr<IInvertedIndex> index,
@@ -660,10 +687,11 @@ template <typename T> class IIndexer {
 public:
   virtual ~IIndexer(){};
 
-  // document_id is chosen by the caller and is only meaningful within the
-  // IInvertedIndex this indexer writes to; see the note on
-  // IPostings::document_id.
-  virtual void index_document(size_t document_id, Tokenizer<T> tokenizer) = 0;
+  // document_key is chosen by the caller and names the document from then
+  // on (see the note on IPostings::document_ordinal). Indexing a key that is
+  // already present replaces that document: the old one is tombstoned and
+  // the new text gets a fresh ordinal, so nothing of the old text survives.
+  virtual void index_document(size_t document_key, Tokenizer<T> tokenizer) = 0;
 };
 
 //-----------------------------------------------------------------------------
@@ -788,8 +816,8 @@ TextRange text_range(const TextRangeList<TextRange> &text_range_list,
 // Either way load() restores the same in-memory structure and auto-detects
 // the format from the file header, so no format argument is needed there.
 enum class IndexFormat : uint32_t {
-  Plain = 0,
-  Compressed = 2, // 1 is reserved for a future mmap-oriented format
+  Plain = detail::kFormatTypePlain,
+  Compressed = detail::kFormatTypeCompressed,
 };
 
 namespace detail {
@@ -827,18 +855,20 @@ load_compressed_index(const std::string &path);
 
 class InMemoryInvertedIndexBase : public IInvertedIndex, public IScopeIndex {
 public:
+  // Live documents only: a removed one no longer counts here, nor in the
+  // average below.
   size_t document_count() const override;
 
-  size_t document_term_count(size_t document_id) const override;
+  size_t document_term_count(size_t ordinal) const override;
   double average_document_term_count() const override;
 
   bool term_exists(const std::u32string &str) const override;
   size_t term_count(const std::u32string &str) const override;
   size_t term_count(const std::u32string &str,
-                    size_t document_id) const override;
+                    size_t ordinal) const override;
 
   size_t df(const std::u32string &str) const override;
-  double tf(const std::u32string &str, size_t document_id) const override;
+  double tf(const std::u32string &str, size_t ordinal) const override;
 
   std::shared_ptr<const IPostings>
   postings(const std::u32string &str) const override;
@@ -859,26 +889,37 @@ public:
       const override;
 
   bool has_removed_documents() const override;
-  bool is_document_removed(size_t document_id) const override;
+  bool is_document_removed(size_t ordinal) const override;
 
-  // Logical deletion: mark a document_id as removed. The postings and term
-  // statistics are left intact (no physical compaction); searches exclude
-  // removed document_ids at their output. Re-indexing the same document_id
-  // via InMemoryIndexer clears the tombstone.
-  void remove_document(size_t document_id);
+  // The key <-> ordinal bridge (see the note on IPostings::document_ordinal).
+  // document_key is only defined for an ordinal this index handed out.
+  // document_ordinal answers for a removed document too (its tombstoned
+  // ordinal, on which is_document_removed is true), and nullopt for a key
+  // that was never indexed.
+  size_t document_key(size_t ordinal) const;
+  std::optional<size_t> document_ordinal(size_t document_key) const;
 
-  // Search-scope side data (see IScopeIndex). scope_ids.size() must equal
-  // document_term_count(document_id) and its values must be monotonically
-  // non-decreasing (positions in the same structural unit share a value;
-  // later units get strictly larger values). Overwrites any previous
-  // registration for the same (scope_name, document_id). Throws
-  // std::invalid_argument on a size mismatch or a non-monotone sequence.
-  void set_scope_ids(const std::string &scope_name, size_t document_id,
+  // Logical deletion: tombstone the document `document_key` names. The
+  // postings and term statistics are left intact (no physical compaction);
+  // searches exclude removed ordinals at their output, and document_count /
+  // average_document_term_count count live documents only. A key that names
+  // no document is a no-op. Re-indexing the key via InMemoryIndexer makes it
+  // searchable again, under a fresh ordinal.
+  void remove_document(size_t document_key);
+
+  // Search-scope side data (see IScopeIndex), registered by key since that is
+  // what the caller has. scope_ids.size() must equal the document's term
+  // count and its values must be monotonically non-decreasing (positions in
+  // the same structural unit share a value; later units get strictly larger
+  // values). Overwrites any previous registration for the same (scope_name,
+  // document). Throws std::invalid_argument on a key that names no document,
+  // a size mismatch or a non-monotone sequence.
+  void set_scope_ids(const std::string &scope_name, size_t document_key,
                      const std::vector<size_t> &scope_ids);
 
   bool has_scope(const std::string &scope_name,
-                size_t document_id) const override;
-  size_t scope_id(const std::string &scope_name, size_t document_id,
+                size_t ordinal) const override;
+  size_t scope_id(const std::string &scope_name, size_t ordinal,
                   size_t term_pos) const override;
 
   // Serialize/deserialize the T-independent part of the index (documents_
@@ -893,14 +934,18 @@ public:
   public:
     size_t size() const override;
 
-    size_t document_id(size_t index) const override;
+    size_t document_ordinal(size_t index) const override;
     size_t search_hit_count(size_t index) const override;
 
     size_t term_position(size_t index, size_t search_hit_index) const override;
     size_t term_length(size_t index, size_t search_hit_index) const override;
     bool is_term_position(size_t index, size_t term_pos) const override;
 
-    void add_term_position(size_t document_id, size_t term_pos);
+    // Appends term_pos for `ordinal`, which must be >= the last ordinal
+    // appended: ordinals are handed out in indexing order and never
+    // revisited (re-indexing gets a fresh one), so a postings list is
+    // append-only.
+    void add_term_position(size_t ordinal, size_t term_pos);
 
     void save(std::ostream &os) const;
     void load(std::istream &is);
@@ -914,23 +959,25 @@ public:
     void load_compressed(std::istream &is);
 
   private:
-    // Document ids ascending, so that document_id(index) is O(1) and lookups
-    // by document_id can binary-search; each document's term positions are
-    // the slice [offsets_[i], offsets_[i + 1]) of one concatenated array.
+    // Ordinals ascending (by construction, see add_term_position), so that
+    // document_ordinal(index) is O(1) and lookups by ordinal can
+    // binary-search; each document's term positions are the slice
+    // [offsets_[i], offsets_[i + 1]) of one concatenated array.
     //
     // The three arrays exist instead of a vector of
-    // (document_id, vector<position>) pairs because that shape put a 24-byte
-    // vector header beside every 8-byte document id. Walking or galloping
-    // over the document ids then strode 32 bytes and pulled in three
-    // quarters of a cache line it never read, which is the dominant cost of
-    // an And over a high-df term.
-    std::vector<size_t> document_ids_;
-    std::vector<size_t> offsets_{0}; // document_ids_.size() + 1 entries
+    // (ordinal, vector<position>) pairs because that shape put a 24-byte
+    // vector header beside every 8-byte ordinal. Walking or galloping over
+    // the ordinals then strode 32 bytes and pulled in three quarters of a
+    // cache line it never read, which is the dominant cost of an And over a
+    // high-df term.
+    std::vector<size_t> document_ordinals_;
+    std::vector<size_t> offsets_{0}; // document_ordinals_.size() + 1 entries
     std::vector<size_t> positions_;  // every position, concatenated
   };
 
   struct Document {
     size_t term_count;
+    size_t key;
   };
 
   struct Term {
@@ -939,17 +986,24 @@ public:
     Postings postings;
   };
 
-  // Registers (or replaces) a document's term count. Always go through this
-  // rather than assigning into documents_ directly, so that the running total
-  // behind average_document_term_count() stays correct.
-  void set_document_term_count(size_t document_id, size_t term_count);
+  // Hands out the next ordinal for `document_key`. A key that already names
+  // a document tombstones that document first -- re-indexing is delete +
+  // add -- so ordinals only ever grow and nothing of the old text survives.
+  // The new document's term count is 0 until set_document_term_count.
+  size_t allocate_ordinal(size_t document_key);
 
-  std::unordered_map<size_t /*document_id*/, Document> documents_;
+  // Records a freshly allocated document's term count. Always go through
+  // this rather than assigning into documents_ directly, so that the running
+  // total behind average_document_term_count() stays correct.
+  void set_document_term_count(size_t ordinal, size_t term_count);
+
+  std::vector<Document> documents_; // indexed by ordinal
+  std::unordered_map<size_t /*key*/, size_t /*ordinal*/> key_to_ordinal_;
   std::unordered_map<std::u32string /*str*/, Term> term_dictionary_;
-  std::unordered_set<size_t /*document_id*/> removed_document_ids_;
+  std::unordered_set<size_t /*ordinal*/> removed_ordinals_;
   std::shared_ptr<detail::ScopeIndexData> scope_data_;
 
-  // Sum of every documents_ entry's term_count, maintained on write so that
+  // Sum of every live document's term_count, maintained on write so that
   // average_document_term_count() is O(1). It used to walk documents_ on
   // every call, which bm25_score makes once per scored hit -- that turned
   // scoring into O(hits * documents) and dominated every ranked query.
@@ -957,6 +1011,11 @@ public:
   // and runs under ThreadSafeInvertedIndex's shared_lock, where a mutable
   // cache would be a data race.
   size_t total_document_term_count_ = 0;
+
+private:
+  // Idempotent: tombstoning an ordinal twice changes nothing, which is what
+  // lets allocate_ordinal and remove_document share it without checking.
+  void tombstone_(size_t ordinal);
 };
 
 template <typename T>
@@ -966,8 +1025,8 @@ class InMemoryInvertedIndex : public IInvertedIndexWithTextRange<T>,
 public:
   size_t document_count() const override { return base_.document_count(); }
 
-  size_t document_term_count(size_t document_id) const override {
-    return base_.document_term_count(document_id);
+  size_t document_term_count(size_t ordinal) const override {
+    return base_.document_term_count(ordinal);
   }
 
   double average_document_term_count() const override {
@@ -983,14 +1042,14 @@ public:
   }
 
   size_t term_count(const std::u32string &str,
-                    size_t document_id) const override {
-    return base_.term_count(str, document_id);
+                    size_t ordinal) const override {
+    return base_.term_count(str, ordinal);
   }
 
   size_t df(const std::u32string &str) const override { return base_.df(str); }
 
-  double tf(const std::u32string &str, size_t document_id) const override {
-    return base_.tf(str, document_id);
+  double tf(const std::u32string &str, size_t ordinal) const override {
+    return base_.tf(str, ordinal);
   }
 
   std::shared_ptr<const IPostings>
@@ -1023,27 +1082,35 @@ public:
     return base_.has_removed_documents();
   }
 
-  bool is_document_removed(size_t document_id) const override {
-    return base_.is_document_removed(document_id);
+  bool is_document_removed(size_t ordinal) const override {
+    return base_.is_document_removed(ordinal);
   }
 
-  void remove_document(size_t document_id) override {
-    base_.remove_document(document_id);
+  size_t document_key(size_t ordinal) const override {
+    return base_.document_key(ordinal);
   }
 
-  void set_scope_ids(const std::string &scope_name, size_t document_id,
+  std::optional<size_t> document_ordinal(size_t document_key) const override {
+    return base_.document_ordinal(document_key);
+  }
+
+  void remove_document(size_t document_key) override {
+    base_.remove_document(document_key);
+  }
+
+  void set_scope_ids(const std::string &scope_name, size_t document_key,
                      const std::vector<size_t> &scope_ids) {
-    base_.set_scope_ids(scope_name, document_id, scope_ids);
+    base_.set_scope_ids(scope_name, document_key, scope_ids);
   }
 
   bool has_scope(const std::string &scope_name,
-                size_t document_id) const override {
-    return base_.has_scope(scope_name, document_id);
+                size_t ordinal) const override {
+    return base_.has_scope(scope_name, ordinal);
   }
 
-  size_t scope_id(const std::string &scope_name, size_t document_id,
+  size_t scope_id(const std::string &scope_name, size_t ordinal,
                   size_t term_pos) const override {
-    return base_.scope_id(scope_name, document_id, term_pos);
+    return base_.scope_id(scope_name, ordinal, term_pos);
   }
 
   T text_range(const IPostings &positions, size_t index,
@@ -1163,19 +1230,21 @@ private:
   template <typename> friend class InMemoryIndexer;
 
   // Generic text-range section: per-document value lists written with
-  // save_value_, ordered by document_id for deterministic output.
+  // save_value_, ordered by ordinal for deterministic output. The ordinal is
+  // written out because the map is sparse: a document with no positions
+  // never gets an entry.
   void save_text_ranges_(std::ostream &os,
                          const TextRangeSerializer &serialize_value) const {
     detail::write_scalar<uint64_t>(os, text_range_list_.size());
-    std::vector<size_t> document_ids;
-    document_ids.reserve(text_range_list_.size());
-    for (const auto &[document_id, _] : text_range_list_) {
-      document_ids.push_back(document_id);
+    std::vector<size_t> ordinals;
+    ordinals.reserve(text_range_list_.size());
+    for (const auto &[ordinal, _] : text_range_list_) {
+      ordinals.push_back(ordinal);
     }
-    std::sort(document_ids.begin(), document_ids.end());
-    for (auto document_id : document_ids) {
-      const auto &values = text_range_list_.at(document_id);
-      detail::write_scalar<uint64_t>(os, document_id);
+    std::sort(ordinals.begin(), ordinals.end());
+    for (auto ordinal : ordinals) {
+      const auto &values = text_range_list_.at(ordinal);
+      detail::write_scalar<uint64_t>(os, ordinal);
       detail::write_scalar<uint64_t>(os, values.size());
       for (const auto &value : values) {
         save_value_(os, value, serialize_value);
@@ -1187,14 +1256,14 @@ private:
                          const TextRangeDeserializer &deserialize_value) {
     auto document_count = detail::read_scalar<uint64_t>(is);
     for (uint64_t i = 0; i < document_count; i++) {
-      auto document_id = static_cast<size_t>(detail::read_scalar<uint64_t>(is));
+      auto ordinal = static_cast<size_t>(detail::read_scalar<uint64_t>(is));
       auto value_count = detail::read_scalar<uint64_t>(is);
       std::vector<T> values;
       values.reserve(static_cast<size_t>(value_count));
       for (uint64_t j = 0; j < value_count; j++) {
         values.push_back(load_value_(is, deserialize_value));
       }
-      text_range_list_[document_id] = std::move(values);
+      text_range_list_[ordinal] = std::move(values);
     }
   }
 
@@ -1267,10 +1336,11 @@ public:
                   TextRangeStorage text_ranges = TextRangeStorage::Store)
       : index_(index), normalizer_(normalizer), text_ranges_(text_ranges) {}
 
-  void index_document(size_t document_id, Tokenizer<T> tokenizer) override {
-    // (Re)indexing a document clears any prior logical-deletion tombstone,
-    // so that the "update = remove + re-index (same id)" pattern works.
-    index_.base_.removed_document_ids_.erase(document_id);
+  void index_document(size_t document_key, Tokenizer<T> tokenizer) override {
+    // A fresh ordinal every time: a key that already names a document has
+    // that one tombstoned by allocate_ordinal, which is what makes "update =
+    // re-index the same key" leave nothing of the old text behind.
+    auto ordinal = index_.base_.allocate_ordinal(document_key);
 
     size_t term_count = 0;
     tokenizer(normalizer_, [&](const auto &str, auto term_pos,
@@ -1282,16 +1352,16 @@ public:
 
       auto &term = index_.base_.term_dictionary_.at(str);
       term.term_count++;
-      term.postings.add_term_position(document_id, term_pos);
+      term.postings.add_term_position(ordinal, term_pos);
 
       if (text_ranges_ == TextRangeStorage::Store) {
-        index_.text_range_list_[document_id].push_back(std::move(text_range));
+        index_.text_range_list_[ordinal].push_back(std::move(text_range));
       }
 
       term_count++;
     });
 
-    index_.base_.set_document_term_count(document_id, term_count);
+    index_.base_.set_document_term_count(ordinal, term_count);
   }
 
 private:
@@ -1327,11 +1397,11 @@ private:
 //
 //   auto hits = index.read([&](const auto &idx) {
 //     auto postings = perform_search(idx, *expr);
-//     std::vector<size_t> document_ids;
+//     std::vector<size_t> keys;
 //     for (size_t i = 0; i < postings->size(); i++) {
-//       document_ids.push_back(postings->document_id(i));
+//       keys.push_back(idx.document_key(postings->document_ordinal(i)));
 //     }
-//     return document_ids;  // materialized: safe to use after the lock
+//     return keys;  // materialized: safe to use after the lock
 //   });
 template <typename T> class ThreadSafeInvertedIndex {
 public:
@@ -1362,13 +1432,12 @@ private:
 
 // Groups several independently-built InMemoryInvertedIndex<T> instances
 // under named fields (e.g. "title", "body", "tags"), the minimal answer to
-// docs/missing_features.ja.md 2.2. Unlike FederatedIndex (whose members have
-// member-local document_id spaces, see the note on IPostings::document_id),
-// a MultiFieldIndex's fields share one document_id space: the caller indexes
-// the same logical document under the same document_id into whichever
-// fields it has content for, so grouping hits back into "this document
-// matched in title and body" is a plain document_id comparison, no
-// per-field id remapping needed.
+// docs/missing_features.ja.md 2.2. The fields share one key space: the
+// caller indexes the same logical document under the same key into whichever
+// fields it has content for. Each field is its own index with its own
+// ordinals, though, and a document present in some fields but not others
+// lands on different ordinals in each -- so hits are grouped by key, which
+// perform_multi_field_search resolves per hit, never by ordinal.
 //
 // Field-qualified search ("only search the title field") needs no new API:
 // call perform_search(*index.field("title"), expr) directly, exactly as for
@@ -1446,14 +1515,14 @@ private:
 };
 
 // One hit produced by perform_multi_field_search, tagged with the field it
-// came from. document_id (via postings->document_id(index_in_postings)) is
-// shared across fields -- see the MultiFieldIndex note above -- so callers
-// group hits by that id to combine per-field matches/scores for the same
-// document.
+// came from and with the document's key -- the one thing shared across
+// fields (see the MultiFieldIndex note above), so callers group hits by
+// document_key to combine per-field matches/scores for the same document.
 template <typename T> struct MultiFieldHit {
   std::string field;
   std::shared_ptr<IPostings> postings;
   size_t index_in_postings;
+  size_t document_key;
 };
 
 // Runs expr independently against every field of index (each field resolves
@@ -1461,7 +1530,7 @@ template <typename T> struct MultiFieldHit {
 // results tagged by field name. No cross-field score normalization,
 // combination, or sorting is performed; callers that need a single combined
 // ranking do so themselves (e.g. summing or maxing bm25_score across the
-// fields where a document_id appears) -- the same division of
+// fields where a document_key appears) -- the same division of
 // responsibility as perform_federated_search.
 template <typename T>
 std::vector<MultiFieldHit<T>>
@@ -1472,7 +1541,8 @@ perform_multi_field_search(const MultiFieldIndex<T> &index,
     const auto *field_index = index.field(name);
     auto postings = perform_search(*field_index, expr);
     for (size_t i = 0; i < postings->size(); i++) {
-      hits.push_back({name, postings, i});
+      hits.push_back({name, postings, i,
+                      field_index->document_key(postings->document_ordinal(i))});
     }
   }
   return hits;

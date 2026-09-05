@@ -26,10 +26,10 @@ auto sample_index() {
   InMemoryInvertedIndex<TextRange> invidx;
 
   InMemoryIndexer indexer(invidx, normalizer);
-  size_t document_id = 0;
+  size_t document_key = 0;
   for (const auto &doc : sample_documents) {
-    indexer.index_document(document_id, UTF8PlainTextTokenizer(doc));
-    document_id++;
+    indexer.index_document(document_key, UTF8PlainTextTokenizer(doc));
+    document_key++;
   }
 
   EXPECT_EQ(sample_documents.size(), invidx.document_count());
@@ -52,14 +52,14 @@ TEST(TokenizerTest, UTF8PlainTextTokenizer) {
       {"a", "well", "known", "example"},
   };
 
-  size_t document_id = 0;
+  size_t document_key = 0;
   for (const auto &doc : sample_documents) {
     UTF8PlainTextTokenizer tokenizer(doc);
     std::vector<std::string> actual;
     tokenizer([](auto sv) { return unicode::to_lowercase(sv); },
               [&](auto &str, auto, auto) { actual.emplace_back(u8(str)); });
-    EXPECT_EQ(expected[document_id], actual);
-    document_id++;
+    EXPECT_EQ(expected[document_key], actual);
+    document_key++;
   }
 }
 
@@ -170,7 +170,7 @@ TEST(TermTest, TermSearch) {
 
     {
       auto index = 0;
-      EXPECT_EQ(0, postings->document_id(index));
+      EXPECT_EQ(0, postings->document_ordinal(index));
       EXPECT_EQ(1, postings->search_hit_count(index));
 
       EXPECT_EQ(2, postings->term_position(index, 0));
@@ -183,7 +183,7 @@ TEST(TermTest, TermSearch) {
 
     {
       auto index = 2;
-      EXPECT_EQ(2, postings->document_id(index));
+      EXPECT_EQ(2, postings->document_ordinal(index));
       EXPECT_EQ(3, postings->search_hit_count(index));
 
       EXPECT_EQ(2, postings->term_position(index, 0));
@@ -209,7 +209,7 @@ TEST(TermTest, TermSearch) {
 
     {
       auto index = 0;
-      EXPECT_EQ(1, postings->document_id(index));
+      EXPECT_EQ(1, postings->document_ordinal(index));
       EXPECT_EQ(1, postings->search_hit_count(index));
 
       EXPECT_EQ(3, postings->term_position(index, 0));
@@ -222,7 +222,7 @@ TEST(TermTest, TermSearch) {
 
     {
       auto index = 1;
-      EXPECT_EQ(2, postings->document_id(index));
+      EXPECT_EQ(2, postings->document_ordinal(index));
       EXPECT_EQ(1, postings->search_hit_count(index));
 
       EXPECT_EQ(8, postings->term_position(index, 0));
@@ -235,10 +235,12 @@ TEST(TermTest, TermSearch) {
   }
 }
 
-TEST(TermTest, OutOfOrderDocumentIds) {
-  // Postings keeps entries sorted by document_id internally; this indexes
-  // documents in descending order to verify that add_term_position's sorted
-  // insertion (not just append) keeps lookups and result ordering correct.
+TEST(TermTest, OutOfOrderDocumentKeys) {
+  // Keys are the caller's business and arrive in any order; the ordinals the
+  // index assigns underneath follow indexing order regardless, which is what
+  // keeps every postings list append-only (add_term_position asserts it).
+  // This indexes keys in descending order and checks that nothing about the
+  // result depends on it except the keys themselves.
   InMemoryInvertedIndex<TextRange> invidx;
   InMemoryIndexer indexer(invidx, normalizer);
 
@@ -248,22 +250,31 @@ TEST(TermTest, OutOfOrderDocumentIds) {
       "first document here",
   };
   for (size_t i = 0; i < documents.size(); i++) {
-    size_t document_id = documents.size() - 1 - i;
-    indexer.index_document(document_id, UTF8PlainTextTokenizer(documents[i]));
+    size_t document_key = documents.size() - 1 - i;
+    indexer.index_document(document_key, UTF8PlainTextTokenizer(documents[i]));
   }
+
+  // Ordinals 0, 1, 2 were handed out in that order, to keys 2, 1, 0.
+  EXPECT_EQ(2, invidx.document_key(0));
+  EXPECT_EQ(1, invidx.document_key(1));
+  EXPECT_EQ(0, invidx.document_key(2));
+  EXPECT_EQ(0, *invidx.document_ordinal(2));
+  EXPECT_EQ(2, *invidx.document_ordinal(0));
+  EXPECT_FALSE(invidx.document_ordinal(3));
 
   EXPECT_EQ(3, invidx.document_count());
   EXPECT_EQ(3, invidx.df(U"document"));
-  EXPECT_EQ(1, invidx.term_count(U"document", 0));
-  EXPECT_EQ(1, invidx.term_count(U"document", 1));
-  EXPECT_EQ(1, invidx.term_count(U"document", 2));
+  for (size_t key = 0; key < 3; key++) {
+    EXPECT_EQ(1, invidx.term_count(U"document", *invidx.document_ordinal(key)));
+  }
 
   auto expr = parse_query(normalizer, "document");
   auto postings = perform_search(invidx, *expr);
   ASSERT_EQ(3, postings->size());
-  EXPECT_EQ(0, postings->document_id(0));
-  EXPECT_EQ(1, postings->document_id(1));
-  EXPECT_EQ(2, postings->document_id(2));
+  // Ascending in ordinal, which is indexing order -- so descending in key.
+  EXPECT_EQ(2, invidx.document_key(postings->document_ordinal(0)));
+  EXPECT_EQ(1, invidx.document_key(postings->document_ordinal(1)));
+  EXPECT_EQ(0, invidx.document_key(postings->document_ordinal(2)));
 }
 
 TEST(AndTest, AndSearch) {
@@ -281,7 +292,7 @@ TEST(AndTest, AndSearch) {
 
     {
       auto index = 0;
-      EXPECT_EQ(2, postings->document_id(index));
+      EXPECT_EQ(2, postings->document_ordinal(index));
       EXPECT_EQ(6, postings->search_hit_count(index));
 
       {
@@ -332,7 +343,7 @@ TEST(OrTest, OrSearch) {
 
     {
       auto index = 0;
-      EXPECT_EQ(1, postings->document_id(index));
+      EXPECT_EQ(1, postings->document_ordinal(index));
       EXPECT_EQ(1, postings->search_hit_count(index));
 
       {
@@ -348,7 +359,7 @@ TEST(OrTest, OrSearch) {
 
     {
       auto index = 1;
-      EXPECT_EQ(2, postings->document_id(index));
+      EXPECT_EQ(2, postings->document_ordinal(index));
       EXPECT_EQ(3, postings->search_hit_count(index));
 
       {
@@ -384,7 +395,7 @@ TEST(OrTest, OrSearch) {
 
     {
       auto index = 2;
-      EXPECT_EQ(4, postings->document_id(index));
+      EXPECT_EQ(4, postings->document_ordinal(index));
       EXPECT_EQ(1, postings->search_hit_count(index));
 
       {
@@ -415,7 +426,7 @@ TEST(AdjacentTest, AdjacentSearch) {
 
     {
       auto index = 0;
-      EXPECT_EQ(0, postings->document_id(index));
+      EXPECT_EQ(0, postings->document_ordinal(index));
       EXPECT_EQ(1, postings->search_hit_count(index));
 
       {
@@ -431,7 +442,7 @@ TEST(AdjacentTest, AdjacentSearch) {
 
     {
       auto index = 1;
-      EXPECT_EQ(1, postings->document_id(index));
+      EXPECT_EQ(1, postings->document_ordinal(index));
       EXPECT_EQ(1, postings->search_hit_count(index));
 
       {
@@ -447,7 +458,7 @@ TEST(AdjacentTest, AdjacentSearch) {
 
     {
       auto index = 2;
-      EXPECT_EQ(2, postings->document_id(index));
+      EXPECT_EQ(2, postings->document_ordinal(index));
       EXPECT_EQ(2, postings->search_hit_count(index));
 
       {
@@ -488,7 +499,7 @@ TEST(AdjacentTest, AdjacentSearchWith3Words) {
 
     {
       auto index = 0;
-      EXPECT_EQ(2, postings->document_id(index));
+      EXPECT_EQ(2, postings->document_ordinal(index));
       EXPECT_EQ(1, postings->search_hit_count(index));
 
       {
@@ -519,7 +530,7 @@ TEST(NearTest, NearSearch) {
 
     {
       auto index = 0;
-      EXPECT_EQ(1, postings->document_id(index));
+      EXPECT_EQ(1, postings->document_ordinal(index));
       EXPECT_EQ(2, postings->search_hit_count(index));
 
       {
@@ -545,7 +556,7 @@ TEST(NearTest, NearSearch) {
 
     {
       auto index = 1;
-      EXPECT_EQ(2, postings->document_id(index));
+      EXPECT_EQ(2, postings->document_ordinal(index));
       EXPECT_EQ(2, postings->search_hit_count(index));
 
       {
@@ -586,7 +597,7 @@ TEST(NearTest, NearSearchWithPhrase) {
 
     {
       auto index = 0;
-      EXPECT_EQ(2, postings->document_id(index));
+      EXPECT_EQ(2, postings->document_ordinal(index));
       EXPECT_EQ(2, postings->search_hit_count(index));
 
       {
@@ -623,7 +634,7 @@ TEST(QueryTest, UnicodeTerm) {
 
     auto postings = perform_search(invidx, *expr);
     EXPECT_EQ(1, postings->size());
-    EXPECT_EQ(5, postings->document_id(0));
+    EXPECT_EQ(5, postings->document_ordinal(0));
   }
 
   {
@@ -659,7 +670,7 @@ TEST(QueryTest, ImplicitPhrase) {
 
     auto postings = perform_search(invidx, *expr);
     EXPECT_EQ(1, postings->size());
-    EXPECT_EQ(6, postings->document_id(0));
+    EXPECT_EQ(6, postings->document_ordinal(0));
     EXPECT_EQ(1, postings->term_position(0, 0));
     EXPECT_EQ(2, postings->term_length(0, 0));
   }
@@ -673,7 +684,7 @@ TEST(QueryTest, ImplicitPhrase) {
 
     auto postings = perform_search(invidx, *expr);
     EXPECT_EQ(1, postings->size());
-    EXPECT_EQ(6, postings->document_id(0));
+    EXPECT_EQ(6, postings->document_ordinal(0));
     EXPECT_EQ(4, postings->term_length(0, 0));
   }
 
@@ -700,10 +711,10 @@ TEST(NotTest, NotSearch) {
 
     EXPECT_EQ(2, postings->size());
 
-    EXPECT_EQ(0, postings->document_id(0));
+    EXPECT_EQ(0, postings->document_ordinal(0));
     EXPECT_EQ(1, postings->search_hit_count(0));
 
-    EXPECT_EQ(3, postings->document_id(1));
+    EXPECT_EQ(3, postings->document_ordinal(1));
     EXPECT_EQ(1, postings->search_hit_count(1));
   }
 
@@ -712,9 +723,9 @@ TEST(NotTest, NotSearch) {
     auto postings = perform_search(invidx, *expr);
 
     EXPECT_EQ(3, postings->size());
-    EXPECT_EQ(0, postings->document_id(0));
-    EXPECT_EQ(1, postings->document_id(1));
-    EXPECT_EQ(3, postings->document_id(2));
+    EXPECT_EQ(0, postings->document_ordinal(0));
+    EXPECT_EQ(1, postings->document_ordinal(1));
+    EXPECT_EQ(3, postings->document_ordinal(2));
   }
 
   {
@@ -722,7 +733,7 @@ TEST(NotTest, NotSearch) {
     auto postings = perform_search(invidx, *expr);
 
     EXPECT_EQ(1, postings->size());
-    EXPECT_EQ(0, postings->document_id(0));
+    EXPECT_EQ(0, postings->document_ordinal(0));
   }
 
   {
@@ -759,11 +770,11 @@ TEST(TF_IDF_Test, TF_IDF) {
   {
     InMemoryIndexer indexer(invidx, normalizer);
 
-    size_t document_id = 0;
+    size_t document_key = 0;
     for (const auto &doc : documents) {
       UTF8PlainTextTokenizer tokenizer(doc);
-      indexer.index_document(document_id, tokenizer);
-      document_id++;
+      indexer.index_document(document_key, tokenizer);
+      document_key++;
     }
   }
 
@@ -824,11 +835,11 @@ TEST(TopKTest, ReturnsHighestScoresDescending) {
   InMemoryInvertedIndex<TextRange> invidx;
   {
     InMemoryIndexer indexer(invidx, normalizer);
-    size_t document_id = 0;
+    size_t document_key = 0;
     for (const auto &doc : documents) {
       UTF8PlainTextTokenizer tokenizer(doc);
-      indexer.index_document(document_id, tokenizer);
-      document_id++;
+      indexer.index_document(document_key, tokenizer);
+      document_key++;
     }
   }
 
@@ -841,9 +852,9 @@ TEST(TopKTest, ReturnsHighestScoresDescending) {
   });
 
   ASSERT_EQ(2, hits.size());
-  EXPECT_EQ(0, result->document_id(hits[0].index));
+  EXPECT_EQ(0, result->document_ordinal(hits[0].index));
   EXPECT_EQ(3, hits[0].score);
-  EXPECT_EQ(3, result->document_id(hits[1].index));
+  EXPECT_EQ(3, result->document_ordinal(hits[1].index));
   EXPECT_EQ(2, hits[1].score);
 }
 
@@ -857,11 +868,11 @@ TEST(TopKTest, KGreaterThanCountReturnsAllSorted) {
   InMemoryInvertedIndex<TextRange> invidx;
   {
     InMemoryIndexer indexer(invidx, normalizer);
-    size_t document_id = 0;
+    size_t document_key = 0;
     for (const auto &doc : documents) {
       UTF8PlainTextTokenizer tokenizer(doc);
-      indexer.index_document(document_id, tokenizer);
-      document_id++;
+      indexer.index_document(document_key, tokenizer);
+      document_key++;
     }
   }
 
@@ -873,9 +884,9 @@ TEST(TopKTest, KGreaterThanCountReturnsAllSorted) {
   });
 
   ASSERT_EQ(3, hits.size());
-  EXPECT_EQ(1, result->document_id(hits[0].index));
-  EXPECT_EQ(2, result->document_id(hits[1].index));
-  EXPECT_EQ(0, result->document_id(hits[2].index));
+  EXPECT_EQ(1, result->document_ordinal(hits[0].index));
+  EXPECT_EQ(2, result->document_ordinal(hits[1].index));
+  EXPECT_EQ(0, result->document_ordinal(hits[2].index));
 }
 
 TEST(TopKTest, ZeroKReturnsEmpty) {
@@ -906,11 +917,11 @@ TEST(TopKTest, TiesBrokenByAscendingIndex) {
   InMemoryInvertedIndex<TextRange> invidx;
   {
     InMemoryIndexer indexer(invidx, normalizer);
-    size_t document_id = 0;
+    size_t document_key = 0;
     for (const auto &doc : documents) {
       UTF8PlainTextTokenizer tokenizer(doc);
-      indexer.index_document(document_id, tokenizer);
-      document_id++;
+      indexer.index_document(document_key, tokenizer);
+      document_key++;
     }
   }
 
@@ -953,7 +964,7 @@ TEST(PersistenceTest, RoundTrip) {
   auto actual = perform_search(loaded, *expr);
   ASSERT_EQ(expected->size(), actual->size());
   for (size_t i = 0; i < expected->size(); i++) {
-    EXPECT_EQ(expected->document_id(i), actual->document_id(i));
+    EXPECT_EQ(expected->document_ordinal(i), actual->document_ordinal(i));
     ASSERT_EQ(expected->search_hit_count(i), actual->search_hit_count(i));
     for (size_t h = 0; h < expected->search_hit_count(i); h++) {
       auto a = invidx.text_range(*expected, i, h);
@@ -974,9 +985,9 @@ TEST(TextRangeStorageTest, SkippingRangesChangesNothingButTextRange) {
   InMemoryInvertedIndex<TextRange> skipped;
   {
     InMemoryIndexer indexer(skipped, normalizer, TextRangeStorage::Skip);
-    size_t document_id = 0;
+    size_t document_key = 0;
     for (const auto &doc : sample_documents) {
-      indexer.index_document(document_id++, UTF8PlainTextTokenizer(doc));
+      indexer.index_document(document_key++, UTF8PlainTextTokenizer(doc));
     }
   }
 
@@ -992,7 +1003,7 @@ TEST(TextRangeStorageTest, SkippingRangesChangesNothingButTextRange) {
     auto b = perform_search(skipped, *expr);
     ASSERT_EQ(a->size(), b->size()) << query;
     for (size_t i = 0; i < a->size(); i++) {
-      EXPECT_EQ(a->document_id(i), b->document_id(i)) << query;
+      EXPECT_EQ(a->document_ordinal(i), b->document_ordinal(i)) << query;
       EXPECT_EQ(a->search_hit_count(i), b->search_hit_count(i)) << query;
       // Term positions come from the postings, not from the ranges, so they
       // survive too -- only the byte offsets are gone.
@@ -1025,9 +1036,9 @@ TEST(TextRangeStorageTest, EmptyTextRangeSectionRoundTrips) {
   InMemoryInvertedIndex<TextRange> skipped;
   {
     InMemoryIndexer indexer(skipped, normalizer, TextRangeStorage::Skip);
-    size_t document_id = 0;
+    size_t document_key = 0;
     for (const auto &doc : sample_documents) {
-      indexer.index_document(document_id++, UTF8PlainTextTokenizer(doc));
+      indexer.index_document(document_key++, UTF8PlainTextTokenizer(doc));
     }
   }
 
@@ -1045,7 +1056,7 @@ TEST(TextRangeStorageTest, EmptyTextRangeSectionRoundTrips) {
     auto actual = perform_search(loaded, *expr);
     ASSERT_EQ(expected->size(), actual->size());
     for (size_t i = 0; i < expected->size(); i++) {
-      EXPECT_EQ(expected->document_id(i), actual->document_id(i));
+      EXPECT_EQ(expected->document_ordinal(i), actual->document_ordinal(i));
     }
     EXPECT_THROW(loaded.text_range(*actual, 0, 0), std::runtime_error);
   }
@@ -1072,7 +1083,7 @@ TEST(PersistenceTest, UnicodeTermSurvives) {
   auto expr = parse_query(normalizer, "東京");
   auto postings = perform_search(loaded, *expr);
   ASSERT_EQ(1, postings->size());
-  EXPECT_EQ(5, postings->document_id(0));
+  EXPECT_EQ(5, postings->document_ordinal(0));
 }
 
 TEST(PersistenceTest, FileRoundTrip) {
@@ -1107,12 +1118,12 @@ TEST(RemoveDocumentTest, ExcludedFromTermSearch) {
   EXPECT_FALSE(invidx.has_removed_documents());
   invidx.remove_document(1);
   EXPECT_TRUE(invidx.has_removed_documents());
-  EXPECT_TRUE(invidx.is_document_removed(1));
+  EXPECT_TRUE(invidx.is_document_removed(*invidx.document_ordinal(1)));
 
   auto postings = perform_search(invidx, *expr);
   ASSERT_EQ(2, postings->size());
-  EXPECT_EQ(0, postings->document_id(0));
-  EXPECT_EQ(2, postings->document_id(1));
+  EXPECT_EQ(0, postings->document_ordinal(0));
+  EXPECT_EQ(2, postings->document_ordinal(1));
 
   // The surviving entries' hits and text ranges stay addressable after the
   // index positions have been renumbered by the filter.
@@ -1130,27 +1141,67 @@ TEST(RemoveDocumentTest, ExcludedFromOrSearch) {
 
   auto postings = perform_search(invidx, *expr);
   ASSERT_EQ(2, postings->size());
-  EXPECT_EQ(1, postings->document_id(0));
-  EXPECT_EQ(4, postings->document_id(1));
+  EXPECT_EQ(1, postings->document_ordinal(0));
+  EXPECT_EQ(4, postings->document_ordinal(1));
 }
 
-TEST(RemoveDocumentTest, ReindexClearsTombstone) {
+TEST(RemoveDocumentTest, ReindexRevivesTheKey) {
   auto invidx = sample_index();
   InMemoryIndexer indexer(invidx, normalizer);
+  auto live = invidx.document_count();
 
   auto expr = parse_query(normalizer, "first"); // only doc 0
   ASSERT_EQ(1, perform_search(invidx, *expr)->size());
 
+  auto old_ordinal = *invidx.document_ordinal(0);
   invidx.remove_document(0);
   EXPECT_EQ(0, perform_search(invidx, *expr)->size());
+  EXPECT_EQ(live - 1, invidx.document_count());
 
-  // Re-indexing the same document_id clears the tombstone (update = remove +
-  // re-index), so the document becomes searchable again.
+  // Re-indexing the key (update = remove + re-index) makes it searchable
+  // again -- under a fresh ordinal. The old ordinal stays tombstoned; the
+  // key now names the new one.
   indexer.index_document(0, UTF8PlainTextTokenizer(sample_documents[0]));
-  EXPECT_FALSE(invidx.is_document_removed(0));
+  auto new_ordinal = *invidx.document_ordinal(0);
+  EXPECT_NE(old_ordinal, new_ordinal);
+  EXPECT_TRUE(invidx.is_document_removed(old_ordinal));
+  EXPECT_FALSE(invidx.is_document_removed(new_ordinal));
+  EXPECT_EQ(live, invidx.document_count());
+
   auto postings = perform_search(invidx, *expr);
   ASSERT_EQ(1, postings->size());
-  EXPECT_EQ(0, postings->document_id(0));
+  EXPECT_EQ(new_ordinal, postings->document_ordinal(0));
+  EXPECT_EQ(0, invidx.document_key(postings->document_ordinal(0)));
+}
+
+TEST(RemoveDocumentTest, ReindexReplacesTheText) {
+  // The point of a fresh ordinal per re-index: terms of the old text must
+  // not linger. Under the old same-slot scheme add_term_position appended to
+  // the existing entry, so "old" would still have found this document.
+  InMemoryInvertedIndex<TextRange> invidx;
+  InMemoryIndexer indexer(invidx, normalizer);
+
+  indexer.index_document(7, UTF8PlainTextTokenizer("old words here"));
+  indexer.index_document(8, UTF8PlainTextTokenizer("other document"));
+  indexer.index_document(7, UTF8PlainTextTokenizer("new words here"));
+
+  EXPECT_EQ(2, invidx.document_count());
+  EXPECT_EQ(0, perform_search(invidx, *parse_query(normalizer, "old"))->size());
+
+  auto postings = perform_search(invidx, *parse_query(normalizer, "new"));
+  ASSERT_EQ(1, postings->size());
+  EXPECT_EQ(7, invidx.document_key(postings->document_ordinal(0)));
+
+  // Both texts share "words here"; only the new one may answer for key 7.
+  auto shared = perform_search(invidx, *parse_query(normalizer, "words"));
+  ASSERT_EQ(1, shared->size());
+  EXPECT_EQ(1, shared->search_hit_count(0));
+  EXPECT_EQ(7, invidx.document_key(shared->document_ordinal(0)));
+
+  // The text ranges answer for the new text, not the old one.
+  auto rng = invidx.text_range(*postings, 0, 0);
+  EXPECT_EQ(0u, rng.position);
+  EXPECT_EQ(3u, rng.length); // "new"
 }
 
 TEST(RemoveDocumentTest, MutableInterface) {
@@ -1164,8 +1215,8 @@ TEST(RemoveDocumentTest, MutableInterface) {
   auto expr = parse_query(normalizer, "the");
   auto postings = perform_search(invidx, *expr);
   ASSERT_EQ(2, postings->size());
-  EXPECT_EQ(1, postings->document_id(0));
-  EXPECT_EQ(2, postings->document_id(1));
+  EXPECT_EQ(1, postings->document_ordinal(0));
+  EXPECT_EQ(2, postings->document_ordinal(1));
 }
 
 TEST(PersistenceTest, RemovedDocumentsSurvive) {
@@ -1179,13 +1230,13 @@ TEST(PersistenceTest, RemovedDocumentsSurvive) {
   loaded.load(ss);
 
   EXPECT_TRUE(loaded.has_removed_documents());
-  EXPECT_TRUE(loaded.is_document_removed(1));
+  EXPECT_TRUE(loaded.is_document_removed(*loaded.document_ordinal(1)));
 
   auto expr = parse_query(normalizer, "the");
   auto postings = perform_search(loaded, *expr);
   ASSERT_EQ(2, postings->size());
-  EXPECT_EQ(0, postings->document_id(0));
-  EXPECT_EQ(2, postings->document_id(1));
+  EXPECT_EQ(0, loaded.document_key(postings->document_ordinal(0)));
+  EXPECT_EQ(2, loaded.document_key(postings->document_ordinal(1)));
 }
 
 // Builds an Operation::SameScope Expression by hand: parse_query does not
@@ -1246,7 +1297,7 @@ TEST(SameScopeTest, HitsInSameScopeSurvive) {
   auto postings = perform_search(invidx, expr, &invidx);
 
   ASSERT_EQ(1, postings->size());
-  EXPECT_EQ(0, postings->document_id(0));
+  EXPECT_EQ(0, postings->document_ordinal(0));
   ASSERT_EQ(2, postings->search_hit_count(0));
   EXPECT_EQ(0, postings->term_position(0, 0));
   EXPECT_EQ(1, postings->term_position(0, 1));
@@ -1263,7 +1314,7 @@ TEST(SameScopeTest, HitsAcrossScopesAreDropped) {
   auto postings = perform_search(invidx, expr, &invidx);
 
   ASSERT_EQ(1, postings->size());
-  EXPECT_EQ(1, postings->document_id(0));
+  EXPECT_EQ(1, postings->document_ordinal(0));
   ASSERT_EQ(2, postings->search_hit_count(0));
   EXPECT_EQ(0, postings->term_position(0, 0)); // alpha@0
   EXPECT_EQ(1, postings->term_position(0, 1)); // gamma@1
@@ -1279,7 +1330,7 @@ TEST(SameScopeTest, DocumentsWithoutScopeDataAreExcluded) {
   auto postings = perform_search(invidx, expr, &invidx);
 
   ASSERT_EQ(1, postings->size());
-  EXPECT_EQ(0, postings->document_id(0));
+  EXPECT_EQ(0, postings->document_ordinal(0));
   ASSERT_EQ(2, postings->search_hit_count(0));
   EXPECT_EQ(2, postings->term_position(0, 0)); // gamma@2
   EXPECT_EQ(3, postings->term_position(0, 1)); // delta@3
@@ -1292,7 +1343,7 @@ TEST(SameScopeTest, ThreeOrMoreNodes) {
   auto postings = perform_search(invidx, expr, &invidx);
 
   ASSERT_EQ(1, postings->size());
-  EXPECT_EQ(4, postings->document_id(0));
+  EXPECT_EQ(4, postings->document_ordinal(0));
   ASSERT_EQ(3, postings->search_hit_count(0));
   EXPECT_EQ(0, postings->term_position(0, 0));
   EXPECT_EQ(1, postings->term_position(0, 1));
@@ -1325,7 +1376,7 @@ TEST(SameScopeTest, ComposesInsideAnd) {
   auto postings = perform_search(invidx, and_expr, &invidx);
 
   ASSERT_EQ(1, postings->size());
-  EXPECT_EQ(0, postings->document_id(0));
+  EXPECT_EQ(0, postings->document_ordinal(0));
 }
 
 TEST(SameScopeTest, SetScopeIdsRejectsSizeMismatch) {
@@ -1355,8 +1406,8 @@ TEST(SameScopeTest, PersistedScopeSurvivesRoundtrip) {
   InMemoryInvertedIndex<TextRange> loaded;
   loaded.load(ss);
 
-  EXPECT_TRUE(loaded.has_scope("paragraph", 0));
-  EXPECT_FALSE(loaded.has_scope("paragraph", 2));
+  EXPECT_TRUE(loaded.has_scope("paragraph", *loaded.document_ordinal(0)));
+  EXPECT_FALSE(loaded.has_scope("paragraph", *loaded.document_ordinal(2)));
 
   auto expr = same_scope_expr("paragraph", {U"alpha", U"gamma"});
   auto expected = perform_search(invidx, expr, &invidx);
@@ -1364,7 +1415,7 @@ TEST(SameScopeTest, PersistedScopeSurvivesRoundtrip) {
 
   ASSERT_EQ(expected->size(), actual->size());
   for (size_t i = 0; i < expected->size(); i++) {
-    EXPECT_EQ(expected->document_id(i), actual->document_id(i));
+    EXPECT_EQ(expected->document_ordinal(i), actual->document_ordinal(i));
     ASSERT_EQ(expected->search_hit_count(i), actual->search_hit_count(i));
     for (size_t h = 0; h < expected->search_hit_count(i); h++) {
       EXPECT_EQ(expected->term_position(i, h), actual->term_position(i, h));
@@ -1406,7 +1457,7 @@ TEST(CompressedPersistenceTest, RoundTrip) {
   auto actual = perform_search(loaded, *expr);
   ASSERT_EQ(expected->size(), actual->size());
   for (size_t i = 0; i < expected->size(); i++) {
-    EXPECT_EQ(expected->document_id(i), actual->document_id(i));
+    EXPECT_EQ(expected->document_ordinal(i), actual->document_ordinal(i));
     ASSERT_EQ(expected->search_hit_count(i), actual->search_hit_count(i));
     for (size_t h = 0; h < expected->search_hit_count(i); h++) {
       auto a = invidx.text_range(*expected, i, h);
@@ -1434,7 +1485,7 @@ TEST(CompressedPersistenceTest, AllTermsBelowThreshold) {
   auto actual = perform_search(loaded, *expr);
   ASSERT_EQ(expected->size(), actual->size());
   for (size_t i = 0; i < expected->size(); i++) {
-    EXPECT_EQ(expected->document_id(i), actual->document_id(i));
+    EXPECT_EQ(expected->document_ordinal(i), actual->document_ordinal(i));
   }
 }
 
@@ -1448,7 +1499,7 @@ TEST(CompressedPersistenceTest, TombstoneSurvives) {
   InMemoryInvertedIndex<TextRange> loaded;
   loaded.load(ss);
 
-  EXPECT_TRUE(loaded.is_document_removed(42));
+  EXPECT_TRUE(loaded.is_document_removed(*loaded.document_ordinal(42)));
   auto expr = parse_query(normalizer, "common");
   EXPECT_EQ(99, perform_search(loaded, *expr)->size());
 }
@@ -1472,10 +1523,10 @@ TEST(ThreadSafetyTest, ReadWriteBasics) {
 
   index.write([&](auto &idx) {
     InMemoryIndexer indexer(idx, normalizer);
-    size_t document_id = 0;
+    size_t document_key = 0;
     for (const auto &doc : sample_documents) {
-      indexer.index_document(document_id, UTF8PlainTextTokenizer(doc));
-      document_id++;
+      indexer.index_document(document_key, UTF8PlainTextTokenizer(doc));
+      document_key++;
     }
   });
 
@@ -1487,7 +1538,7 @@ TEST(ThreadSafetyTest, ReadWriteBasics) {
       auto postings = perform_search(idx, *expr);
       std::vector<size_t> ids;
       for (size_t i = 0; i < postings->size(); i++) {
-        ids.push_back(postings->document_id(i));
+        ids.push_back(postings->document_ordinal(i));
       }
       return ids;
     });
@@ -1543,7 +1594,7 @@ TEST(ThreadSafetyTest, ConcurrentReadersAndWriter) {
     while (!writer_done.load()) {
       auto ok = index.read([&](const auto &idx) {
         auto postings = perform_search(idx, *expr);
-        // Consume every entry (document_id, hits, text_range) under the lock.
+        // Consume every entry (ordinal, hits, text_range) under the lock.
         for (size_t i = 0; i < postings->size(); i++) {
           if (postings->search_hit_count(i) == 0) {
             return false;
@@ -1584,10 +1635,10 @@ const std::vector<std::string> prefix_documents = {
 auto prefix_index() {
   InMemoryInvertedIndex<TextRange> invidx;
   InMemoryIndexer indexer(invidx, normalizer);
-  size_t document_id = 0;
+  size_t document_key = 0;
   for (const auto &doc : prefix_documents) {
-    indexer.index_document(document_id, UTF8PlainTextTokenizer(doc));
-    document_id++;
+    indexer.index_document(document_key, UTF8PlainTextTokenizer(doc));
+    document_key++;
   }
   return invidx;
 }
@@ -1606,7 +1657,7 @@ static std::vector<std::string> terms_with_prefix(const IInvertedIndex &invidx,
 static std::vector<size_t> hit_document_ids(const IPostings &postings) {
   std::vector<size_t> ids;
   for (size_t i = 0; i < postings.size(); i++) {
-    ids.push_back(postings.document_id(i));
+    ids.push_back(postings.document_ordinal(i));
   }
   return ids;
 }
@@ -1772,7 +1823,7 @@ TEST(PrefixSearchTest, ExpandPrefixesRewritesToAnEquivalentOr) {
   auto direct = perform_search(invidx, *parsed);
   ASSERT_EQ(direct->size(), result->size());
   for (size_t i = 0; i < result->size(); i++) {
-    EXPECT_EQ(direct->document_id(i), result->document_id(i));
+    EXPECT_EQ(direct->document_ordinal(i), result->document_ordinal(i));
     EXPECT_AP(bm25_score(invidx, *parsed, *direct, i),
               bm25_score(invidx, expanded, *result, i));
   }
@@ -1969,7 +2020,7 @@ TEST(WildcardSearchTest, ExpandWildcardsRewritesToAnEquivalentOr) {
   auto direct = perform_search(invidx, *parsed);
   ASSERT_EQ(direct->size(), result->size());
   for (size_t i = 0; i < result->size(); i++) {
-    EXPECT_EQ(direct->document_id(i), result->document_id(i));
+    EXPECT_EQ(direct->document_ordinal(i), result->document_ordinal(i));
     EXPECT_AP(bm25_score(invidx, *parsed, *direct, i),
               bm25_score(invidx, expanded, *result, i));
   }
@@ -2029,13 +2080,13 @@ TEST(WildcardSearchTest, CompressedBackendMatchesInMemoryOffTheEasyPath) {
   InMemoryInvertedIndex<TextRange> invidx;
   {
     InMemoryIndexer indexer(invidx, normalizer);
-    size_t document_id = 0;
+    size_t document_key = 0;
     for (const auto &term :
          {a62, a63, a64, std::u32string(65, U'a'), std::u32string(100, U'a'),
           a63 + U"b", a64 + U"b", std::u32string(U"apple"),
           std::u32string(U"banana"), std::u32string(U"café"),
           std::u32string(U"日本語"), std::u32string(U"あいうえお")}) {
-      indexer.index_document(document_id++, UTF8PlainTextTokenizer(u8(term)));
+      indexer.index_document(document_key++, UTF8PlainTextTokenizer(u8(term)));
     }
   }
 
@@ -2104,10 +2155,10 @@ const std::vector<std::string> fuzzy_documents = {
 auto fuzzy_index() {
   InMemoryInvertedIndex<TextRange> invidx;
   InMemoryIndexer indexer(invidx, normalizer);
-  size_t document_id = 0;
+  size_t document_key = 0;
   for (const auto &doc : fuzzy_documents) {
-    indexer.index_document(document_id, UTF8PlainTextTokenizer(doc));
-    document_id++;
+    indexer.index_document(document_key, UTF8PlainTextTokenizer(doc));
+    document_key++;
   }
   return invidx;
 }
@@ -2362,7 +2413,7 @@ TEST(FuzzySearchTest, ExpandFuzzyRewritesToAnEquivalentOr) {
   auto direct = perform_search(invidx, *parsed);
   ASSERT_EQ(direct->size(), result->size());
   for (size_t i = 0; i < result->size(); i++) {
-    EXPECT_EQ(direct->document_id(i), result->document_id(i));
+    EXPECT_EQ(direct->document_ordinal(i), result->document_ordinal(i));
     EXPECT_AP(bm25_score(invidx, *parsed, *direct, i),
               bm25_score(invidx, expanded, *result, i));
   }
@@ -2576,7 +2627,7 @@ TEST(AverageDocumentTermCountTest, ReindexingReplacesTheOldCount) {
   indexer.index_document(1, UTF8PlainTextTokenizer("one two"));
   EXPECT_DOUBLE_EQ(3.0, invidx.average_document_term_count()); // (4+2)/2
 
-  // Re-indexing the same document_id must subtract the previous count, not
+  // Re-indexing the same document_key must subtract the previous count, not
   // add to it.
   indexer.index_document(0, UTF8PlainTextTokenizer("one"));
   EXPECT_EQ(2, invidx.document_count());

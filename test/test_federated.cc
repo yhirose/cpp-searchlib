@@ -12,10 +12,10 @@ auto federated_normalizer = [](auto sv) { return unicode::to_lowercase(sv); };
 auto make_index(const std::vector<std::string> &documents) {
   auto invidx = std::make_shared<InMemoryInvertedIndex<TextRange>>();
   InMemoryIndexer indexer(*invidx, federated_normalizer);
-  size_t document_id = 0;
+  size_t document_key = 0;
   for (const auto &doc : documents) {
-    indexer.index_document(document_id, UTF8PlainTextTokenizer(doc));
-    document_id++;
+    indexer.index_document(document_key, UTF8PlainTextTokenizer(doc));
+    document_key++;
   }
   return invidx;
 }
@@ -24,8 +24,8 @@ auto make_index(const std::vector<std::string> &documents) {
 // logical deletion is out of scope for this test (see roadmap section 3).
 class MockMutableInvertedIndex : public IMutableInvertedIndex {
 public:
-  void remove_document(size_t document_id) override {
-    removed_document_ids.push_back(document_id);
+  void remove_document(size_t document_key) override {
+    removed_document_ids.push_back(document_key);
   }
 
   std::vector<size_t> removed_document_ids;
@@ -48,10 +48,10 @@ TEST(FederatedSearchTest, SearchAcrossMembers) {
   ASSERT_EQ(2, hits.size());
 
   EXPECT_EQ(book, hits[0].index);
-  EXPECT_EQ(0, hits[0].postings->document_id(hits[0].index_in_postings));
+  EXPECT_EQ(0, hits[0].postings->document_ordinal(hits[0].index_in_postings));
 
   EXPECT_EQ(notes, hits[1].index);
-  EXPECT_EQ(0, hits[1].postings->document_id(hits[1].index_in_postings));
+  EXPECT_EQ(0, hits[1].postings->document_ordinal(hits[1].index_in_postings));
 }
 
 TEST(FederatedSearchTest, RemoveMember) {
@@ -153,10 +153,10 @@ TEST(FederatedSearchTest, MixedInMemoryAndCompressedMembers) {
   ASSERT_EQ(2, hits.size());
 
   EXPECT_EQ(book, hits[0].index);
-  EXPECT_EQ(0, hits[0].postings->document_id(hits[0].index_in_postings));
+  EXPECT_EQ(0, hits[0].postings->document_ordinal(hits[0].index_in_postings));
 
   EXPECT_EQ(notes, hits[1].index);
-  EXPECT_EQ(0, hits[1].postings->document_id(hits[1].index_in_postings));
+  EXPECT_EQ(0, hits[1].postings->document_ordinal(hits[1].index_in_postings));
 
   // Highlighting works through the compressed member's text_range.
   auto range = book->text_range(*hits[0].postings, hits[0].index_in_postings, 0);

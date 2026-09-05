@@ -15,10 +15,9 @@
 namespace searchlib {
 
 // Defined in invertedindex.cpp; shared here because the compressed backend
-// answers term_count(str, document_id) / tf the same way the in-memory
-// index does.
-size_t find_postings_index_for_document_id_(const IPostings &p,
-                                            size_t document_id);
+// answers term_count(str, ordinal) / tf the same way the in-memory index
+// does.
+size_t find_postings_index_for_ordinal_(const IPostings &p, size_t ordinal);
 
 namespace {
 
@@ -30,22 +29,22 @@ namespace {
 class EFPostings : public IPostings {
 public:
   void load(std::istream &is) {
-    document_ids_.load(is);
+    ordinals_.load(is);
     end_offsets_.load(is);
     bases_.load(is);
     positions_.load(is);
-    if (end_offsets_.size() != document_ids_.size() ||
-        bases_.size() != document_ids_.size() ||
-        (document_ids_.size() > 0 &&
+    if (end_offsets_.size() != ordinals_.size() ||
+        bases_.size() != ordinals_.size() ||
+        (ordinals_.size() > 0 &&
          positions_.size() != end_offsets_.access(end_offsets_.size() - 1))) {
       throw std::runtime_error("searchlib: corrupt compressed postings");
     }
   }
 
-  size_t size() const override { return document_ids_.size(); }
+  size_t size() const override { return ordinals_.size(); }
 
-  size_t document_id(size_t index) const override {
-    return static_cast<size_t>(document_ids_.access(index));
+  size_t document_ordinal(size_t index) const override {
+    return static_cast<size_t>(ordinals_.access(index));
   }
 
   size_t search_hit_count(size_t index) const override {
@@ -86,7 +85,7 @@ private:
     return index == 0 ? 0 : end_offsets_.access(index - 1);
   }
 
-  detail::EliasFano document_ids_;
+  detail::EliasFano ordinals_;
   detail::EliasFano end_offsets_;
   detail::EliasFano bases_;
   detail::EliasFano positions_;
@@ -98,13 +97,13 @@ private:
 class EFTextRanges {
 public:
   void load(std::istream &is) {
-    document_ids_.load(is);
+    ordinals_.load(is);
     end_offsets_.load(is);
     bases_.load(is);
     positions_.load(is);
     cumulative_lengths_.load(is);
 
-    auto document_count = document_ids_.size();
+    auto document_count = ordinals_.size();
     auto total_values =
         document_count == 0 ? 0 : end_offsets_.access(document_count - 1);
     if (end_offsets_.size() != document_count ||
@@ -115,10 +114,10 @@ public:
     }
   }
 
-  TextRange text_range(size_t document_id, size_t term_pos) const {
-    auto i = document_ids_.next_geq(document_id);
-    if (i == document_ids_.size() || document_ids_.access(i) != document_id) {
-      throw std::out_of_range("searchlib: unknown document_id");
+  TextRange text_range(size_t ordinal, size_t term_pos) const {
+    auto i = ordinals_.next_geq(ordinal);
+    if (i == ordinals_.size() || ordinals_.access(i) != ordinal) {
+      throw std::out_of_range("searchlib: unknown ordinal");
     }
     auto begin = i == 0 ? 0 : end_offsets_.access(i - 1);
     auto j = begin + term_pos;
@@ -137,7 +136,7 @@ public:
   }
 
 private:
-  detail::EliasFano document_ids_;
+  detail::EliasFano ordinals_;
   detail::EliasFano end_offsets_;
   detail::EliasFano bases_;
   detail::EliasFano positions_;
@@ -168,13 +167,17 @@ public:
     }
 
     // Section order mirrors InMemoryInvertedIndexBase::load followed by the
-    // text-range section of InMemoryInvertedIndex<TextRange>::load.
+    // text-range section of InMemoryInvertedIndex<TextRange>::load. Document
+    // records are in ordinal order, so the vectors index by ordinal directly.
     auto document_count = detail::read_scalar<uint64_t>(is);
-    documents_.reserve(static_cast<size_t>(document_count));
+    term_counts_.reserve(static_cast<size_t>(document_count));
+    keys_.reserve(static_cast<size_t>(document_count));
     for (uint64_t i = 0; i < document_count; i++) {
-      auto document_id = static_cast<size_t>(detail::read_scalar<uint64_t>(is));
-      auto term_count = static_cast<size_t>(detail::read_scalar<uint64_t>(is));
-      documents_[document_id] = term_count;
+      term_counts_.push_back(
+          static_cast<size_t>(detail::read_scalar<uint64_t>(is)));
+      keys_.push_back(static_cast<size_t>(detail::read_scalar<uint64_t>(is)));
+      // A re-indexed key ends on its newest ordinal, as in the in-memory map.
+      key_to_ordinal_[keys_.back()] = static_cast<size_t>(i);
     }
 
     // Term dictionary: the FST stays as the dictionary rather than being
@@ -202,9 +205,9 @@ public:
     }
 
     auto removed_count = detail::read_scalar<uint64_t>(is);
-    removed_document_ids_.reserve(static_cast<size_t>(removed_count));
+    removed_ordinals_.reserve(static_cast<size_t>(removed_count));
     for (uint64_t i = 0; i < removed_count; i++) {
-      removed_document_ids_.insert(
+      removed_ordinals_.insert(
           static_cast<size_t>(detail::read_scalar<uint64_t>(is)));
     }
 
@@ -220,7 +223,7 @@ public:
 
       auto doc_count = detail::read_scalar<uint64_t>(is);
       for (uint64_t j = 0; j < doc_count; j++) {
-        detail::read_scalar<uint64_t>(is); // document_id
+        detail::read_scalar<uint64_t>(is); // ordinal
         detail::EliasFano discarded;
         discarded.load(is);
       }
@@ -235,10 +238,24 @@ public:
     average_document_term_count_ = compute_average_document_term_count_();
   }
 
-  size_t document_count() const override { return documents_.size(); }
+  size_t document_count() const override {
+    return term_counts_.size() - removed_ordinals_.size();
+  }
 
-  size_t document_term_count(size_t document_id) const override {
-    return documents_.at(document_id);
+  size_t document_term_count(size_t ordinal) const override {
+    return term_counts_.at(ordinal);
+  }
+
+  size_t document_key(size_t ordinal) const override {
+    return keys_.at(ordinal);
+  }
+
+  std::optional<size_t> document_ordinal(size_t document_key) const override {
+    auto it = key_to_ordinal_.find(document_key);
+    if (it == key_to_ordinal_.end()) {
+      return std::nullopt;
+    }
+    return it->second;
   }
 
   double average_document_term_count() const override {
@@ -255,9 +272,9 @@ public:
   }
 
   size_t term_count(const std::u32string &str,
-                    size_t document_id) const override {
+                    size_t ordinal) const override {
     auto p = postings(str);
-    auto i = find_postings_index_for_document_id_(*p, document_id);
+    auto i = find_postings_index_for_ordinal_(*p, ordinal);
     if (i < p->size()) {
       return p->search_hit_count(i);
     }
@@ -268,12 +285,12 @@ public:
     return postings(str)->size();
   }
 
-  double tf(const std::u32string &str, size_t document_id) const override {
+  double tf(const std::u32string &str, size_t ordinal) const override {
     auto p = postings(str);
-    auto i = find_postings_index_for_document_id_(*p, document_id);
+    auto i = find_postings_index_for_ordinal_(*p, ordinal);
     if (i < p->size()) {
       return static_cast<double>(p->search_hit_count(i)) /
-             static_cast<double>(document_term_count(document_id));
+             static_cast<double>(document_term_count(ordinal));
     }
     return 0.0;
   }
@@ -324,25 +341,25 @@ public:
   }
 
   bool has_removed_documents() const override {
-    return !removed_document_ids_.empty();
+    return !removed_ordinals_.empty();
   }
 
-  bool is_document_removed(size_t document_id) const override {
-    return removed_document_ids_.find(document_id) !=
-           removed_document_ids_.end();
+  bool is_document_removed(size_t ordinal) const override {
+    return removed_ordinals_.find(ordinal) !=
+           removed_ordinals_.end();
   }
 
   TextRange text_range(const IPostings &positions, size_t index,
                        size_t search_hit_index) const override {
-    auto document_id = positions.document_id(index);
+    auto ordinal = positions.document_ordinal(index);
     auto term_pos = positions.term_position(index, search_hit_index);
     auto term_length = positions.term_length(index, search_hit_index);
     if (term_length == 1) {
-      return text_ranges_.text_range(document_id, term_pos);
+      return text_ranges_.text_range(ordinal, term_pos);
     }
-    auto beg = text_ranges_.text_range(document_id, term_pos);
+    auto beg = text_ranges_.text_range(ordinal, term_pos);
     auto end =
-        text_ranges_.text_range(document_id, term_pos + term_length - 1);
+        text_ranges_.text_range(ordinal, term_pos + term_length - 1);
     return TextRange{beg.position, end.position + end.length - beg.position};
   }
 
@@ -363,28 +380,32 @@ private:
   }
 
   // Evaluated once at load time, since the index never changes afterwards.
-  // Matches InMemoryInvertedIndexBase::average_document_term_count, including
-  // the 0.0 it returns for an empty index.
+  // Matches InMemoryInvertedIndexBase::average_document_term_count: live
+  // documents only, and 0.0 when there are none.
   double compute_average_document_term_count_() const {
-    if (documents_.empty()) {
+    auto live = document_count();
+    if (live == 0) {
       return 0.0;
     }
     size_t total = 0;
-    for (const auto &[_, term_count] : documents_) {
-      total += term_count;
+    for (size_t ordinal = 0; ordinal < term_counts_.size(); ordinal++) {
+      if (!is_document_removed(ordinal)) {
+        total += term_counts_[ordinal];
+      }
     }
-    return static_cast<double>(total) /
-           static_cast<double>(documents_.size());
+    return static_cast<double>(total) / static_cast<double>(live);
   }
 
-  std::unordered_map<size_t /*document_id*/, size_t /*term_count*/> documents_;
+  std::vector<size_t> term_counts_; // indexed by ordinal
+  std::vector<size_t> keys_;        // indexed by ordinal
+  std::unordered_map<size_t /*key*/, size_t /*ordinal*/> key_to_ordinal_;
 
   // Holding this makes the whole index non-copyable and non-movable, which
   // is required: the FST points into its own byte buffer (see termdict.h).
   detail::TermDictionaryFst term_dictionary_;
   std::vector<CompressedTerm> terms_; // indexed by the FST's ordinal
 
-  std::unordered_set<size_t> removed_document_ids_;
+  std::unordered_set<size_t> removed_ordinals_;
   EFTextRanges text_ranges_;
   double average_document_term_count_ = 0.0;
 };

@@ -96,7 +96,7 @@ std::vector<size_t> search_ids(const IInvertedIndex &index,
   std::vector<size_t> ids;
   auto postings = perform_search(index, expr);
   for (size_t i = 0; i < postings->size(); i++) {
-    ids.push_back(postings->document_id(i));
+    ids.push_back(postings->document_ordinal(i));
   }
   return ids;
 }

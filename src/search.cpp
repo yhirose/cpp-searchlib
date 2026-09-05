@@ -25,7 +25,7 @@ namespace searchlib {
 
 // Decorator that hides logically-deleted (tombstoned) documents from a search
 // result. It maps external indices to the underlying result's indices, skipping
-// any entry whose document_id was removed from the index. Applied once at the
+// any entry whose ordinal was removed from the index. Applied once at the
 // top of perform_search, so it uniformly covers Term/And/Or/Adjacent/Near.
 class FilteredPostings : public IPostings {
 public:
@@ -35,7 +35,7 @@ public:
     auto count = postings_->size();
     live_indices_.reserve(count);
     for (size_t i = 0; i < count; i++) {
-      if (!inverted_index.is_document_removed(postings_->document_id(i))) {
+      if (!inverted_index.is_document_removed(postings_->document_ordinal(i))) {
         live_indices_.push_back(i);
       }
     }
@@ -45,8 +45,8 @@ public:
 
   size_t size() const override { return live_indices_.size(); }
 
-  size_t document_id(size_t index) const override {
-    return postings_->document_id(live_indices_[index]);
+  size_t document_ordinal(size_t index) const override {
+    return postings_->document_ordinal(live_indices_[index]);
   }
 
   size_t search_hit_count(size_t index) const override {
@@ -88,10 +88,10 @@ class SearchResult : public IPostings {
 public:
   ~SearchResult() override = default;
 
-  size_t size() const override { return document_ids_.size(); }
+  size_t size() const override { return ordinals_.size(); }
 
-  size_t document_id(size_t index) const override {
-    return document_ids_[index];
+  size_t document_ordinal(size_t index) const override {
+    return ordinals_[index];
   }
 
   size_t search_hit_count(size_t index) const override {
@@ -116,9 +116,9 @@ public:
 
   // Appends one matched document, taking its hits from the scratch buffers
   // the operation filled, and leaving those cleared for the next document.
-  void push_back(size_t document_id, std::vector<size_t> &term_positions,
+  void push_back(size_t ordinal, std::vector<size_t> &term_positions,
                  std::vector<size_t> &term_lengths) {
-    document_ids_.push_back(document_id);
+    ordinals_.push_back(ordinal);
     positions_.insert(positions_.end(), term_positions.begin(),
                       term_positions.end());
     lengths_.insert(lengths_.end(), term_lengths.begin(), term_lengths.end());
@@ -128,7 +128,7 @@ public:
   }
 
 private:
-  std::vector<size_t> document_ids_;
+  std::vector<size_t> ordinals_;
   std::vector<size_t> offsets_{0}; // size() + 1 entries
   std::vector<size_t> positions_;  // every hit, concatenated
   std::vector<size_t> lengths_;    // parallel to positions_
@@ -171,9 +171,9 @@ min_slots(const std::vector<std::shared_ptr<IPostings>> &positings_list,
   // The running minimum only changes when a smaller id resets `slots`, so it
   // lives in a local instead of being re-read through the virtual interface
   // on every iteration (this runs once per output document of every union).
-  auto prev = positings_list[0]->document_id(cursors[0]);
+  auto prev = positings_list[0]->document_ordinal(cursors[0]);
   for (size_t slot = 1; slot < positings_list.size(); slot++) {
-    auto curr = positings_list[slot]->document_id(cursors[slot]);
+    auto curr = positings_list[slot]->document_ordinal(cursors[slot]);
 
     if (curr < prev) {
       slots.clear();
@@ -190,11 +190,11 @@ min_slots(const std::vector<std::shared_ptr<IPostings>> &positings_list,
 static std::pair<size_t /*min*/, size_t /*max*/>
 min_max_slots(const std::vector<std::shared_ptr<IPostings>> &positings_list,
               const std::vector<size_t> &cursors) {
-  auto min = positings_list[0]->document_id(cursors[0]);
+  auto min = positings_list[0]->document_ordinal(cursors[0]);
   auto max = min;
 
   for (size_t slot = 1; slot < positings_list.size(); slot++) {
-    auto id = positings_list[slot]->document_id(cursors[slot]);
+    auto id = positings_list[slot]->document_ordinal(cursors[slot]);
     if (id < min) {
       min = id;
     } else if (id > max) {
@@ -205,12 +205,12 @@ min_max_slots(const std::vector<std::shared_ptr<IPostings>> &positings_list,
   return std::make_pair(min, max);
 }
 
-// First index in [low, high) whose document_id is >= document_id.
-static size_t lower_bound_document_id(const IPostings &postings, size_t low,
-                                      size_t high, size_t document_id) {
+// First index in [low, high) whose ordinal is >= ordinal.
+static size_t lower_bound_ordinal(const IPostings &postings, size_t low,
+                                      size_t high, size_t ordinal) {
   while (low < high) {
     auto mid = low + (high - low) / 2;
-    if (postings.document_id(mid) < document_id) {
+    if (postings.document_ordinal(mid) < ordinal) {
       low = mid + 1;
     } else {
       high = mid;
@@ -219,19 +219,19 @@ static size_t lower_bound_document_id(const IPostings &postings, size_t low,
   return low;
 }
 
-// First index in (cursor, size] whose document_id is >= document_id, found by
+// First index in (cursor, size] whose ordinal is >= ordinal, found by
 // galloping forward from cursor: O(log gap) accesses instead of a linear
 // scan's O(gap), which pays off when an AND operand skips far ahead, and
 // instead of a plain binary search's O(log size), which the scorer's
 // step-or-two advances would not amortize. A separate skip-list structure is
-// unnecessary because document_id(index) is O(1) random access. Requires
-// postings.document_id(cursor) < document_id.
+// unnecessary because document_ordinal(index) is O(1) random access. Requires
+// postings.document_ordinal(cursor) < ordinal.
 static size_t gallop_lower_bound(const IPostings &postings, size_t cursor,
-                                 size_t size, size_t document_id) {
+                                 size_t size, size_t ordinal) {
   size_t step = 1;
-  auto low = cursor + 1; // document_id(cursor) is known to be < target
+  auto low = cursor + 1; // document_ordinal(cursor) is known to be < target
   auto high = cursor + step;
-  while (high < size && postings.document_id(high) < document_id) {
+  while (high < size && postings.document_ordinal(high) < ordinal) {
     low = high + 1;
     step *= 2;
     high = cursor + step;
@@ -240,17 +240,17 @@ static size_t gallop_lower_bound(const IPostings &postings, size_t cursor,
     high = size;
   }
   // `high` itself is either a known match or `size`.
-  return lower_bound_document_id(postings, low, high, document_id);
+  return lower_bound_ordinal(postings, low, high, ordinal);
 }
 
-// find_postings_index_for_document_id_, but resuming from where the previous
+// find_postings_index_for_ordinal_, but resuming from where the previous
 // lookup landed. Every caller walks documents in ascending id order, so the
 // answer is usually at or just past the cursor. `size` is the postings size,
 // resolved once by the caller rather than re-fetched through the virtual
 // interface on every lookup.
 //
-// Both `cursor` and `last_document_id` are updated so that the invariant
-// "cursor is the first entry whose document id is >= last_document_id" holds
+// Both `cursor` and `last_ordinal` are updated so that the invariant
+// "cursor is the first entry whose document id is >= last_ordinal" holds
 // on entry and on exit. That invariant carries the whole optimization: when
 // the walk is moving forward, everything before the cursor is already known
 // to be below the target, so a cursor sitting past the target proves the
@@ -266,27 +266,27 @@ static size_t gallop_lower_bound(const IPostings &postings, size_t cursor,
 // code at all.
 static SEARCHLIB_ALWAYS_INLINE size_t
 find_from_cursor(const IPostings &postings, size_t size, size_t &cursor,
-                 size_t &last_document_id, size_t document_id) {
+                 size_t &last_ordinal, size_t ordinal) {
   if (size == 0) {
     return 0;
   }
 
-  if (document_id < last_document_id) {
+  if (ordinal < last_ordinal) {
     // The caller is walking out of ascending order, so the invariant says
     // nothing about entries before the cursor and they have to be searched.
     // Galloping forward would never find the target either. The clamp
     // matters: an exhausted cursor sits at size, and cursor + 1 would run
     // the search one entry past the end.
     auto high = std::min(cursor + 1, size);
-    cursor = lower_bound_document_id(postings, 0, high, document_id);
-  } else if (cursor < size && postings.document_id(cursor) < document_id) {
-    cursor = gallop_lower_bound(postings, cursor, size, document_id);
+    cursor = lower_bound_ordinal(postings, 0, high, ordinal);
+  } else if (cursor < size && postings.document_ordinal(cursor) < ordinal) {
+    cursor = gallop_lower_bound(postings, cursor, size, ordinal);
   }
   // Otherwise the cursor is already the lower bound for this document: it
   // either sits on it, or sits past it (absent), or the list is exhausted.
-  last_document_id = document_id;
+  last_ordinal = ordinal;
 
-  return (cursor < size && postings.document_id(cursor) == document_id) ? cursor
+  return (cursor < size && postings.document_ordinal(cursor) == ordinal) ? cursor
                                                                        : size;
 }
 
@@ -295,7 +295,7 @@ find_from_cursor(const IPostings &postings, size_t size, size_t &cursor,
 // Result of an And/Or operation: the document ids that matched, viewed over
 // the operand postings they matched in.
 //
-// Positions are never copied out. BM25 ranking reads only document_id from a
+// Positions are never copied out. BM25 ranking reads only ordinal from a
 // result -- it takes each term's frequency from that term's own postings --
 // and the consumers that do read positions (text_range for highlighting, a
 // nested Adjacent/Near) touch a handful of documents each. Building them all
@@ -314,7 +314,7 @@ find_from_cursor(const IPostings &postings, size_t size, size_t &cursor,
 //   - A one-row memo, because a document's hits are always read together: a
 //     term_position(index, 0..n) run costs one merge rather than n.
 //
-// Only term_position/term_length need that merge at all; size, document_id,
+// Only term_position/term_length need that merge at all; size, ordinal,
 // search_hit_count and is_term_position are answered from the operands
 // directly.
 //
@@ -335,12 +335,12 @@ public:
 
   // Appends one matched document. Callers append in ascending id order,
   // which is the order the operand cursors are built to exploit.
-  void push_back(size_t document_id) { document_ids_.push_back(document_id); }
+  void push_back(size_t ordinal) { ordinals_.push_back(ordinal); }
 
-  size_t size() const override { return document_ids_.size(); }
+  size_t size() const override { return ordinals_.size(); }
 
-  size_t document_id(size_t index) const override {
-    return document_ids_[index];
+  size_t document_ordinal(size_t index) const override {
+    return ordinals_[index];
   }
 
   // The sum of the operands' counts, no merge needed: merging reorders the
@@ -390,7 +390,7 @@ private:
   struct OperandCursor {
     size_t size = 0;
     size_t cursor = 0;
-    size_t last_document_id = 0;
+    size_t last_ordinal = 0;
   };
 
   // One operand's state for the row being merged: where its entry for this
@@ -402,12 +402,12 @@ private:
     size_t hit_cursor;
   };
 
-  // This operand's index for `document_id`, or its size if the operand does
+  // This operand's index for `ordinal`, or its size if the operand does
   // not carry the document -- possible under Or, never under And.
-  size_t locate(size_t slot, size_t document_id) const {
+  size_t locate(size_t slot, size_t ordinal) const {
     auto &cursor = cursors_[slot];
     return find_from_cursor(*operands_[slot], cursor.size, cursor.cursor,
-                            cursor.last_document_id, document_id);
+                            cursor.last_ordinal, ordinal);
   }
 
   // Resolves every operand's entry for one document, and its hit count,
@@ -428,7 +428,7 @@ private:
     located_index_ = kNone;
     row_slots_.clear();
     for (size_t slot = 0; slot < operands_.size(); slot++) {
-      auto i = locate(slot, document_ids_[index]);
+      auto i = locate(slot, ordinals_[index]);
       auto count =
           i < cursors_[slot].size ? operands_[slot]->search_hit_count(i) : 0;
       row_slots_.push_back(RowSlot{i, count, 0});
@@ -489,7 +489,7 @@ private:
     cached_index_ = index;
   }
 
-  std::vector<size_t> document_ids_;
+  std::vector<size_t> ordinals_;
   std::vector<std::shared_ptr<IPostings>> operands_;
 
   mutable std::vector<OperandCursor> cursors_;
@@ -507,14 +507,14 @@ private:
 static bool
 skip_cursors(const std::vector<std::shared_ptr<IPostings>> &positings_list,
              const std::vector<size_t> &sizes, std::vector<size_t> &cursors,
-             size_t document_id) {
+             size_t ordinal) {
   for (size_t slot = 0; slot < positings_list.size(); slot++) {
     const auto &postings = *positings_list[slot];
     auto &cursor = cursors[slot];
     auto size = sizes[slot];
 
-    if (cursor < size && postings.document_id(cursor) < document_id) {
-      cursor = gallop_lower_bound(postings, cursor, size, document_id);
+    if (cursor < size && postings.document_ordinal(cursor) < ordinal) {
+      cursor = gallop_lower_bound(postings, cursor, size, ordinal);
     }
 
     if (cursor == size) {
@@ -586,7 +586,7 @@ is_adjacent(const std::vector<std::shared_ptr<IPostings>> &positings_list,
 }
 
 // The document-id walk shared by every intersecting operation: advances the
-// cursors in ascending document id order and calls fn(cursors, document_id)
+// cursors in ascending document id order and calls fn(cursors, ordinal)
 // once for each document that appears in all of them, with every cursor
 // parked on that document so fn can read the operands' hits without
 // searching for it again. Only the cursors are handed out: they live inside
@@ -642,10 +642,10 @@ static std::shared_ptr<IPostings> intersect_postings(
   std::vector<size_t> term_lengths;
 
   for_each_intersection(
-      positings_list, [&](const auto &cursors, size_t document_id) {
-        if (make_positions(positings_list, cursors, document_id, term_positions,
+      positings_list, [&](const auto &cursors, size_t ordinal) {
+        if (make_positions(positings_list, cursors, ordinal, term_positions,
                            term_lengths)) {
-          result->push_back(document_id, term_positions, term_lengths);
+          result->push_back(ordinal, term_positions, term_lengths);
         } else {
           term_positions.clear();
           term_lengths.clear();
@@ -731,21 +731,21 @@ perform_and_operation(const IInvertedIndex &inverted_index,
   auto result = std::make_shared<LazyMergeResult>(positive_postings_list);
 
   for_each_intersection(
-      positive_postings_list, [&](const auto &, size_t document_id) {
+      positive_postings_list, [&](const auto &, size_t ordinal) {
         // Exclude documents that appear in any negative postings. Both sides
         // are iterated in ascending document id order.
         for (size_t slot = 0; slot < negative_postings_list.size(); slot++) {
           const auto &p = negative_postings_list[slot];
           auto &cursor = negative_cursors[slot];
-          while (cursor < p->size() && p->document_id(cursor) < document_id) {
+          while (cursor < p->size() && p->document_ordinal(cursor) < ordinal) {
             cursor++;
           }
-          if (cursor < p->size() && p->document_id(cursor) == document_id) {
+          if (cursor < p->size() && p->document_ordinal(cursor) == ordinal) {
             return;
           }
         }
 
-        result->push_back(document_id);
+        result->push_back(ordinal);
       });
 
   return result;
@@ -758,7 +758,7 @@ perform_adjacent_operation(const IInvertedIndex &inverted_index,
   return intersect_postings(
       positings_list(inverted_index, expr.nodes, scope_index),
       [](const auto &positings_list, const auto &cursors,
-         size_t /*document_id*/, auto &term_positions, auto &term_lengths) {
+         size_t /*ordinal*/, auto &term_positions, auto &term_lengths) {
         auto target_slot = shortest_slot(positings_list, cursors);
 
         auto count =
@@ -834,7 +834,7 @@ perform_near_operation(const IInvertedIndex &inverted_index,
   return intersect_postings(
       positings_list(inverted_index, expr.nodes, scope_index),
       [&](const auto &positings_list, const auto &cursors,
-          size_t /*document_id*/, auto &term_positions, auto &term_lengths) {
+          size_t /*ordinal*/, auto &term_positions, auto &term_lengths) {
         search_hit_cursors.assign(positings_list.size(), 0);
 
         auto done = false;
@@ -923,9 +923,9 @@ perform_same_scope_operation(const IInvertedIndex &inverted_index,
 
   return intersect_postings(
       positings_list(inverted_index, expr.nodes, scope_index),
-      [&](const auto &positings_list, const auto &cursors, size_t document_id,
+      [&](const auto &positings_list, const auto &cursors, size_t ordinal,
           auto &term_positions, auto &term_lengths) {
-        if (!scope_index->has_scope(expr.scope_name, document_id)) {
+        if (!scope_index->has_scope(expr.scope_name, ordinal)) {
           return false;
         }
 
@@ -952,7 +952,7 @@ perform_same_scope_operation(const IInvertedIndex &inverted_index,
           auto same_scope = true;
           for (const auto &[term_pos, item] : slots_by_term_pos) {
             auto sid =
-                scope_index->scope_id(expr.scope_name, document_id, term_pos);
+                scope_index->scope_id(expr.scope_name, ordinal, term_pos);
             if (!reference_scope_id) {
               reference_scope_id = sid;
             } else if (*reference_scope_id != sid) {
@@ -1137,23 +1137,23 @@ void enumerate_terms(const IInvertedIndex &invidx, const Expression &expr,
 
 size_t term_count_score(const IInvertedIndex &invidx, const Expression &expr,
                         const IPostings &postings, size_t index) {
-  auto document_id = postings.document_id(index);
+  auto ordinal = postings.document_ordinal(index);
   size_t score = 0;
   enumerate_terms(invidx, expr, [&](const auto &term) {
-    score += invidx.term_count(term, document_id);
+    score += invidx.term_count(term, ordinal);
   });
   return score;
 }
 
 double tf_idf_score(const IInvertedIndex &invidx, const Expression &expr,
                     const IPostings &postings, size_t index) {
-  auto document_id = postings.document_id(index);
+  auto ordinal = postings.document_ordinal(index);
   auto N = static_cast<double>(invidx.document_count());
   double score = 0.0;
   enumerate_terms(invidx, expr, [&](const auto &term) {
     auto n = static_cast<double>(invidx.df(term));
     auto idf = std::log2((N + 0.001) / (n + 0.001));
-    score += invidx.tf(term, document_id) * idf;
+    score += invidx.tf(term, ordinal) * idf;
   });
   return score;
 }
@@ -1161,16 +1161,16 @@ double tf_idf_score(const IInvertedIndex &invidx, const Expression &expr,
 double bm25_score(const IInvertedIndex &invidx, const Expression &expr,
                   const IPostings &postings, size_t index, double k1,
                   double b) {
-  auto document_id = postings.document_id(index);
+  auto ordinal = postings.document_ordinal(index);
   auto N = static_cast<double>(invidx.document_count());
-  auto dl = static_cast<double>(invidx.document_term_count(document_id));
+  auto dl = static_cast<double>(invidx.document_term_count(ordinal));
   auto avgdl = static_cast<double>(invidx.average_document_term_count());
 
   double score = 0.0;
   enumerate_terms(invidx, expr, [&](const auto &term) {
     auto n = static_cast<double>(invidx.df(term));
     auto idf = std::log2((N - n + 0.5) / (n + 0.5));
-    auto tf = invidx.tf(term, document_id);
+    auto tf = invidx.tf(term, ordinal);
 
     score +=
         idf * ((tf * (k1 + 1.0)) / (tf + k1 * (1.0 - b + b * (dl / avgdl))));
@@ -1200,8 +1200,8 @@ BM25Scorer::BM25Scorer(const IInvertedIndex &invidx, const Expression &expr,
 }
 
 double BM25Scorer::operator()(const IPostings &postings, size_t index) const {
-  auto document_id = postings.document_id(index);
-  auto dl = static_cast<double>(invidx_.document_term_count(document_id));
+  auto ordinal = postings.document_ordinal(index);
+  auto dl = static_cast<double>(invidx_.document_term_count(ordinal));
   auto norm = k1_ * (1.0 - b_ + b_ * (dl / avgdl_));
 
   double score = 0.0;
@@ -1211,7 +1211,7 @@ double BM25Scorer::operator()(const IPostings &postings, size_t index) const {
     // norm NaN) produces the same value bm25_score would.
     double tf = 0.0;
     auto i = find_from_cursor(*term.postings, term.size, term.cursor,
-                              term.last_document_id, document_id);
+                              term.last_ordinal, ordinal);
     if (i < term.size) {
       tf = static_cast<double>(term.postings->search_hit_count(i)) / dl;
     }

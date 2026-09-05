@@ -114,13 +114,13 @@ TEST(PerfTest, ScorerDoesNotScaleWithVocabulary) {
   auto build = [](size_t vocabulary) {
     InMemoryInvertedIndex<TextRange> invidx;
     InMemoryIndexer indexer(invidx, perf_normalizer);
-    size_t document_id = 0;
+    size_t document_key = 0;
     for (size_t i = 0; i < vocabulary; i++) {
-      indexer.index_document(document_id++,
+      indexer.index_document(document_key++,
                              UTF8PlainTextTokenizer(alpha_term("term", i)));
     }
     for (size_t i = 0; i < kHits; i++) {
-      indexer.index_document(document_id++,
+      indexer.index_document(document_key++,
                              UTF8PlainTextTokenizer(alpha_term("zqx", i % 5)));
     }
     return invidx;
@@ -243,12 +243,12 @@ TEST(PerfTest, BuildingAUnionCostsLittleMoreThanEnumeratingItsDocumentIds) {
   ASSERT_EQ(kDocuments, result->size());
 
   auto build_us = best_of(20, [&] { perform_search(invidx, *expr); });
-  // document_id only. search_hit_count would drag the operand lookups into
+  // document_ordinal only. search_hit_count would drag the operand lookups into
   // the denominator and hide exactly what this test is about.
   auto walk_us = best_of(20, [&] {
     size_t sink = 0;
     for (size_t i = 0; i < result->size(); i++) {
-      sink += result->document_id(i);
+      sink += result->document_ordinal(i);
     }
     EXPECT_GT(sink, 0u);
   });

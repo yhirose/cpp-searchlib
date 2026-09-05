@@ -6,6 +6,7 @@
 //
 
 #include <algorithm>
+#include <cassert>
 #include <numeric>
 
 #include "searchlib.h"
@@ -31,10 +32,12 @@ IMutableInvertedIndex::~IMutableInvertedIndex() = default;
 
 IScopeIndex::~IScopeIndex() = default;
 
+IKeyedIndex::~IKeyedIndex() = default;
+
 //-----------------------------------------------------------------------------
 
 // Definition of the opaque type forward-declared in searchlib.h. One
-// Elias-Fano sequence per (scope_name, document_id), each mapping term_pos ->
+// Elias-Fano sequence per (scope_name, ordinal), each mapping term_pos ->
 // scope ordinal via EliasFano::access (see docs comment on ScopeIndexData's
 // forward declaration for why this stays out of the public header).
 namespace detail {
@@ -48,11 +51,12 @@ public:
 //-----------------------------------------------------------------------------
 
 size_t InMemoryInvertedIndexBase::Postings::size() const {
-  return document_ids_.size();
+  return document_ordinals_.size();
 }
 
-size_t InMemoryInvertedIndexBase::Postings::document_id(size_t index) const {
-  return document_ids_[index];
+size_t
+InMemoryInvertedIndexBase::Postings::document_ordinal(size_t index) const {
+  return document_ordinals_[index];
 }
 
 size_t
@@ -76,49 +80,29 @@ bool InMemoryInvertedIndexBase::Postings::is_term_position(
                             positions_.begin() + offsets_[index + 1], term_pos);
 }
 
-void InMemoryInvertedIndexBase::Postings::add_term_position(size_t document_id,
+void InMemoryInvertedIndexBase::Postings::add_term_position(size_t ordinal,
                                                             size_t term_pos) {
-  // Indexing walks documents in ascending id order and emits each document's
-  // positions in ascending order, so these two appends are the hot path and
-  // both are O(1) amortized. The general insert below only runs for a caller
-  // that indexes out of order, or re-indexes a document already present.
-  if (!document_ids_.empty() && document_ids_.back() == document_id) {
+  // Ordinals arrive in indexing order and each document's positions in
+  // ascending order, so this is append-only: extend the current document's
+  // slice, or open a new one. An ordinal below the last would mean a
+  // document was revisited, which allocate_ordinal rules out -- there used
+  // to be a sorted-insert path here for callers indexing out of order, and
+  // it is gone with them.
+  if (!document_ordinals_.empty() && document_ordinals_.back() == ordinal) {
     positions_.push_back(term_pos);
     offsets_.back() = positions_.size();
     return;
   }
-  if (document_ids_.empty() || document_ids_.back() < document_id) {
-    document_ids_.push_back(document_id);
-    positions_.push_back(term_pos);
-    offsets_.push_back(positions_.size());
-    return;
-  }
-
-  auto it =
-      std::lower_bound(document_ids_.begin(), document_ids_.end(), document_id);
-  auto index = static_cast<size_t>(it - document_ids_.begin());
-
-  if (it != document_ids_.end() && *it == document_id) {
-    // Append to this document's slice, as pushing onto its own vector used
-    // to, and shift the slices after it along.
-    positions_.insert(positions_.begin() + offsets_[index + 1], term_pos);
-    for (auto i = index + 1; i < offsets_.size(); i++) {
-      offsets_[i]++;
-    }
-  } else {
-    document_ids_.insert(it, document_id);
-    positions_.insert(positions_.begin() + offsets_[index], term_pos);
-    offsets_.insert(offsets_.begin() + index + 1, offsets_[index] + 1);
-    for (auto i = index + 2; i < offsets_.size(); i++) {
-      offsets_[i]++;
-    }
-  }
+  assert(document_ordinals_.empty() || document_ordinals_.back() < ordinal);
+  document_ordinals_.push_back(ordinal);
+  positions_.push_back(term_pos);
+  offsets_.push_back(positions_.size());
 }
 
 void InMemoryInvertedIndexBase::Postings::save(std::ostream &os) const {
-  detail::write_scalar<uint64_t>(os, document_ids_.size());
-  for (size_t i = 0; i < document_ids_.size(); i++) {
-    detail::write_scalar<uint64_t>(os, document_ids_[i]);
+  detail::write_scalar<uint64_t>(os, document_ordinals_.size());
+  for (size_t i = 0; i < document_ordinals_.size(); i++) {
+    detail::write_scalar<uint64_t>(os, document_ordinals_[i]);
     detail::write_scalar<uint64_t>(os, offsets_[i + 1] - offsets_[i]);
     for (auto j = offsets_[i]; j < offsets_[i + 1]; j++) {
       detail::write_scalar<uint64_t>(os, positions_[j]);
@@ -128,13 +112,13 @@ void InMemoryInvertedIndexBase::Postings::save(std::ostream &os) const {
 
 void InMemoryInvertedIndexBase::Postings::load(std::istream &is) {
   auto entry_count = detail::read_scalar<uint64_t>(is);
-  document_ids_.clear();
+  document_ordinals_.clear();
   offsets_.assign(1, 0);
   positions_.clear();
-  document_ids_.reserve(static_cast<size_t>(entry_count));
+  document_ordinals_.reserve(static_cast<size_t>(entry_count));
   offsets_.reserve(static_cast<size_t>(entry_count) + 1);
   for (uint64_t i = 0; i < entry_count; i++) {
-    document_ids_.push_back(
+    document_ordinals_.push_back(
         static_cast<size_t>(detail::read_scalar<uint64_t>(is)));
     auto position_count = detail::read_scalar<uint64_t>(is);
     for (uint64_t j = 0; j < position_count; j++) {
@@ -148,28 +132,27 @@ void InMemoryInvertedIndexBase::Postings::load(std::istream &is) {
 void InMemoryInvertedIndexBase::Postings::save_compressed(
     std::ostream &os) const {
   // Everything becomes a monotone sequence and is Elias-Fano coded:
-  // document_ids and the end offsets of each entry's slice in the
-  // concatenated position array are strictly increasing as-is. The
-  // positions themselves restart at every document, so each entry's
-  // positions get a per-entry base added (base = previous base + previous
-  // entry's last position + 1), which makes the concatenation strictly
-  // increasing too; the bases form a fourth monotone sequence so that a
-  // slice can be decoded (or randomly accessed later) by subtracting its
-  // base.
-  std::vector<uint64_t> document_ids;
+  // ordinals and the end offsets of each entry's slice in the concatenated
+  // position array are strictly increasing as-is. The positions themselves
+  // restart at every document, so each entry's positions get a per-entry
+  // base added (base = previous base + previous entry's last position + 1),
+  // which makes the concatenation strictly increasing too; the bases form a
+  // fourth monotone sequence so that a slice can be decoded (or randomly
+  // accessed later) by subtracting its base.
+  std::vector<uint64_t> ordinals;
   std::vector<uint64_t> end_offsets;
   std::vector<uint64_t> bases;
   std::vector<uint64_t> monotonized_positions;
-  document_ids.reserve(document_ids_.size());
-  end_offsets.reserve(document_ids_.size());
-  bases.reserve(document_ids_.size());
+  ordinals.reserve(document_ordinals_.size());
+  end_offsets.reserve(document_ordinals_.size());
+  bases.reserve(document_ordinals_.size());
   // One entry per element of the position arena, whose length the flat
   // layout has on hand -- and this is the largest of the four vectors.
   monotonized_positions.reserve(positions_.size());
   uint64_t total_positions = 0;
   uint64_t base = 0;
-  for (size_t i = 0; i < document_ids_.size(); i++) {
-    document_ids.push_back(document_ids_[i]);
+  for (size_t i = 0; i < document_ordinals_.size(); i++) {
+    ordinals.push_back(document_ordinals_[i]);
     total_positions += offsets_[i + 1] - offsets_[i];
     end_offsets.push_back(total_positions);
     bases.push_back(base);
@@ -179,40 +162,47 @@ void InMemoryInvertedIndexBase::Postings::save_compressed(
     base = monotonized_positions.back() + 1;
   }
 
-  detail::EliasFano(document_ids, document_ids.back() + 1).save(os);
+  // A universe of last + 1 on a non-empty sequence, and 1 on an empty one:
+  // no term in a dictionary is ever posting-less today, but a Postings is
+  // also a public class, and an empty one must round-trip rather than read
+  // past its end.
+  auto universe = [](const std::vector<uint64_t> &v) {
+    return v.empty() ? uint64_t(1) : v.back() + 1;
+  };
+  detail::EliasFano(ordinals, universe(ordinals)).save(os);
   detail::EliasFano(end_offsets, total_positions + 1).save(os);
-  detail::EliasFano(bases, bases.back() + 1).save(os);
-  detail::EliasFano(monotonized_positions, monotonized_positions.back() + 1)
+  detail::EliasFano(bases, universe(bases)).save(os);
+  detail::EliasFano(monotonized_positions, universe(monotonized_positions))
       .save(os);
 }
 
 void InMemoryInvertedIndexBase::Postings::load_compressed(std::istream &is) {
-  detail::EliasFano document_ids;
-  document_ids.load(is);
+  detail::EliasFano ordinals;
+  ordinals.load(is);
   detail::EliasFano end_offsets;
   end_offsets.load(is);
   detail::EliasFano bases;
   bases.load(is);
   detail::EliasFano monotonized_positions;
   monotonized_positions.load(is);
-  if (end_offsets.size() != document_ids.size() ||
-      bases.size() != document_ids.size() ||
-      (document_ids.size() > 0 &&
+  if (end_offsets.size() != ordinals.size() ||
+      bases.size() != ordinals.size() ||
+      (ordinals.size() > 0 &&
        monotonized_positions.size() !=
            end_offsets.access(end_offsets.size() - 1))) {
     throw std::runtime_error("searchlib: corrupt compressed postings");
   }
 
-  document_ids_.clear();
+  document_ordinals_.clear();
   offsets_.assign(1, 0);
   positions_.clear();
-  document_ids_.reserve(document_ids.size());
-  offsets_.reserve(document_ids.size() + 1);
+  document_ordinals_.reserve(ordinals.size());
+  offsets_.reserve(ordinals.size() + 1);
   // The corrupt-check above pinned monotonized_positions.size() to the total
   // position count, which is exactly what the decode loop pushes.
   positions_.reserve(monotonized_positions.size());
   uint64_t begin = 0;
-  for (size_t i = 0; i < document_ids.size(); i++) {
+  for (size_t i = 0; i < ordinals.size(); i++) {
     auto end = end_offsets.access(i);
     auto base = bases.access(i);
     if (end < begin) {
@@ -225,7 +215,7 @@ void InMemoryInvertedIndexBase::Postings::load_compressed(std::istream &is) {
       }
       positions_.push_back(static_cast<size_t>(value - base));
     }
-    document_ids_.push_back(static_cast<size_t>(document_ids.access(i)));
+    document_ordinals_.push_back(static_cast<size_t>(ordinals.access(i)));
     offsets_.push_back(positions_.size());
     begin = end;
   }
@@ -243,24 +233,24 @@ namespace detail {
 // per-document overhead is negligible even for many small documents.
 void save_text_ranges_compressed(std::ostream &os,
                                  const TextRangeList<TextRange> &list) {
-  std::vector<uint64_t> document_ids;
-  document_ids.reserve(list.size());
-  for (const auto &[document_id, _] : list) {
-    document_ids.push_back(document_id);
+  std::vector<uint64_t> ordinals;
+  ordinals.reserve(list.size());
+  for (const auto &[ordinal, _] : list) {
+    ordinals.push_back(ordinal);
   }
-  std::sort(document_ids.begin(), document_ids.end());
+  std::sort(ordinals.begin(), ordinals.end());
 
   std::vector<uint64_t> end_offsets;
   std::vector<uint64_t> bases;
   std::vector<uint64_t> positions;
   std::vector<uint64_t> cumulative_lengths;
-  end_offsets.reserve(document_ids.size());
-  bases.reserve(document_ids.size());
+  end_offsets.reserve(ordinals.size());
+  bases.reserve(ordinals.size());
   uint64_t total_values = 0;
   uint64_t base = 0;
   uint64_t length_sum = 0;
-  for (auto document_id : document_ids) {
-    const auto &values = list.at(static_cast<size_t>(document_id));
+  for (auto ordinal : ordinals) {
+    const auto &values = list.at(static_cast<size_t>(ordinal));
     total_values += values.size();
     end_offsets.push_back(total_values);
     bases.push_back(base);
@@ -277,7 +267,7 @@ void save_text_ranges_compressed(std::ostream &os,
   auto save_sequence = [&os](const std::vector<uint64_t> &values) {
     EliasFano(values, values.empty() ? 0 : values.back() + 1).save(os);
   };
-  save_sequence(document_ids);
+  save_sequence(ordinals);
   save_sequence(end_offsets);
   save_sequence(bases);
   save_sequence(positions);
@@ -336,53 +326,79 @@ void load_text_ranges_compressed(std::istream &is,
 
 //-----------------------------------------------------------------------------
 
-// Assumes document_id(index) is monotonically increasing in index, which
-// holds for every IPostings this library produces: Postings keeps entries
-// sorted by document_id, and SearchResult (search.cpp) only ever appends
-// documents in ascending order via its cursor-merge algorithms.
-size_t find_postings_index_for_document_id_(const IPostings &p,
-                                            size_t document_id) {
+// Assumes document_ordinal(index) is monotonically increasing in index,
+// which holds for every IPostings this library produces: Postings is
+// append-only in ordinal order, and SearchResult (search.cpp) only ever
+// appends documents in ascending order via its cursor-merge algorithms.
+size_t find_postings_index_for_ordinal_(const IPostings &p, size_t ordinal) {
   size_t lo = 0, hi = p.size();
   while (lo < hi) {
     size_t mid = lo + (hi - lo) / 2;
-    if (p.document_id(mid) < document_id) {
+    if (p.document_ordinal(mid) < ordinal) {
       lo = mid + 1;
     } else {
       hi = mid;
     }
   }
-  if (lo < p.size() && p.document_id(lo) == document_id) {
+  if (lo < p.size() && p.document_ordinal(lo) == ordinal) {
     return lo;
   }
   return p.size();
 }
 
 size_t InMemoryInvertedIndexBase::document_count() const {
-  return documents_.size();
+  return documents_.size() - removed_ordinals_.size();
 }
 
-size_t
-InMemoryInvertedIndexBase::document_term_count(size_t document_id) const {
-  return documents_.at(document_id).term_count;
+size_t InMemoryInvertedIndexBase::document_term_count(size_t ordinal) const {
+  return documents_.at(ordinal).term_count;
 }
 
-void InMemoryInvertedIndexBase::set_document_term_count(size_t document_id,
-                                                        size_t term_count) {
-  auto [it, inserted] = documents_.emplace(document_id, Document{term_count});
-  if (!inserted) {
-    // Re-indexing an existing document_id replaces its term count.
-    total_document_term_count_ -= it->second.term_count;
-    it->second.term_count = term_count;
+size_t InMemoryInvertedIndexBase::allocate_ordinal(size_t document_key) {
+  auto it = key_to_ordinal_.find(document_key);
+  if (it != key_to_ordinal_.end()) {
+    tombstone_(it->second);
   }
+  auto ordinal = documents_.size();
+  documents_.push_back(Document{0, document_key});
+  key_to_ordinal_[document_key] = ordinal;
+  return ordinal;
+}
+
+void InMemoryInvertedIndexBase::set_document_term_count(size_t ordinal,
+                                                        size_t term_count) {
+  auto &document = documents_.at(ordinal);
+  total_document_term_count_ -= document.term_count;
+  document.term_count = term_count;
   total_document_term_count_ += term_count;
 }
 
 double InMemoryInvertedIndexBase::average_document_term_count() const {
-  if (documents_.empty()) {
+  auto live = document_count();
+  if (live == 0) {
     return 0.0;
   }
   return static_cast<double>(total_document_term_count_) /
-         static_cast<double>(documents_.size());
+         static_cast<double>(live);
+}
+
+size_t InMemoryInvertedIndexBase::document_key(size_t ordinal) const {
+  return documents_.at(ordinal).key;
+}
+
+std::optional<size_t>
+InMemoryInvertedIndexBase::document_ordinal(size_t document_key) const {
+  auto it = key_to_ordinal_.find(document_key);
+  if (it == key_to_ordinal_.end()) {
+    return std::nullopt;
+  }
+  return it->second;
+}
+
+void InMemoryInvertedIndexBase::tombstone_(size_t ordinal) {
+  if (removed_ordinals_.insert(ordinal).second) {
+    total_document_term_count_ -= documents_[ordinal].term_count;
+  }
 }
 
 bool InMemoryInvertedIndexBase::term_exists(const std::u32string &str) const {
@@ -395,9 +411,9 @@ size_t InMemoryInvertedIndexBase::term_count(const std::u32string &str) const {
 }
 
 size_t InMemoryInvertedIndexBase::term_count(const std::u32string &str,
-                                             size_t document_id) const {
+                                             size_t ordinal) const {
   auto p = postings(str);
-  auto i = find_postings_index_for_document_id_(*p, document_id);
+  auto i = find_postings_index_for_ordinal_(*p, ordinal);
   if (i < p->size()) {
     return p->search_hit_count(i);
   }
@@ -409,12 +425,12 @@ size_t InMemoryInvertedIndexBase::df(const std::u32string &str) const {
 }
 
 double InMemoryInvertedIndexBase::tf(const std::u32string &str,
-                                     size_t document_id) const {
+                                     size_t ordinal) const {
   auto p = postings(str);
-  auto i = find_postings_index_for_document_id_(*p, document_id);
+  auto i = find_postings_index_for_ordinal_(*p, ordinal);
   if (i < p->size()) {
     return static_cast<double>(p->search_hit_count(i)) /
-           static_cast<double>(document_term_count(document_id));
+           static_cast<double>(document_term_count(ordinal));
   }
   return 0.0;
 }
@@ -553,21 +569,29 @@ void InMemoryInvertedIndexBase::enumerate_terms_with_edit_distance(
 }
 
 bool InMemoryInvertedIndexBase::has_removed_documents() const {
-  return !removed_document_ids_.empty();
+  return !removed_ordinals_.empty();
 }
 
-bool InMemoryInvertedIndexBase::is_document_removed(size_t document_id) const {
-  return removed_document_ids_.find(document_id) != removed_document_ids_.end();
+bool InMemoryInvertedIndexBase::is_document_removed(size_t ordinal) const {
+  return removed_ordinals_.find(ordinal) != removed_ordinals_.end();
 }
 
-void InMemoryInvertedIndexBase::remove_document(size_t document_id) {
-  removed_document_ids_.insert(document_id);
+void InMemoryInvertedIndexBase::remove_document(size_t document_key) {
+  auto it = key_to_ordinal_.find(document_key);
+  if (it != key_to_ordinal_.end()) {
+    tombstone_(it->second);
+  }
 }
 
 void InMemoryInvertedIndexBase::set_scope_ids(
-    const std::string &scope_name, size_t document_id,
+    const std::string &scope_name, size_t document_key,
     const std::vector<size_t> &scope_ids) {
-  if (scope_ids.size() != document_term_count(document_id)) {
+  auto ordinal = document_ordinal(document_key);
+  if (!ordinal) {
+    throw std::invalid_argument(
+        "searchlib: set_scope_ids: the key names no document");
+  }
+  if (scope_ids.size() != document_term_count(*ordinal)) {
     throw std::invalid_argument(
         "searchlib: scope_ids.size() must equal document_term_count()");
   }
@@ -584,11 +608,11 @@ void InMemoryInvertedIndexBase::set_scope_ids(
       scope_ids.empty() ? uint64_t(1) : uint64_t(scope_ids.back()) + 1;
   std::vector<uint64_t> values(scope_ids.begin(), scope_ids.end());
   scope_data_->by_name[scope_name].insert_or_assign(
-      document_id, detail::EliasFano(values, universe));
+      *ordinal, detail::EliasFano(values, universe));
 }
 
 bool InMemoryInvertedIndexBase::has_scope(const std::string &scope_name,
-                                          size_t document_id) const {
+                                          size_t ordinal) const {
   if (!scope_data_) {
     return false;
   }
@@ -596,11 +620,11 @@ bool InMemoryInvertedIndexBase::has_scope(const std::string &scope_name,
   if (it == scope_data_->by_name.end()) {
     return false;
   }
-  return it->second.find(document_id) != it->second.end();
+  return it->second.find(ordinal) != it->second.end();
 }
 
 size_t InMemoryInvertedIndexBase::scope_id(const std::string &scope_name,
-                                           size_t document_id,
+                                           size_t ordinal,
                                            size_t term_pos) const {
   if (!scope_data_) {
     return static_cast<size_t>(-1);
@@ -609,7 +633,7 @@ size_t InMemoryInvertedIndexBase::scope_id(const std::string &scope_name,
   if (it == scope_data_->by_name.end()) {
     return static_cast<size_t>(-1);
   }
-  auto doc_it = it->second.find(document_id);
+  auto doc_it = it->second.find(ordinal);
   if (doc_it == it->second.end()) {
     return static_cast<size_t>(-1);
   }
@@ -618,17 +642,14 @@ size_t InMemoryInvertedIndexBase::scope_id(const std::string &scope_name,
 
 void InMemoryInvertedIndexBase::save(std::ostream &os,
                                      IndexFormat format) const {
-  // Documents section, ordered by document_id for deterministic output.
+  // Documents section, in ordinal order. The ordinal is the position, so
+  // each record carries only the term count and the caller's key; a
+  // tombstoned document is written like any other, since its ordinal must
+  // keep its slot for the postings that still name it.
   detail::write_scalar<uint64_t>(os, documents_.size());
-  std::vector<size_t> document_ids;
-  document_ids.reserve(documents_.size());
-  for (const auto &[document_id, _] : documents_) {
-    document_ids.push_back(document_id);
-  }
-  std::sort(document_ids.begin(), document_ids.end());
-  for (auto document_id : document_ids) {
-    detail::write_scalar<uint64_t>(os, document_id);
-    detail::write_scalar<uint64_t>(os, documents_.at(document_id).term_count);
+  for (const auto &document : documents_) {
+    detail::write_scalar<uint64_t>(os, document.term_count);
+    detail::write_scalar<uint64_t>(os, document.key);
   }
 
   // Term dictionary section, ordered by term string for deterministic output.
@@ -674,16 +695,16 @@ void InMemoryInvertedIndexBase::save(std::ostream &os,
   }
 
   // Removed-documents (tombstone) section, sorted for deterministic output.
-  detail::write_scalar<uint64_t>(os, removed_document_ids_.size());
-  std::vector<size_t> removed_ids(removed_document_ids_.begin(),
-                                  removed_document_ids_.end());
-  std::sort(removed_ids.begin(), removed_ids.end());
-  for (auto document_id : removed_ids) {
-    detail::write_scalar<uint64_t>(os, document_id);
+  detail::write_scalar<uint64_t>(os, removed_ordinals_.size());
+  std::vector<size_t> removed(removed_ordinals_.begin(),
+                              removed_ordinals_.end());
+  std::sort(removed.begin(), removed.end());
+  for (auto ordinal : removed) {
+    detail::write_scalar<uint64_t>(os, ordinal);
   }
 
-  // Scope-index section: per scope_name (sorted), per document_id (sorted),
-  // an Elias-Fano encoded term_pos->scope-ordinal sequence. Stored the same
+  // Scope-index section: per scope_name (sorted), per ordinal (sorted), an
+  // Elias-Fano encoded term_pos->scope-ordinal sequence. Stored the same
   // way regardless of `format`, since EliasFano is already compact.
   if (scope_data_) {
     detail::write_scalar<uint64_t>(os, scope_data_->by_name.size());
@@ -698,17 +719,17 @@ void InMemoryInvertedIndexBase::save(std::ostream &os,
       os.write(name.data(), static_cast<std::streamsize>(name.size()));
 
       const auto &by_document = scope_data_->by_name.at(name);
-      std::vector<size_t> doc_ids;
-      doc_ids.reserve(by_document.size());
-      for (const auto &[document_id, _] : by_document) {
-        doc_ids.push_back(document_id);
+      std::vector<size_t> ordinals;
+      ordinals.reserve(by_document.size());
+      for (const auto &[ordinal, _] : by_document) {
+        ordinals.push_back(ordinal);
       }
-      std::sort(doc_ids.begin(), doc_ids.end());
+      std::sort(ordinals.begin(), ordinals.end());
 
-      detail::write_scalar<uint64_t>(os, doc_ids.size());
-      for (auto document_id : doc_ids) {
-        detail::write_scalar<uint64_t>(os, document_id);
-        by_document.at(document_id).save(os);
+      detail::write_scalar<uint64_t>(os, ordinals.size());
+      for (auto ordinal : ordinals) {
+        detail::write_scalar<uint64_t>(os, ordinal);
+        by_document.at(ordinal).save(os);
       }
     }
   } else {
@@ -718,14 +739,20 @@ void InMemoryInvertedIndexBase::save(std::ostream &os,
 
 void InMemoryInvertedIndexBase::load(std::istream &is, IndexFormat format) {
   documents_.clear();
-  total_document_term_count_ = 0;
+  key_to_ordinal_.clear();
   auto document_count = detail::read_scalar<uint64_t>(is);
   documents_.reserve(static_cast<size_t>(document_count));
   for (uint64_t i = 0; i < document_count; i++) {
-    auto document_id = static_cast<size_t>(detail::read_scalar<uint64_t>(is));
     auto term_count = static_cast<size_t>(detail::read_scalar<uint64_t>(is));
-    set_document_term_count(document_id, term_count);
+    auto key = static_cast<size_t>(detail::read_scalar<uint64_t>(is));
+    documents_.push_back(Document{term_count, key});
+    // Records are in ordinal order, so a key that was re-indexed ends up
+    // mapped to its newest ordinal -- the one that is live, unless it too
+    // was removed, which is exactly what the in-memory map would say.
+    key_to_ordinal_[key] = static_cast<size_t>(i);
   }
+  // The running total is settled once the tombstones below are known.
+  total_document_term_count_ = 0;
 
   term_dictionary_.clear();
   auto term_count = detail::read_scalar<uint64_t>(is);
@@ -761,12 +788,17 @@ void InMemoryInvertedIndexBase::load(std::istream &is, IndexFormat format) {
     }
   }
 
-  removed_document_ids_.clear();
+  removed_ordinals_.clear();
   auto removed_count = detail::read_scalar<uint64_t>(is);
-  removed_document_ids_.reserve(static_cast<size_t>(removed_count));
+  removed_ordinals_.reserve(static_cast<size_t>(removed_count));
   for (uint64_t i = 0; i < removed_count; i++) {
-    removed_document_ids_.insert(
+    removed_ordinals_.insert(
         static_cast<size_t>(detail::read_scalar<uint64_t>(is)));
+  }
+  for (size_t ordinal = 0; ordinal < documents_.size(); ordinal++) {
+    if (removed_ordinals_.find(ordinal) == removed_ordinals_.end()) {
+      total_document_term_count_ += documents_[ordinal].term_count;
+    }
   }
 
   scope_data_.reset();
@@ -781,11 +813,10 @@ void InMemoryInvertedIndexBase::load(std::istream &is, IndexFormat format) {
       auto &by_document = scope_data_->by_name[name];
       auto doc_count = detail::read_scalar<uint64_t>(is);
       for (uint64_t j = 0; j < doc_count; j++) {
-        auto document_id =
-            static_cast<size_t>(detail::read_scalar<uint64_t>(is));
+        auto ordinal = static_cast<size_t>(detail::read_scalar<uint64_t>(is));
         detail::EliasFano ef;
         ef.load(is);
-        by_document.insert_or_assign(document_id, std::move(ef));
+        by_document.insert_or_assign(ordinal, std::move(ef));
       }
     }
   }

@@ -22,10 +22,10 @@ static auto kjv_index() {
       std::string line;
       while (std::getline(fs, line)) {
         auto fields = split(line, '\t');
-        auto document_id = std::stoi(fields[0]);
+        auto document_key = std::stoi(fields[0]);
         const auto &s = fields[1];
 
-        indexer.index_document(document_id, UTF8PlainTextTokenizer(s));
+        indexer.index_document(document_key, UTF8PlainTextTokenizer(s));
       }
     }
   }
@@ -48,14 +48,17 @@ TEST(KJVChapterTest, SimpleTest) {
     auto term = U"apple";
     EXPECT_EQ(8, invidx.df(term));
 
-    EXPECT_EQ(532, postings->document_id(0));
-    EXPECT_EQ(1917, postings->document_id(1));
-    EXPECT_EQ(2007, postings->document_id(2));
-    EXPECT_EQ(2202, postings->document_id(3));
-    EXPECT_EQ(2208, postings->document_id(4));
-    EXPECT_EQ(2502, postings->document_id(5));
-    EXPECT_EQ(2901, postings->document_id(6));
-    EXPECT_EQ(3802, postings->document_id(7));
+    // The TSV's ids are book/chapter numbers, so they are the caller's keys
+    // and come back through document_key; the ordinals underneath are the
+    // file's line numbers.
+    EXPECT_EQ(532, invidx.document_key(postings->document_ordinal(0)));
+    EXPECT_EQ(1917, invidx.document_key(postings->document_ordinal(1)));
+    EXPECT_EQ(2007, invidx.document_key(postings->document_ordinal(2)));
+    EXPECT_EQ(2202, invidx.document_key(postings->document_ordinal(3)));
+    EXPECT_EQ(2208, invidx.document_key(postings->document_ordinal(4)));
+    EXPECT_EQ(2502, invidx.document_key(postings->document_ordinal(5)));
+    EXPECT_EQ(2901, invidx.document_key(postings->document_ordinal(6)));
+    EXPECT_EQ(3802, invidx.document_key(postings->document_ordinal(7)));
 
     EXPECT_EQ(1, postings->search_hit_count(0));
     EXPECT_EQ(1, postings->search_hit_count(1));
@@ -93,9 +96,9 @@ TEST(KJVChapterTest, SimpleTest) {
     ASSERT_TRUE(postings);
     ASSERT_EQ(3, postings->size());
 
-    EXPECT_EQ(2202, postings->document_id(0));
-    EXPECT_EQ(2208, postings->document_id(1));
-    EXPECT_EQ(2901, postings->document_id(2));
+    EXPECT_EQ(2202, invidx.document_key(postings->document_ordinal(0)));
+    EXPECT_EQ(2208, invidx.document_key(postings->document_ordinal(1)));
+    EXPECT_EQ(2901, invidx.document_key(postings->document_ordinal(2)));
 
     EXPECT_EQ(3, postings->search_hit_count(0));
     EXPECT_EQ(2, postings->search_hit_count(1));
@@ -122,7 +125,7 @@ TEST(KJVChapterTest, SimpleTest) {
       size_t i = 0;
       for (auto expected : {426, 434, 534, 602, 603, 604, 605, 606, 607, 608,
                             609, 610, 612, 613, 618, 620, 624, 1116}) {
-        EXPECT_EQ(expected, postings->document_id(i));
+        EXPECT_EQ(expected, invidx.document_key(postings->document_ordinal(i)));
         i++;
       }
     }

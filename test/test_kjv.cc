@@ -21,10 +21,10 @@ static auto kjv_index() {
     std::string line;
     while (std::getline(fs, line)) {
       auto fields = split(line, '\t');
-      auto document_id = std::stoi(fields[0]);
+      auto document_key = std::stoi(fields[0]);
       const auto &s = fields[4];
 
-      indexer.index_document(document_id, UTF8PlainTextTokenizer(s));
+      indexer.index_document(document_key, UTF8PlainTextTokenizer(s));
     }
   }
   return invidx;
@@ -124,7 +124,7 @@ TEST(KJVTest, CompressedPersistenceRoundTrip) {
   auto actual = perform_search(loaded, *expr);
   ASSERT_EQ(expected->size(), actual->size());
   for (size_t i = 0; i < expected->size(); i++) {
-    EXPECT_EQ(expected->document_id(i), actual->document_id(i));
+    EXPECT_EQ(expected->document_ordinal(i), actual->document_ordinal(i));
     ASSERT_EQ(expected->search_hit_count(i), actual->search_hit_count(i));
     for (size_t h = 0; h < expected->search_hit_count(i); h++) {
       EXPECT_EQ(expected->term_position(i, h), actual->term_position(i, h));
@@ -285,7 +285,7 @@ TEST(KJVTest, CompressedBackend) {
     ASSERT_GT(expected->size(), 0u) << query;
     ASSERT_EQ(expected->size(), actual->size()) << query;
     for (size_t i = 0; i < expected->size(); i++) {
-      EXPECT_EQ(expected->document_id(i), actual->document_id(i));
+      EXPECT_EQ(expected->document_ordinal(i), actual->document_ordinal(i));
       ASSERT_EQ(expected->search_hit_count(i), actual->search_hit_count(i));
       for (size_t h = 0; h < expected->search_hit_count(i); h++) {
         EXPECT_EQ(expected->term_position(i, h), actual->term_position(i, h));
@@ -302,8 +302,12 @@ TEST(KJVTest, CompressedBackend) {
 }
 
 TEST(KJVTest, CompressedBackendTombstones) {
+  // Keys are the TSV's verse ids (book/chapter/verse), so Genesis 1:1 is
+  // 1001001. This used to remove 1001 -- a key no verse has -- and passed
+  // only because removal then tombstoned any number it was handed.
   auto invidx = kjv_index();
-  invidx.remove_document(1001);
+  ASSERT_TRUE(invidx.document_ordinal(1001001));
+  invidx.remove_document(1001001);
 
   std::stringstream compressed(std::ios::in | std::ios::out |
                                std::ios::binary);
@@ -311,8 +315,9 @@ TEST(KJVTest, CompressedBackendTombstones) {
 
   auto loaded = load_compressed_index(compressed);
   EXPECT_TRUE(loaded->has_removed_documents());
-  EXPECT_TRUE(loaded->is_document_removed(1001));
-  EXPECT_FALSE(loaded->is_document_removed(1002));
+  EXPECT_TRUE(loaded->is_document_removed(*loaded->document_ordinal(1001001)));
+  EXPECT_FALSE(loaded->is_document_removed(*loaded->document_ordinal(1001002)));
+  EXPECT_EQ(1001001, loaded->document_key(*loaded->document_ordinal(1001001)));
 }
 
 TEST(KJVTest, CompressedBackendRejectsPlainFormat) {
