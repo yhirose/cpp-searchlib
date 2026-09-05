@@ -1,7 +1,7 @@
 # cpp-unicodelib (vendored)
 
 Upstream: https://github.com/yhirose/cpp-unicodelib
-Revision: bfdd356f2f99c6a5c861db8e84cf464dc6774827
+Revision: 6b0e3709757368e65d39543bcb1929de8e573591
 
 `unicodelib.h`, `unicodelib_encodings.h` and `unicodelib_names.h` are copied
 verbatim from that revision; `LICENSE` is its own. Upstream publishes no
