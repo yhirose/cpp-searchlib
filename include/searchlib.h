@@ -220,9 +220,99 @@ public:
     return count;
   }
 
+  // search_hit_count(index), (index+1), ... on the same terms as
+  // read_ordinals: the scorer reads a term's hit count for every document it
+  // scores, and on Elias-Fano a hit count is two selects.
+  virtual size_t read_hit_counts(size_t index, size_t *out,
+                                 size_t count) const {
+    auto n = size();
+    if (index >= n) {
+      return 0;
+    }
+    count = std::min(count, n - index);
+    for (size_t i = 0; i < count; i++) {
+      out[i] = search_hit_count(index + i);
+    }
+    return count;
+  }
+
+  // First index after `from` whose ordinal is >= `ordinal`, or size() when
+  // there is none. Requires document_ordinal(from) < ordinal, which is what
+  // every caller has just observed. The default gallops forward, which on a
+  // vector is O(log gap) loads; Elias-Fano overrides it with next_geq, one
+  // bucket lookup instead of a select per probe. Defined with the other
+  // out-of-line bodies, after detail::gallop_lower_bound.
+  virtual size_t advance(size_t from, size_t ordinal) const;
+
   virtual size_t term_position(size_t index, size_t search_hit_index) const = 0;
   virtual size_t term_length(size_t index, size_t search_hit_index) const = 0;
   virtual bool is_term_position(size_t index, size_t term_pos) const = 0;
+};
+
+// One operand read in order. Where the operand says a block is cheaper than
+// an element (prefers_block_reads: Elias-Fano), ordinals and hit counts come
+// in through read_ordinals / read_hit_counts a window at a time; anywhere
+// else every read is the operand's own call, so a vector-backed operand
+// pays one predictable branch and nothing more. The reads on one window
+// only move forward, which is how BM25Scorer walks: a result in ascending
+// order, each term's cursor following it.
+//
+// Same interface as IPostings for what it covers, so find_from_cursor takes
+// either.
+class PostingsWindow {
+public:
+  PostingsWindow() = default;
+  explicit PostingsWindow(const IPostings *postings)
+      : postings_(postings), buffered_(postings->prefers_block_reads()) {}
+
+  size_t document_ordinal(size_t index) {
+    if (!buffered_) {
+      return postings_->document_ordinal(index);
+    }
+    return ordinals_[locate_(index)];
+  }
+
+  size_t search_hit_count(size_t index) {
+    if (!buffered_) {
+      return postings_->search_hit_count(index);
+    }
+    auto i = locate_(index);
+    if (!counts_filled_) {
+      postings_->read_hit_counts(base_, counts_, filled_);
+      counts_filled_ = true;
+    }
+    return counts_[i];
+  }
+
+  size_t advance(size_t from, size_t ordinal) const {
+    return postings_->advance(from, ordinal);
+  }
+
+private:
+  static constexpr size_t kWindow = 8;
+
+  // The slot of `index` in the window, refilling when it is outside. A miss
+  // that continues where the window ended is a walk and refills a block;
+  // any other miss is a jump -- an advance -- and reads one, since a block
+  // there decodes values nothing will ask for (as OrdinalWindows does).
+  size_t locate_(size_t index) {
+    if (index >= base_ && index - base_ < filled_) {
+      return index - base_;
+    }
+    auto count = index == base_ + filled_ ? kWindow : size_t(1);
+    filled_ = postings_->read_ordinals(index, ordinals_, count);
+    base_ = index;
+    counts_filled_ = false;
+    return 0;
+  }
+
+  const IPostings *postings_ = nullptr;
+  bool buffered_ = false;
+  size_t base_ = 0;
+  size_t filled_ = 0;
+  bool counts_filled_ = false;
+  size_t ordinals_[kWindow];
+  size_t counts_[kWindow];
 };
 
 class IInvertedIndex {
@@ -662,6 +752,9 @@ public:
 private:
   struct TermState {
     std::shared_ptr<const IPostings> postings;
+    // The postings read forward (PostingsWindow), which is how the scorer
+    // reads them: a result in ascending order, this cursor following.
+    mutable PostingsWindow window;
     double idf;
     // postings->size(), resolved once here: the scorer's contract already
     // pins the postings for its lifetime, and re-fetching the size through
@@ -680,10 +773,29 @@ private:
     // of order stays correct, just without the shortcut.
     mutable size_t cursor;
     mutable size_t last_ordinal;
+    // postings->prefers_block_reads(), resolved once like `size` (see
+    // find_from_cursor).
+    bool block_reads;
   };
+
+  // The BM25 arithmetic over one document, reading the result and each
+  // term through whatever operator() hands it: the operands themselves, or
+  // their windows.
+  template <typename Result, typename TermReader>
+  double score_(Result &result, size_t index, TermReader term_reader) const;
 
   const IInvertedIndex &invidx_;
   std::vector<TermState> terms_;
+  // Whether any term reads in blocks. Resolved once, because the windowed
+  // body costs a vector-backed term on every hit (measured: +40% on a
+  // single-term result) and the walks' rule applies -- pick the path once,
+  // outside the loop.
+  bool windowed_ = false;
+  // The result being scored, read forward as well. A Term query's result is
+  // the term's own postings, so on the compressed backend every ordinal it
+  // is asked for would otherwise be a select.
+  mutable const IPostings *result_ = nullptr;
+  mutable PostingsWindow result_window_;
   double avgdl_;
   double k1_;
   double b_;
@@ -3048,6 +3160,25 @@ public:
     return static_cast<size_t>(end_offsets_.access(index) - begin_(index));
   }
 
+  size_t read_hit_counts(size_t index, size_t *out,
+                         size_t count) const override {
+    // The end offsets of the run in one pass, then differences in place:
+    // one select for the run and one for the offset before it, instead of
+    // two per entry.
+    count = end_offsets_.read(index, out, count);
+    auto previous = begin_(index);
+    for (size_t i = 0; i < count; i++) {
+      auto end = out[i];
+      out[i] = end - previous;
+      previous = end;
+    }
+    return count;
+  }
+
+  size_t advance(size_t, size_t ordinal) const override {
+    return ordinals_.next_geq(ordinal);
+  }
+
   size_t term_position(size_t index, size_t search_hit_index) const override {
     return static_cast<size_t>(
         positions_.access(static_cast<size_t>(begin_(index)) +
@@ -3624,6 +3755,10 @@ public:
 
   // False when no operand asked for blocks.
   bool buffered() const { return !blocks_.empty(); }
+  // Whether this one operand did.
+  bool buffered(size_t slot_index) const {
+    return !blocks_.empty() && blocks_[slot_index].buffer != nullptr;
+  }
 
   // Kept in step with the operand list the union walk prunes.
   void erase(size_t slot_index) {
@@ -3696,8 +3831,10 @@ min_max_slots_scan(size_t slot_count, Read read) {
 
 
 
-// First index in [low, high) whose ordinal is >= ordinal.
-inline size_t lower_bound_ordinal(const IPostings &postings, size_t low,
+// First index in [low, high) whose ordinal is >= ordinal. A template over
+// the operand, so that a PostingsWindow serves as well as an IPostings.
+template <typename P>
+inline size_t lower_bound_ordinal(P &postings, size_t low,
                                       size_t high, size_t ordinal) {
   while (low < high) {
     auto mid = low + (high - low) / 2;
@@ -3714,11 +3851,14 @@ inline size_t lower_bound_ordinal(const IPostings &postings, size_t low,
 // galloping forward from cursor: O(log gap) accesses instead of a linear
 // scan's O(gap), which pays off when an AND operand skips far ahead, and
 // instead of a plain binary search's O(log size), which the scorer's
-// step-or-two advances would not amortize. A separate skip-list structure is
-// unnecessary because document_ordinal(index) is O(1) random access. Requires
-// postings.document_ordinal(cursor) < ordinal.
-inline size_t gallop_lower_bound(const IPostings &postings, size_t cursor,
-                                 size_t size, size_t ordinal) {
+// step-or-two advances would not amortize. This is IPostings::advance's
+// default, right for an operand whose document_ordinal(index) is O(1) random
+// access; Elias-Fano, where each probe is a select, overrides advance with
+// its own next_geq instead. Requires postings.document_ordinal(cursor) <
+// ordinal.
+template <typename P>
+inline size_t gallop_lower_bound(P &postings, size_t cursor, size_t size,
+                                 size_t ordinal) {
   size_t step = 1;
   auto low = cursor + 1; // document_ordinal(cursor) is known to be < target
   auto high = cursor + step;
@@ -3755,8 +3895,15 @@ inline size_t gallop_lower_bound(const IPostings &postings, size_t cursor,
 // 172-instruction body into a 68-instruction one plus a call and costing 22%
 // of the scoring phase of a two-term Or, on a change that touched no scoring
 // code at all.
+//
+// `block_reads` is the operand's prefers_block_reads(), resolved once by the
+// caller like `size`: it picks the operand's own advance (Elias-Fano's
+// next_geq) over the inline gallop. A vector operand keeps the gallop and
+// pays no virtual call for it -- routing it through advance cost a two-term
+// Or's scoring 20%.
+template <typename P>
 SEARCHLIB_ALWAYS_INLINE size_t
-find_from_cursor(const IPostings &postings, size_t size, size_t &cursor,
+find_from_cursor(P &postings, size_t size, bool block_reads, size_t &cursor,
                  size_t &last_ordinal, size_t ordinal) {
   if (size == 0) {
     return 0;
@@ -3771,7 +3918,8 @@ find_from_cursor(const IPostings &postings, size_t size, size_t &cursor,
     auto high = std::min(cursor + 1, size);
     cursor = lower_bound_ordinal(postings, 0, high, ordinal);
   } else if (cursor < size && postings.document_ordinal(cursor) < ordinal) {
-    cursor = gallop_lower_bound(postings, cursor, size, ordinal);
+    cursor = block_reads ? postings.advance(cursor, ordinal)
+                         : gallop_lower_bound(postings, cursor, size, ordinal);
   }
   // Otherwise the cursor is already the lower bound for this document: it
   // either sits on it, or sits past it (absent), or the list is exhausted.
@@ -3819,6 +3967,7 @@ public:
       : operands_(std::move(operands)), cursors_(operands_.size()) {
     for (size_t slot = 0; slot < operands_.size(); slot++) {
       cursors_[slot].size = operands_[slot]->size();
+      cursors_[slot].block_reads = operands_[slot]->prefers_block_reads();
     }
   }
 
@@ -3880,6 +4029,7 @@ private:
   // rather than re-fetched through the virtual interface per lookup.
   struct OperandCursor {
     size_t size = 0;
+    bool block_reads = false;
     size_t cursor = 0;
     size_t last_ordinal = 0;
   };
@@ -3897,8 +4047,8 @@ private:
   // not carry the document -- possible under Or, never under And.
   size_t locate(size_t slot, size_t ordinal) const {
     auto &cursor = cursors_[slot];
-    return find_from_cursor(*operands_[slot], cursor.size, cursor.cursor,
-                            cursor.last_ordinal, ordinal);
+    return find_from_cursor(*operands_[slot], cursor.size, cursor.block_reads,
+                            cursor.cursor, cursor.last_ordinal, ordinal);
   }
 
   // Resolves every operand's entry for one document, and its hit count,
@@ -3995,17 +4145,21 @@ private:
 
 //-----------------------------------------------------------------------------
 
+// Each operand skips its own way (see find_from_cursor): an Elias-Fano one
+// through advance, a vector one through the inline gallop.
 inline bool
 skip_cursors(const std::vector<std::shared_ptr<IPostings>> &positings_list,
              const std::vector<size_t> &sizes, std::vector<size_t> &cursors,
-             size_t ordinal) {
+             const OrdinalWindows &windows, size_t ordinal) {
   for (size_t slot = 0; slot < positings_list.size(); slot++) {
     const auto &postings = *positings_list[slot];
     auto &cursor = cursors[slot];
     auto size = sizes[slot];
 
     if (cursor < size && postings.document_ordinal(cursor) < ordinal) {
-      cursor = gallop_lower_bound(postings, cursor, size, ordinal);
+      cursor = windows.buffered(slot)
+                   ? postings.advance(cursor, ordinal)
+                   : gallop_lower_bound(postings, cursor, size, ordinal);
     }
 
     if (cursor == size) {
@@ -4122,7 +4276,7 @@ inline void for_each_intersection(
         fn(cursors, min);
         done = increment_all_cursors(sizes, cursors);
       } else {
-        done = skip_cursors(positings_list, sizes, cursors, max);
+        done = skip_cursors(positings_list, sizes, cursors, windows, max);
       }
     }
   } else {
@@ -4134,7 +4288,7 @@ inline void for_each_intersection(
         fn(cursors, min);
         done = increment_all_cursors(sizes, cursors);
       } else {
-        done = skip_cursors(positings_list, sizes, cursors, max);
+        done = skip_cursors(positings_list, sizes, cursors, windows, max);
       }
     }
   }
@@ -4793,6 +4947,10 @@ inline std::optional<Expression> parse_query_impl(
 //-----------------------------------------------------------------------------
 // Definitions of everything declared in the interface above
 //-----------------------------------------------------------------------------
+
+inline size_t IPostings::advance(size_t from, size_t ordinal) const {
+  return detail::gallop_lower_bound(*this, from, size(), ordinal);
+}
 
 inline IPostings::~IPostings() = default;
 
@@ -5807,15 +5965,19 @@ inline BM25Scorer::BM25Scorer(const IInvertedIndex &invidx,
     auto postings = invidx.postings(term);
     auto size = postings->size();
     auto n = static_cast<double>(size);
-    terms_.push_back(TermState{std::move(postings),
+    PostingsWindow window(postings.get());
+    auto block_reads = postings->prefers_block_reads();
+    windowed_ = windowed_ || block_reads;
+    terms_.push_back(TermState{std::move(postings), window,
                                std::log2((N - n + 0.5) / (n + 0.5)), size, 0,
-                               0});
+                               0, block_reads});
   });
 }
 
-inline double BM25Scorer::operator()(const IPostings &postings,
-                                     size_t index) const {
-  auto ordinal = postings.document_ordinal(index);
+template <typename Result, typename TermReader>
+inline double BM25Scorer::score_(Result &result, size_t index,
+                                 TermReader term_reader) const {
+  auto ordinal = result.document_ordinal(index);
   auto dl = static_cast<double>(invidx_.document_term_count(ordinal));
   auto norm = k1_ * (1.0 - b_ + b_ * (dl / avgdl_));
 
@@ -5825,14 +5987,31 @@ inline double BM25Scorer::operator()(const IPostings &postings,
     // than being skipped, so that a degenerate index (avgdl == 0, making
     // norm NaN) produces the same value bm25_score would.
     double tf = 0.0;
-    auto i = detail::find_from_cursor(*term.postings, term.size, term.cursor,
-                                      term.last_ordinal, ordinal);
+    auto &reader = term_reader(term);
+    auto i = detail::find_from_cursor(reader, term.size, term.block_reads,
+                                      term.cursor, term.last_ordinal, ordinal);
     if (i < term.size) {
-      tf = static_cast<double>(term.postings->search_hit_count(i)) / dl;
+      tf = static_cast<double>(reader.search_hit_count(i)) / dl;
     }
     score += term.idf * ((tf * (k1_ + 1.0)) / (tf + norm));
   }
   return score;
+}
+
+inline double BM25Scorer::operator()(const IPostings &postings,
+                                     size_t index) const {
+  if (!windowed_) {
+    return score_(postings, index, [](const TermState &term) -> const IPostings & {
+      return *term.postings;
+    });
+  }
+  if (result_ != &postings) {
+    result_ = &postings;
+    result_window_ = PostingsWindow(&postings);
+  }
+  return score_(result_window_, index, [](const TermState &term) -> PostingsWindow & {
+    return term.window;
+  });
 }
 
 //-----------------------------------------------------------------------------
