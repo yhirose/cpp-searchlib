@@ -4,7 +4,7 @@
 #include <random>
 #include <vector>
 
-#include "succinct.h"
+#include <searchlib.h>
 
 using searchlib::detail::BitVector;
 using searchlib::detail::EliasFano;

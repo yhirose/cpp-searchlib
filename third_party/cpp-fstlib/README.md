@@ -1,19 +1,17 @@
-# cpp-fstlib (vendored, for segmentlib)
+# cpp-fstlib (path shim for segmentlib)
 
-Upstream: https://github.com/yhirose/cpp-fstlib
-Revision: 2c9af63710777ee69b4b9062aa98be4349e93d88
+No third-party code lives here. `segmentlib/mlp/dictionary.h` includes fstlib
+as `"cpp-fstlib/fstlib.h"`, which is upstream's own vendoring path; the
+`fstlib.h` here forwards that spelling to `../fstlib/fstlib.h`, this
+project's copy, so both spellings resolve to one library.
 
-This is **segmentlib's** copy of fstlib, taken from
-`third_party/cpp-fstlib/` of the cpp-segmentlib revision recorded in
-`../segmentlib/README.md`. `segmentlib/mlp/dictionary.h` includes it as
-`"cpp-fstlib/fstlib.h"`, which resolves here when `third_party` is on the
-include path.
+It used to be a second vendored copy, at whatever revision segmentlib
+bundled, and no translation unit could include both because both define
+`namespace fst`. That rule ended when `searchlib.h` became a single header:
+every consumer now sees fstlib, segmentlib's consumers included. Segmentation
+was verified against this revision before the copy was dropped -- upstream's
+reference model segments the same text identically.
 
-It is a different revision from this project's own copy at
-`../fstlib/fstlib.h`, which `src/termdict.h` includes as `"fstlib/fstlib.h"`.
-Both are kept, and the reason, plus the one rule that follows from it (no
-translation unit may include both), are in `../segmentlib/README.md`.
-
-Update this file only together with the segmentlib tree it belongs to (run
-`just vendor-update segmentlib`, not this file by hand): its revision is
-whatever that segmentlib revision vendored, not whatever is current upstream.
+The directory stays because it is the include path segmentlib's own headers
+expect, and editing a tree that is supposed to be a verbatim copy is worse
+than keeping a two-line file here.

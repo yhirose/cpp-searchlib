@@ -7,26 +7,25 @@ if(MSVC)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /Zc:__cplusplus /utf-8")
 endif()
 
-# The CJK-segmentation splitter, built as its own target so that the include
-# path reaching the vendored cpp-segmentlib (and, through it, segmentlib's own
-# copy of fstlib) is scoped to this single translation unit. Including
-# src/termdict.h alongside those headers fails with `namespace fst`
-# redefinition errors, so the scoping is what makes the collision unreachable;
-# see third_party/segmentlib/README.md. Declared at the top level rather than under
-# test/ because it is a library of this project, not of its test suite; only
-# test/ links it today, but nothing about it is test-specific.
-#
-# OBJECT rather than STATIC because consumers are executables built in this
-# same tree; there is no install rule to carry a library artifact. It holds
-# only this one file: the utils.cpp it calls into is compiled by whichever
-# target links this, the way every other src/*.cpp here is.
-add_library(searchlib-segment OBJECT src/segmentsplitter.cpp)
-target_include_directories(searchlib-segment PRIVATE include src)
-# -isystem, not -I: segmentlib's automaton is third-party code and is not
-# warning-clean at -Wall -Wextra (nine -Wunused-parameter hits). This project
-# sets no warning flags of its own today, so keeping it a system header is what
-# makes a warnings-on build stay quiet whenever someone turns them on.
-target_include_directories(searchlib-segment SYSTEM PRIVATE third_party)
+# The library itself: one header, plus the include paths its three vendored
+# dependencies resolve on. searchlib.h spells them as <fstlib.h>, <peglib.h>,
+# <unicodelib.h> and <unicodelib_encodings.h>, so a project that already
+# vendors any of them points at its own copy instead of this one and gets a
+# single definition of each (which is what culebra does).
+add_library(searchlib INTERFACE)
+target_include_directories(searchlib INTERFACE include)
+target_include_directories(searchlib SYSTEM INTERFACE
+  third_party/fstlib third_party/peglib third_party/unicodelib)
+
+# The opt-in CJK segmentation splitter (include/searchlib_segment.h), which is
+# a second header rather than part of searchlib.h because it needs segmentlib
+# compiled in and a model file shipped. Its include root is `third_party`
+# itself, since segmentlib's headers refer to each other as `segmentlib/...`,
+# and SYSTEM because that tree is not warning-clean at -Wall -Wextra (nine
+# -Wunused-parameter hits).
+add_library(searchlib-segment INTERFACE)
+target_link_libraries(searchlib-segment INTERFACE searchlib)
+target_include_directories(searchlib-segment SYSTEM INTERFACE third_party)
 
 add_subdirectory(cli)
 add_subdirectory(bench)
@@ -34,4 +33,4 @@ add_subdirectory(test)
 
 enable_testing()
 
-# install(FILES searchlib.h DESTINATION include)
+# install(FILES include/searchlib.h DESTINATION include)

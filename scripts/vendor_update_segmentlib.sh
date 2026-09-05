@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
-# Updates the vendored cpp-segmentlib tree (third_party/segmentlib, plus its
-# bundled third_party/cpp-fstlib and the test suite's model copy) to the
-# newest release tag, and records it in the two README.md files.
+# Updates the vendored cpp-segmentlib tree (third_party/segmentlib, plus the
+# test suite's model copy) to the newest release tag, and records it in the
+# README.md.
 #
 # Unlike the single-header libraries, this is a directory tree, so the update
 # is a tarball fetch + targeted copy rather than a raw.githubusercontent.com
-# curl per file. Everything replaced here comes from that one tag, so the
-# three pieces (segmentlib headers, its bundled fstlib, the MLP reference
-# model) always move together.
+# curl per file. Both pieces replaced here (segmentlib headers, the MLP
+# reference model) come from that one tag, so they always move together.
+#
+# Upstream's own third_party/cpp-fstlib is deliberately NOT copied: this
+# project has its own fstlib and segmentlib is built against it (see
+# third_party/cpp-fstlib/README.md). Segmentation output is what proves that
+# still holds, so run the tests after every update.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -46,8 +50,6 @@ EXTRACTED="${extracted_dirs[0]}"
 
 rm -rf "${ROOT_DIR}/third_party/segmentlib"
 cp -R "${EXTRACTED}include/segmentlib" "${ROOT_DIR}/third_party/segmentlib"
-rm -rf "${ROOT_DIR}/third_party/cpp-fstlib"
-cp -R "${EXTRACTED}third_party/cpp-fstlib" "${ROOT_DIR}/third_party/cpp-fstlib"
 
 # The bundled MLP reference model, plus its own NOTICE (CC BY-SA 4.0, unlike
 # this repository's MIT code -- see test/models/NOTICE). Requiring exactly one
@@ -76,9 +78,8 @@ Unicode letter runs, so a Japanese sentence with no spaces becomes one enormous
 term.
 
 Copied verbatim from that tag's `include/segmentlib/`. Update with
-`just vendor-update segmentlib`, which replaces the tree, the bundled
-`../cpp-fstlib/`, the test suite's model copy, and this line together, all
-from the same tag.
+`just vendor-update segmentlib`, which replaces the tree, the test suite's
+model copy, and this line together, all from the same tag.
 
 Inference upstream is header-only and targets C++17, which is what makes it
 droppable into this project (peglib/unicodelib/fstlib are here on the same
@@ -98,73 +99,34 @@ The headers refer to each other as `segmentlib/...`, so the include root is
 warning-clean under this project's flags (nine `-Wunused-parameter` hits at
 `-Wall -Wextra`).
 
-The one consumer is `src/segmentsplitter.cpp`, which implements
-`searchlib::load_segmenting_splitter` (`include/searchlib_segment.h`). It is
-built as its own CMake target, `searchlib-segment`, and that target carries the
-only `-isystem third_party` in the tree -- see below for why the scoping
-matters. Callers get a `TextSplitter`; no segmentlib type reaches the public
-header.
+The one consumer is `include/searchlib_segment.h`, which implements
+`searchlib::load_segmenting_splitter`. It is a header of its own rather than
+part of `searchlib.h` so that only a caller who wants CJK segmentation
+compiles segmentlib and carries `-isystem third_party`; the CMake target that
+supplies that path is `searchlib-segment`. Callers get a `TextSplitter`; no
+segmentlib type reaches `searchlib.h`.
 
 Models are not vendored with the headers, since which one to load is the
 caller's choice. `test/models/ja-ud-gsd.mod` is upstream's MLP reference model,
 copied for the test suite together with its NOTICE (it is CC BY-SA 4.0, unlike
 this repository's MIT code).
 
-## The two cpp-fstlib copies
+## fstlib
 
-`../cpp-fstlib/fstlib.h` is segmentlib's own vendored fstlib, copied alongside
-because `mlp/dictionary.h` holds an `fst::map` and includes it as
-`"cpp-fstlib/fstlib.h"`. It is **a different revision** from this project's
-own copy at `../fstlib/fstlib.h`, which `src/termdict.h` includes as
-`"fstlib/fstlib.h"`. Keeping both is deliberate: segmentlib was written and
-tested against its copy, and swapping in ours would be an unverified bet on
-API compatibility. The directory names deliberately differ (`cpp-fstlib` vs
-`fstlib`) precisely so the two can coexist under one include root without a
-path collision -- `cpp-fstlib` keeps segmentlib's own vendoring choice
-verbatim, `fstlib` is this project's own.
+`mlp/dictionary.h` holds an `fst::map` and includes it as
+`"cpp-fstlib/fstlib.h"`, upstream's own vendoring path. This project does not
+keep a second copy there: `../cpp-fstlib/fstlib.h` forwards to
+`../fstlib/fstlib.h`, so both spellings resolve to one library and one
+`namespace fst`.
 
-The two paths never collide on their own -- `cpp-fstlib/fstlib.h` and
-`fstlib/fstlib.h` are distinct spellings -- but both define `namespace fst`, so
-**one translation unit must not include both**. Verified: a file including
-`src/termdict.h` and `segmentlib/segmenter.h` together fails with 20
-redefinition errors.
-
-This does not constrain the splitter that uses this, because the public header
-does not pull in fstlib: `<searchlib.h>` plus `segmentlib/segmenter.h` compiles
-cleanly. Only `src/termdict.h` (and the two `.cpp` files that include it) is off
-limits in the same file as segmentlib.
-
-The `searchlib-segment` target is how that stays true without relying on anyone
-remembering it: the include path reaching these headers is `PRIVATE` to a
-target holding exactly one source file, so no other translation unit can spell
-`segmentlib/...` at all, let alone alongside `termdict.h`.
+Upstream bundles its own revision, and it used to be copied here, which meant
+no translation unit could include both. That stopped being workable when
+`searchlib.h` became a single header carrying the FST term dictionary --
+every consumer sees fstlib now. Segmentation was verified against this
+project's revision before the copy was dropped, and `SegmentTest` is what
+keeps it verified.
 BODY
 } > "${ROOT_DIR}/third_party/segmentlib/README.md"
-
-{
-    echo "# cpp-fstlib (vendored, for segmentlib)"
-    echo
-    echo "Upstream: https://github.com/yhirose/cpp-fstlib"
-    CPP_FSTLIB_REV="$(sed -n 's/^Revision: *//p' "${EXTRACTED}third_party/cpp-fstlib/README.md" 2>/dev/null | head -1)"
-    echo "Revision: ${CPP_FSTLIB_REV:-see the upstream third_party/cpp-fstlib/README.md at ${TAG}}"
-    echo
-    cat <<'BODY'
-This is **segmentlib's** copy of fstlib, taken from
-`third_party/cpp-fstlib/` of the cpp-segmentlib revision recorded in
-`../segmentlib/README.md`. `segmentlib/mlp/dictionary.h` includes it as
-`"cpp-fstlib/fstlib.h"`, which resolves here when `third_party` is on the
-include path.
-
-It is a different revision from this project's own copy at
-`../fstlib/fstlib.h`, which `src/termdict.h` includes as `"fstlib/fstlib.h"`.
-Both are kept, and the reason, plus the one rule that follows from it (no
-translation unit may include both), are in `../segmentlib/README.md`.
-
-Update this file only together with the segmentlib tree it belongs to (run
-`just vendor-update segmentlib`, not this file by hand): its revision is
-whatever that segmentlib revision vendored, not whatever is current upstream.
-BODY
-} > "${ROOT_DIR}/third_party/cpp-fstlib/README.md"
 
 echo "Done. Segmentation output can change with a model or algorithm update --" \
      "rebuild, run \`just test\`, and check SegmentTest output before committing."

@@ -28,12 +28,13 @@
 // Not built by CMake: it is a one-off corpus tool, not part of the library
 // or its tests. Build it beside the bench target when you need it:
 //
-//   clang++ -O2 -DNDEBUG -std=c++17 -I include -I src -isystem third_party \
-//     bench/segment_corpus.cpp src/*.cpp -o /tmp/segment_corpus
+//   clang++ -O2 -DNDEBUG -std=c++17 -I include -isystem third_party \
+//     -isystem third_party/fstlib -isystem third_party/peglib \
+//     -isystem third_party/unicodelib \
+//     bench/segment_corpus.cpp -o /tmp/segment_corpus
 
 #include <searchlib.h>
 #include <searchlib_segment.h>
-#include "utils.h"
 #include <cstdio>
 #include <fstream>
 #include <sstream>

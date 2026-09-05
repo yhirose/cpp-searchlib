@@ -40,8 +40,10 @@ cpp-searchlib's grammar (space is And, `|` is Or) for exactly this reason.
 python3 bench/aozora.py fetch   /tmp/aozora                 # ~700 MB of zips
 python3 bench/aozora.py extract /tmp/aozora /tmp/aozora.tsv
 
-clang++ -O2 -DNDEBUG -std=c++17 -I include -I src -isystem third_party \
-  bench/segment_corpus.cpp src/*.cpp -o /tmp/segment_corpus
+clang++ -O2 -DNDEBUG -std=c++17 -I include -isystem third_party \
+  -isystem third_party/fstlib -isystem third_party/peglib \
+  -isystem third_party/unicodelib \
+  bench/segment_corpus.cpp -o /tmp/segment_corpus
 /tmp/segment_corpus --in /tmp/aozora.tsv --out /tmp/aozora_seg.tsv \
   --splitter test/models/ja-ud-gsd.mod --chunk 300
 ```

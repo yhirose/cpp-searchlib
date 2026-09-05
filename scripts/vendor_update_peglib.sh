@@ -37,8 +37,8 @@ curl -fsSL "https://raw.githubusercontent.com/${REPO}/${TAG}/LICENSE" -o "${VEND
     echo "Update with \`just vendor-update peglib\`, which tracks the newest"
     echo "\`vX.Y.Z\` tag and writes it here."
     echo
-    echo "The one consumer is \`src/query.cpp\`, which includes it as"
-    echo '`"peglib/peglib.h"`.'
+    echo "The one consumer is \`include/searchlib.h\`, which includes it as"
+    echo '`<peglib.h>` -- so this directory itself is the include path.'
 } > "${VENDOR_DIR}/README.md"
 
 echo "Done. peglib drives query parsing end to end -- rebuild, run" \

@@ -1,11 +1,12 @@
 # Third-party code
 
-Every subdirectory here is copied from an upstream repository, not written in
-this project. Each one carries its own `README.md` recording the upstream URL
-and the exact revision vendored, so "is this current" is always answerable by
-reading a file rather than guessing from a commit date. Update with
-`just vendor-update [name]` (`just vendor-update` with no argument checks and
-updates all of them); see `scripts/vendor_update_*.sh`.
+Every subdirectory here except `cpp-fstlib/` is copied from an upstream
+repository, not written in this project. Each one carries its own `README.md`
+recording the upstream URL and the exact revision vendored, so "is this
+current" is always answerable by reading a file rather than guessing from a
+commit date. Update with `just vendor-update [name]` (`just vendor-update`
+with no argument checks and updates all of them); see
+`scripts/vendor_update_*.sh`.
 
 | Directory      | Upstream          | Tracks           |
 |----------------|--------------------|-------------------|
@@ -13,20 +14,21 @@ updates all of them); see `scripts/vendor_update_*.sh`.
 | `peglib/`      | cpp-peglib         | latest `vX.Y.Z` tag |
 | `unicodelib/`  | cpp-unicodelib     | branch tip (no tags) |
 | `segmentlib/`  | cpp-segmentlib     | latest `vX.Y.Z` tag |
-| `cpp-fstlib/`  | cpp-fstlib (again) | whatever `segmentlib/` bundles |
+| `cpp-fstlib/`  | --                 | a forward to `fstlib/` |
 
-`cpp-fstlib/` is not a separate top-level dependency of this project -- it is
-**segmentlib's own** vendored copy of fstlib, carried along because
-`segmentlib/mlp/dictionary.h` includes it as `"cpp-fstlib/fstlib.h"`. It sits
-here, alongside `segmentlib/`, rather than nested inside it, because that is
-the include path segmentlib's own headers expect. It is deliberately a
-different revision from `fstlib/`, this project's own direct copy of the same
-library -- see `segmentlib/README.md` for why both exist and the one rule
-that follows from it (no translation unit may include both; both define
-`namespace fst`).
+`searchlib.h` includes the first three as `<fstlib.h>`, `<peglib.h>`,
+`<unicodelib.h>` and `<unicodelib_encodings.h>`, so each of those directories
+is itself an include path. A project that already vendors any of them points
+at its own copy and gets one definition of each; that is what lets culebra
+build this library against its own peglib and unicodelib.
 
-The directory names encode that split: `fstlib` is this project's own choice
-of name for its own copy; `cpp-fstlib` is segmentlib's own vendoring choice,
-kept verbatim so its internal `#include "cpp-fstlib/fstlib.h"` keeps
-resolving without editing anything inside a tree that is supposed to be a
-verbatim copy.
+`segmentlib/` is the exception: its headers refer to each other as
+`segmentlib/...`, so its include root is `third_party` itself, and only the
+opt-in `searchlib_segment.h` needs it.
+
+`cpp-fstlib/` holds no vendored code. `segmentlib/mlp/dictionary.h` includes
+fstlib as `"cpp-fstlib/fstlib.h"`, upstream's own vendoring path, so a
+two-line header there forwards it to `fstlib/`. It used to be a second copy
+of fstlib at segmentlib's revision, which meant no translation unit could
+include both; the single-header `searchlib.h` ended that arrangement, since
+every consumer now sees fstlib. See `cpp-fstlib/README.md`.

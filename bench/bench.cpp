@@ -44,7 +44,7 @@
 #include <vector>
 
 #include "../test/test_utils.h"
-#include "unicodelib/unicodelib.h"
+#include <unicodelib.h>
 
 #if defined(__APPLE__)
 #include <mach/mach.h>

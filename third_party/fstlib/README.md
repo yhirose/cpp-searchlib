@@ -8,10 +8,8 @@ Upstream publishes no tags, so the revision above is what "current" means
 here. Update with `just vendor-update fstlib`, which replaces `fstlib.h` and
 this line together.
 
-The one consumer is `src/termdict.h`, which includes it as
-`"fstlib/fstlib.h"`.
-
-This is a **different revision** from `../cpp-fstlib/`, segmentlib's own
-bundled copy of the same library. See `../cpp-fstlib/README.md` and
-`../segmentlib/README.md` for why both exist and the one rule that follows
-from it (no translation unit may include both).
+`include/searchlib.h` includes it as `<fstlib.h>`, so this directory itself
+is the include path. It is also the copy segmentlib uses: `../cpp-fstlib/` is
+a two-line forward to this one, standing in for the path segmentlib's own
+headers spell (see its README). So an update here moves segmentlib's FST too
+-- run `just test`, `SegmentTest` included.

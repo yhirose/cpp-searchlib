@@ -23,19 +23,11 @@ add_executable(
   test_multifieldindex.cc
   test_perf.cc
   test_segment.cc
-  ../src/utils.cpp
-  ../src/invertedindex.cpp
-  ../src/compressedindex.cpp
-  ../src/search.cpp
-  ../src/query.cpp
-  ../src/tokenizer.cpp
-  ../src/analyzer.cpp
 )
 
-target_include_directories(test-main PRIVATE ../include ../src ../third_party)
-# searchlib-segment carries the only include path to the vendored
-# cpp-segmentlib; linking it does not extend that path to the sources above,
-# which is the point (see the comment on the target).
+# Nine translation units including one header: a definition that lost its
+# `inline` fails to link here, which is the check that keeps the single header
+# honest.
 target_link_libraries(test-main PRIVATE gtest_main searchlib-segment)
 
 include(GoogleTest)

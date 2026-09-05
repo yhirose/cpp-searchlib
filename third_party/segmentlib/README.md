@@ -9,9 +9,8 @@ Unicode letter runs, so a Japanese sentence with no spaces becomes one enormous
 term.
 
 Copied verbatim from that tag's `include/segmentlib/`. Update with
-`just vendor-update segmentlib`, which replaces the tree, the bundled
-`../cpp-fstlib/`, the test suite's model copy, and this line together, all
-from the same tag.
+`just vendor-update segmentlib`, which replaces the tree, the test suite's
+model copy, and this line together, all from the same tag.
 
 Inference upstream is header-only and targets C++17, which is what makes it
 droppable into this project (peglib/unicodelib/fstlib are here on the same
@@ -31,43 +30,29 @@ The headers refer to each other as `segmentlib/...`, so the include root is
 warning-clean under this project's flags (nine `-Wunused-parameter` hits at
 `-Wall -Wextra`).
 
-The one consumer is `src/segmentsplitter.cpp`, which implements
-`searchlib::load_segmenting_splitter` (`include/searchlib_segment.h`). It is
-built as its own CMake target, `searchlib-segment`, and that target carries the
-only `-isystem third_party` in the tree -- see below for why the scoping
-matters. Callers get a `TextSplitter`; no segmentlib type reaches the public
-header.
+The one consumer is `include/searchlib_segment.h`, which implements
+`searchlib::load_segmenting_splitter`. It is a header of its own rather than
+part of `searchlib.h` so that only a caller who wants CJK segmentation
+compiles segmentlib and carries `-isystem third_party`; the CMake target that
+supplies that path is `searchlib-segment`. Callers get a `TextSplitter`; no
+segmentlib type reaches `searchlib.h`.
 
 Models are not vendored with the headers, since which one to load is the
 caller's choice. `test/models/ja-ud-gsd.mod` is upstream's MLP reference model,
 copied for the test suite together with its NOTICE (it is CC BY-SA 4.0, unlike
 this repository's MIT code).
 
-## The two cpp-fstlib copies
+## fstlib
 
-`../cpp-fstlib/fstlib.h` is segmentlib's own vendored fstlib, copied alongside
-because `mlp/dictionary.h` holds an `fst::map` and includes it as
-`"cpp-fstlib/fstlib.h"`. It is **a different revision** from this project's
-own copy at `../fstlib/fstlib.h`, which `src/termdict.h` includes as
-`"fstlib/fstlib.h"`. Keeping both is deliberate: segmentlib was written and
-tested against its copy, and swapping in ours would be an unverified bet on
-API compatibility. The directory names deliberately differ (`cpp-fstlib` vs
-`fstlib`) precisely so the two can coexist under one include root without a
-path collision -- `cpp-fstlib` keeps segmentlib's own vendoring choice
-verbatim, `fstlib` is this project's own.
+`mlp/dictionary.h` holds an `fst::map` and includes it as
+`"cpp-fstlib/fstlib.h"`, upstream's own vendoring path. This project does not
+keep a second copy there: `../cpp-fstlib/fstlib.h` forwards to
+`../fstlib/fstlib.h`, so both spellings resolve to one library and one
+`namespace fst`.
 
-The two paths never collide on their own -- `cpp-fstlib/fstlib.h` and
-`fstlib/fstlib.h` are distinct spellings -- but both define `namespace fst`, so
-**one translation unit must not include both**. Verified: a file including
-`src/termdict.h` and `segmentlib/segmenter.h` together fails with 20
-redefinition errors.
-
-This does not constrain the splitter that uses this, because the public header
-does not pull in fstlib: `<searchlib.h>` plus `segmentlib/segmenter.h` compiles
-cleanly. Only `src/termdict.h` (and the two `.cpp` files that include it) is off
-limits in the same file as segmentlib.
-
-The `searchlib-segment` target is how that stays true without relying on anyone
-remembering it: the include path reaching these headers is `PRIVATE` to a
-target holding exactly one source file, so no other translation unit can spell
-`segmentlib/...` at all, let alone alongside `termdict.h`.
+Upstream bundles its own revision, and it used to be copied here, which meant
+no translation unit could include both. That stopped being workable when
+`searchlib.h` became a single header carrying the FST term dictionary --
+every consumer sees fstlib now. Segmentation was verified against this
+project's revision before the copy was dropped, and `SegmentTest` is what
+keeps it verified.

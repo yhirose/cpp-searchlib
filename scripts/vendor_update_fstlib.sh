@@ -5,10 +5,10 @@
 # Upstream publishes no tags, so "latest" always means the tip commit of the
 # default branch at the time this runs.
 #
-# This is this project's OWN copy of fstlib -- not the one segmentlib
-# bundles at third_party/cpp-fstlib, which is a different revision on
-# purpose and is updated only by re-vendoring segmentlib as a whole. See
-# third_party/README.md.
+# This is the only copy of fstlib in the tree: third_party/cpp-fstlib is a
+# two-line forward to it, there for the path segmentlib's own headers spell.
+# So an update here moves segmentlib's FST too -- run the tests, SegmentTest
+# included. See third_party/README.md.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

@@ -3,8 +3,7 @@
 #include <limits>
 #include <sstream>
 
-#include "unicodelib/unicodelib.h"
-#include "utils.h"
+#include <unicodelib.h>
 
 // Minimum of several runs: the fastest observed run is the one least
 // polluted by scheduling noise, so it is the stablest estimator here.

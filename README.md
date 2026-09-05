@@ -7,6 +7,26 @@ TODO:
 - [ ] Posting list compression
 - [ ] Search scope (document, section, paragraph)
 
+## Installation
+
+One header, `include/searchlib.h`. Nothing to build and nothing to link:
+copy it, or add `include/` to your include path and
+
+```cpp
+#include <searchlib.h>
+```
+
+It needs three header-only libraries, vendored under `third_party/` and
+included as `<fstlib.h>`, `<peglib.h>`, `<unicodelib.h>` and
+`<unicodelib_encodings.h>`, so each of those directories goes on the include
+path too. A project that already vendors any of them points at its own copy
+instead and ends up with one definition of each. With CMake, linking the
+`searchlib` interface target does all of that.
+
+Japanese segmentation lives in a second header, `<searchlib_segment.h>`,
+because it needs a fourth vendored library and a model file; see
+[Japanese word segmentation](#japanese-word-segmentation).
+
 ## Usage
 
 ```cpp
