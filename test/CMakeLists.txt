@@ -23,9 +23,10 @@ add_executable(
   test_multifieldindex.cc
   test_perf.cc
   test_segment.cc
+  test_splitter.cc
 )
 
-# Nine translation units including one header: a definition that lost its
+# Ten translation units including one header: a definition that lost its
 # `inline` fails to link here, which is the check that keeps the single header
 # honest.
 target_link_libraries(test-main PRIVATE gtest_main searchlib-segment)

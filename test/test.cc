@@ -40,6 +40,18 @@ auto sample_index() {
   return invidx;
 }
 
+// Indexes `text` as one term, whatever the default splitter would make of it.
+// For the tests below that are about the term dictionary or the automata
+// over it, not about splitting: they want 日本語 and 東京都 as terms, which the
+// UAX #29 default cuts one scalar at a time.
+Tokenizer<TextRange> whole_term(std::string text) {
+  return [text = std::move(text)](Normalizer normalizer, auto callback) {
+    auto str = u32(text);
+    callback(normalizer ? normalizer(str) : str, 0,
+             TextRange{0, text.size()});
+  };
+}
+
 TEST(TokenizerTest, UTF8PlainTextTokenizer) {
   std::vector<std::vector<std::string>> expected = {
       {"this", "is", "the", "first", "document"},
@@ -48,7 +60,8 @@ TEST(TokenizerTest, UTF8PlainTextTokenizer) {
        "sentence", "in", "the", "third"},
       {"fourth", "document"},
       {"hello", "world"},
-      {"東京", "タワー", "港区"},
+      // UAX #29: Han is one scalar per word, a Katakana run is one word.
+      {"東", "京", "タワー", "港", "区"},
       {"a", "well", "known", "example"},
   };
 
@@ -627,10 +640,15 @@ TEST(QueryTest, UnicodeTerm) {
   const auto &invidx = sample_index();
 
   {
+    // The default splitter cuts Han one scalar at a time, on both sides, so
+    // the query token becomes the implicit phrase 東 + 京 and still finds the
+    // document that was indexed the same way.
     auto expr = parse_query(normalizer, " 東京 ");
     ASSERT_NE(std::nullopt, expr);
-    EXPECT_EQ(Operation::Term, expr->operation);
-    EXPECT_EQ(U"東京", expr->term_str);
+    EXPECT_EQ(Operation::Adjacent, expr->operation);
+    ASSERT_EQ(2, expr->nodes.size());
+    EXPECT_EQ(U"東", expr->nodes[0].term_str);
+    EXPECT_EQ(U"京", expr->nodes[1].term_str);
 
     auto postings = perform_search(invidx, *expr);
     EXPECT_EQ(1, postings->size());
@@ -649,7 +667,7 @@ TEST(QueryTest, UnicodeTerm) {
     auto postings = perform_search(invidx, *expr);
     EXPECT_EQ(1, postings->size());
     EXPECT_EQ(0, postings->term_position(0, 0));
-    EXPECT_EQ(2, postings->term_length(0, 0));
+    EXPECT_EQ(3, postings->term_length(0, 0)); // 東 京 タワー
   }
 
   {
@@ -689,11 +707,22 @@ TEST(QueryTest, ImplicitPhrase) {
   }
 
   {
-    // A token without letters can never match.
-    auto expr = parse_query(normalizer, " 2021 ");
-    ASSERT_NE(std::nullopt, expr);
-    auto postings = perform_search(invidx, *expr);
-    EXPECT_EQ(0, postings->size());
+    // A number is a term like any other -- UAX #29 keeps `2021` whole, and
+    // `2.0` and `1,234.56` too (WB11/12 join digits across MidNum) -- so a
+    // query for one finds it, and only it.
+    InMemoryInvertedIndex<TextRange> numbered;
+    InMemoryIndexer indexer(numbered, normalizer);
+    indexer.index_document(0, UTF8PlainTextTokenizer("released in 2021"));
+    indexer.index_document(1, UTF8PlainTextTokenizer("version 2.0 shipped"));
+    indexer.index_document(2, UTF8PlainTextTokenizer("costs 1,234.56 today"));
+
+    for (auto [query, hits] : {std::pair{" 2021 ", 1}, {"2.0", 1},
+                               {"1,234.56", 1}, {"2", 0}, {"234", 0}}) {
+      auto expr = parse_query(normalizer, query);
+      ASSERT_NE(std::nullopt, expr) << query;
+      auto postings = perform_search(numbered, *expr);
+      EXPECT_EQ(hits, postings->size()) << query;
+    }
   }
 }
 
@@ -2086,7 +2115,7 @@ TEST(WildcardSearchTest, CompressedBackendMatchesInMemoryOffTheEasyPath) {
           a63 + U"b", a64 + U"b", std::u32string(U"apple"),
           std::u32string(U"banana"), std::u32string(U"café"),
           std::u32string(U"日本語"), std::u32string(U"あいうえお")}) {
-      indexer.index_document(document_key++, UTF8PlainTextTokenizer(u8(term)));
+      indexer.index_document(document_key++, whole_term(u8(term)));
     }
   }
 
@@ -2149,7 +2178,8 @@ const std::vector<std::string> fuzzy_documents = {
     "apple ample",
     "maple banana",
     "apply",
-    "東京 東京都",
+    "東京",
+    "東京都",
 };
 
 auto fuzzy_index() {
@@ -2157,7 +2187,11 @@ auto fuzzy_index() {
   InMemoryIndexer indexer(invidx, normalizer);
   size_t document_key = 0;
   for (const auto &doc : fuzzy_documents) {
-    indexer.index_document(document_key, UTF8PlainTextTokenizer(doc));
+    if (unicode::script(u32(doc)[0]) == unicode::Script::Han) {
+      indexer.index_document(document_key, whole_term(doc));
+    } else {
+      indexer.index_document(document_key, UTF8PlainTextTokenizer(doc));
+    }
     document_key++;
   }
   return invidx;
@@ -2489,7 +2523,7 @@ TEST(FstTermDictionaryTest, RoundTripsUnicodeTerms) {
   InMemoryInvertedIndex<TextRange> loaded;
   loaded.load(compressed);
 
-  for (const auto *term : {U"東京", U"タワー", U"港区", U"document", U"the"}) {
+  for (const auto *term : {U"東", U"タワー", U"区", U"document", U"the"}) {
     EXPECT_TRUE(loaded.term_exists(term)) << u8(term);
     EXPECT_EQ(invidx.term_count(term), loaded.term_count(term)) << u8(term);
     EXPECT_EQ(invidx.df(term), loaded.df(term)) << u8(term);
@@ -2505,14 +2539,14 @@ TEST(FstTermDictionaryTest, CompressedBackendLooksUpUnicodeTerms) {
   invidx.save(compressed, {}, IndexFormat::Compressed);
   auto loaded = load_compressed_index(compressed);
 
-  EXPECT_TRUE(loaded->term_exists(U"東京"));
-  EXPECT_EQ(invidx.df(U"東京"), loaded->df(U"東京"));
-  EXPECT_FALSE(loaded->term_exists(U"京"));  // a suffix is not a term
-  EXPECT_FALSE(loaded->term_exists(U"東"));  // nor is a prefix
+  EXPECT_TRUE(loaded->term_exists(U"タワー"));
+  EXPECT_EQ(invidx.df(U"タワー"), loaded->df(U"タワー"));
+  EXPECT_FALSE(loaded->term_exists(U"ワー"));  // a suffix is not a term
+  EXPECT_FALSE(loaded->term_exists(U"タ"));    // nor is a prefix
 
   // predictive_search over UTF-8 must not split a multi-byte codepoint.
-  EXPECT_EQ((std::vector<std::string>{"東京"}),
-            terms_with_prefix(*loaded, U"東"));
+  EXPECT_EQ((std::vector<std::string>{"タワー"}),
+            terms_with_prefix(*loaded, U"タ"));
 }
 
 TEST(FstTermDictionaryTest, EmptyIndexRoundTrips) {

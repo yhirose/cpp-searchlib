@@ -31,12 +31,12 @@ namespace searchlib {
 // loaded. The returned splitter shares one immutable model between all its
 // copies and is safe to call from several threads.
 //
-// It refines utf8_plain_text_splitter() rather than replacing it: terms are
-// still cut at Unicode letter-run boundaries, and only runs containing Han,
-// Hiragana or Katakana are handed to the model, which then adds boundaries
-// inside them. So the output on text with no CJK in it is byte-for-byte what
-// the default splitter produces -- deliberately, because a model trained on
-// Japanese otherwise shreds English ("iPhone" -> i/Phone).
+// It is the default splitter with a Segmenter plugged in for Han, Hiragana and
+// Katakana: everything else is cut exactly as utf8_plain_text_splitter() cuts
+// it, and only a run of Japanese script reaches the model. That gate is what
+// keeps this splitter's output on English identical to the default's --
+// deliberately, because a model trained on Japanese otherwise shreds English
+// ("iPhone" -> i/Phone, "jumps" -> ju/mps).
 //
 // Pass the same splitter to SplitterTokenizer (to index) and to parse_query
 // (to search); using it on only one side gives an index where 東京 can be
@@ -51,53 +51,66 @@ inline TextSplitter load_segmenting_splitter(const std::string &model_path) {
                              std::string(loaded.error().message));
   }
 
-  // shared_ptr rather than a captured value because a TextSplitter is a
-  // std::function and gets copied freely (parse_query takes one by value); the
-  // model is a few megabytes and immutable, so every copy shares this one.
-  auto segmenter =
+  // shared_ptr rather than a captured value because a Segmenter is a
+  // std::function and gets copied freely; the model is a few megabytes and
+  // immutable, so every copy shares this one.
+  auto model =
       std::make_shared<const segmentlib::Segmenter>(std::move(*loaded));
 
-  return [segmenter](std::string_view text, const auto &emit) {
-    detail::for_each_letter_run(
-        text, [&](const std::u32string &str, TextRange range) {
-          // Non-CJK runs are emitted exactly as the default splitter would,
-          // which is what keeps this splitter's behaviour on English text
-          // identical to utf8_plain_text_splitter()'s.
-          if (!detail::is_cjk_run(str)) {
-            emit(str, range);
-            return;
-          }
-
-          auto run = text.substr(range.position, range.length);
-          auto segments = segmenter->tokenize(run);
-          if (!segments) {
-            // The only failure tokenize() reports is invalid UTF-8, and no
-            // input is known to reach it: every byte of `run` was consumed by
-            // a successful unicode::utf8::decode_codepoint, and the two
-            // vendored decoders reject the same six classes (bad lead byte,
-            // truncated, bad continuation, overlong, surrogate, past
-            // U+10FFFF). Fuzzing 200000 ill-formed byte strings through this
-            // loop produced 87805 CJK runs and zero failures. The branch stays
-            // because that agreement is between two independently vendored
-            // libraries, either of which can move.
-            //
-            // Fall back to the unsegmented run rather than throwing: the query
-            // side runs this same code from inside a PEG semantic action, and
-            // both sides degrading identically keeps their term boundaries in
-            // agreement, which is the one property the whole design rests on.
-            emit(str, range);
-            return;
-          }
-
-          for (const auto &[start, end] : *segments) {
-            if (end <= start) {
-              continue;
-            }
-            auto word = run.substr(start, end - start);
-            emit(u32(word), TextRange{range.position + start, end - start});
-          }
-        });
+  // A scalar the model's run extends over: the three claimed scripts, plus
+  // the Common-script letters and marks Japanese is written with (ー, 々,
+  // combining voicing marks). Punctuation, spaces and digits end the run.
+  auto japanese = [](char32_t cp) {
+    switch (unicode::script(cp)) {
+    case unicode::Script::Han:
+    case unicode::Script::Hiragana:
+    case unicode::Script::Katakana:
+      return true;
+    case unicode::Script::Common:
+    case unicode::Script::Inherited:
+      return unicode::is_letter(cp) || unicode::is_mark(cp);
+    default:
+      return false;
+    }
   };
+
+  Segmenter segmenter = [model, japanese](std::string_view text, size_t offset,
+                                          const SplitEmit &emit) -> size_t {
+    auto end = offset;
+    while (end < text.size()) {
+      char32_t cp;
+      auto len = unicode::utf8::decode_codepoint(&text[end], text.size() - end, cp);
+      if (len == 0 || !japanese(cp)) {
+        break;
+      }
+      end += len;
+    }
+    auto run = text.substr(offset, end - offset);
+
+    auto segments = model->tokenize(run);
+    if (!segments) {
+      // The only failure tokenize() reports is invalid UTF-8, and every byte
+      // of `run` was just decoded successfully, so this is not known to be
+      // reachable. Emitting the run whole rather than throwing keeps both
+      // sides degrading identically, which is the property the design rests
+      // on.
+      emit(u32(run), TextRange{offset, run.size()});
+      return run.size();
+    }
+
+    for (const auto &[start, stop] : *segments) {
+      if (stop <= start) {
+        continue;
+      }
+      auto word = run.substr(start, stop - start);
+      emit(u32(word), TextRange{offset + start, stop - start});
+    }
+    return run.size();
+  };
+
+  return utf8_plain_text_splitter(
+      std::move(segmenter), {unicode::Script::Han, unicode::Script::Hiragana,
+                             unicode::Script::Katakana});
 }
 
 } // namespace searchlib

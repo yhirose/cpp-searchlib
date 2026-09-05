@@ -329,6 +329,10 @@ using Tokenizer =
 // Text splitting (shared by the index side and the query side)
 //-----------------------------------------------------------------------------
 
+// One term and the byte range it was cut from, as a splitter hands them out.
+using SplitEmit =
+    std::function<void(const std::u32string &str, TextRange range)>;
+
 // Splits raw text into the term strings an index should contain, together with
 // the byte range each came from. It is deliberately *not* a Tokenizer<T>: it
 // carries no term positions and no Normalizer, because the query side has no
@@ -342,17 +346,43 @@ using Tokenizer =
 // overlaps them corrupts highlighting. The emitted string need not equal those
 // bytes -- SplitterTokenizer applies the Normalizer on top of it, and a
 // splitter may normalize on its own -- but the range must still point at them.
-using TextSplitter = std::function<void(
-    std::string_view text,
-    const std::function<void(const std::u32string &str, TextRange range)>
-        &emit)>;
+using TextSplitter =
+    std::function<void(std::string_view text, const SplitEmit &emit)>;
 
-// The default splitter, and the one every existing entry point already uses
-// implicitly: maximal runs of Unicode letters (`unicode::is_letter`) become
-// terms and everything else separates them. It cannot segment CJK, where a
-// whole space-free sentence is one letter run and therefore one enormous term;
-// see searchlib_segment.h for a splitter that can.
+// A word segmenter for the scripts UAX #29 leaves to a dictionary. Called with
+// the whole text and the offset of a segment whose script it claimed, it emits
+// the words it finds from there and returns how many bytes it consumed; the
+// default splitter resumes after them. Seeing the whole text is what lets a
+// statistical model read as much context as it wants, and it also means the
+// same shape serves a splitter that handles everything itself: consume
+// `text.size() - offset`.
+//
+// The caller does not trust the answer. A span whose `consumed` is zero, runs
+// past the text or does not end on an extended grapheme cluster boundary is
+// dropped whole -- its words too, since a segmenter that gets the span wrong
+// gives no reason to believe its words -- and the walk resumes at the next
+// grapheme cluster. Within a valid span, a word is dropped on its own when it
+// lies outside the span, is empty, overlaps or precedes the word before it, or
+// is not cut on grapheme cluster boundaries. Nothing is reported: the query
+// side runs this from inside a parser action, and both sides degrading
+// identically is what keeps their term boundaries in agreement.
+using Segmenter = std::function<size_t(std::string_view text, size_t offset,
+                                       const SplitEmit &emit)>;
+
+// The default splitter, and the one every entry point uses when handed none:
+// UAX #29 word boundaries (unicode::word_length) over the whole text, keeping
+// the segments that contain a letter or a number. So `2.0`, `don't`, `U.S.A`
+// and `1,234.56` are each one term, punctuation and spaces are not terms, and
+// a run of Katakana is one term while Han, Hiragana, Thai and the other
+// scripts written without spaces come out one scalar per term -- which is
+// where UAX #29 itself says a dictionary should take over. The second form
+// hands every segment that starts with a scalar of one of `scripts` to
+// `segmenter` instead (see Segmenter for the contract); the first is the
+// second with no scripts claimed. searchlib_segment.h builds a Japanese
+// segmenter on the second form.
 TextSplitter utf8_plain_text_splitter();
+TextSplitter utf8_plain_text_splitter(Segmenter segmenter,
+                                      std::vector<unicode::Script> scripts);
 
 // Cuts every term `base` emits into the pieces `decompose` returns for it,
 // each with its own byte range. This is the shape a word-level morphological
@@ -2667,115 +2697,208 @@ private:
 // Text splitting
 //-----------------------------------------------------------------------------
 
-// The one definition of "what a raw term is" in this library: a maximal run of
-// codepoints for which unicode::is_letter holds. UTF8PlainTextTokenizer,
-// utf8_plain_text_splitter() and the segmenting splitter all go through this,
-// so there is no second place where the rule could drift.
+// The one definition of "what a raw term is" in this library: a UAX #29 word
+// segment containing a letter or a number. UTF8PlainTextTokenizer,
+// utf8_plain_text_splitter() and the segmenting splitter all go through
+// for_each_word below, so there is no second place where the rule could drift.
 //
-// Calls callback(str, range) once per run with the run's decoded codepoints
-// and its byte offsets into `text`. Runs are emitted in increasing order and
-// never overlap.
+// The text is decoded once into scalars with a byte offset per scalar, and
+// the boundaries come from unicode::word_length handed the remainder from each
+// boundary. Not from asking is_word_boundary about every position of the
+// whole text: WB15/16 look back over the preceding Regional_Indicator run, so
+// that shape is quadratic over a run of flags (measured: 3607 ns/scalar at
+// 8,000 scalars and doubling with the size, against 8.4 flat), and both
+// documents and query strings arrive from outside.
 //
-// A template taking the callback by deduced type, rather than a plain function
-// taking a std::function, because this is the indexing hot path and the
-// indirection dominates it. Tokenizing test/t_kjv.tsv (31103 documents) with
-// UTF8PlainTextTokenizer and no normalizer, clang -O2 -DNDEBUG, best of 5,
-// three interleaved rounds, identical checksums both ways: 22.4-22.6 ms as
-// written, 34.0-34.3 ms with this same body behind a `const std::function&`
-// parameter instead. So the rule stays defined once, and each caller's lambda
-// still inlines into the loop rather than becoming an indirect call per term.
-// Taken by forwarding reference rather than by value so that a caller handing
-// over a std::function (utf8_plain_text_splitter's `emit`, and parse_query's
-// per-token one) does not pay a copy of it -- that copy heap-allocates,
-// because the emitters here capture more than the inline buffer holds.
-template <typename Callback>
-void for_each_letter_run(std::string_view text, Callback &&callback) {
-  size_t pos = 0;
-  // Hoisted out of the loop so that each run reuses the previous run's
-  // capacity: libc++'s u32string holds 5 codepoints inline, so a fresh one per
-  // run means a malloc/free for every run longer than that, and this corpus
-  // has hundreds of thousands of them. It never outlives the callback call.
-  std::u32string str;
-  while (pos < text.size()) {
-    // Skip
+// An ill-formed byte -- a truncated sequence, a bad continuation byte, an
+// overlong encoding, a surrogate, a value past U+10FFFF -- becomes U+FFFD and
+// the walk steps over that one byte. It has no letter, so it is never a term
+// and it separates whatever it sits between; and the offset table stays true,
+// so nothing spins on `pos += 0` (reachable from a query string) and no range
+// crosses bytes that were never decoded.
+struct WordScratch {
+  std::u32string cps;          // the text's scalars
+  std::vector<size_t> offsets; // offsets[k] = byte offset of cps[k]; one more
+                               // entry holds text.size(), so every scalar
+                               // boundary in [0, text.size()] is in the table
+  std::u32string str;          // the term being emitted
+
+  void decode(std::string_view text) {
+    cps.clear();
+    offsets.clear();
+    size_t pos = 0;
     while (pos < text.size()) {
       char32_t cp;
       auto len =
           unicode::utf8::decode_codepoint(&text[pos], text.size() - pos, cp);
-      // decode_codepoint returns 0 without writing cp for anything that is not
-      // a well-formed UTF-8 sequence: a truncated one, a bad continuation
-      // byte, an overlong encoding, a surrogate, or a value past U+10FFFF.
-      // Both halves of that matter: reading cp would be an uninitialized read,
-      // and `pos += 0` would spin forever. Since text reaches here straight
-      // from a caller's document -- and, via parse_query, from an end-user's
-      // query string -- that hang is reachable from untrusted input. Step over
-      // the byte instead; it cannot be part of a term either way.
-      //
-      // Checking this is also what keeps cp inside the range the property
-      // tables cover. An earlier vendored unicodelib decoded F7 BF BF BF to
-      // U+1FFFFF and is_letter() then read past the end of its table; see
-      // TokenizerTest.IllFormedUtf8IsSkipped.
       if (len == 0) {
-        pos++;
-        continue;
+        cp = 0xFFFD;
+        len = 1;
       }
-      if (unicode::is_letter(cp)) {
-        break;
-      }
+      cps += cp;
+      offsets.push_back(pos);
       pos += len;
     }
+    offsets.push_back(pos);
+  }
 
-    // Term
-    auto beg = pos;
-    str.clear();
-
-    while (pos < text.size()) {
-      char32_t cp;
-      auto len =
-          unicode::utf8::decode_codepoint(&text[pos], text.size() - pos, cp);
-      // Same undecodable case, ending the term rather than skipping: the loop
-      // above then steps over the byte, so progress is guaranteed either way.
-      if (len == 0 || !unicode::is_letter(cp)) {
-        break;
-      }
-      str += cp;
-      pos += len;
+  // The scalar index at a byte offset, or npos when the offset is not a
+  // scalar boundary (or lies outside the text).
+  size_t scalar_at(size_t byte_offset) const {
+    auto it = std::lower_bound(offsets.begin(), offsets.end(), byte_offset);
+    if (it == offsets.end() || *it != byte_offset) {
+      return std::string::npos;
     }
+    return static_cast<size_t>(it - offsets.begin());
+  }
 
-    if (!str.empty()) {
-      callback(str, TextRange{beg, pos - beg});
+  TextRange range(size_t from, size_t to) const {
+    return TextRange{offsets[from], offsets[to] - offsets[from]};
+  }
+};
+
+// One WordScratch per thread, reused across calls: decoding allocates three
+// buffers otherwise, and on test/t_kjv.tsv (31,103 short documents) that is 9%
+// of the whole index build. A walk that is already using the thread's scratch
+// -- a Segmenter that calls the default splitter back for a span it does not
+// handle -- gets a fresh one of its own instead, so re-entry is merely slower.
+class WordScratchLease {
+public:
+  WordScratchLease() : scratch_(&slot().scratch) {
+    if (slot().in_use) {
+      own_ = std::make_unique<WordScratch>();
+      scratch_ = own_.get();
+    } else {
+      slot().in_use = true;
     }
   }
-}
-
-// Whether `str` contains a Han, Hiragana or Katakana codepoint -- the gate a
-// segmenting splitter uses to decide whether a run is worth handing to a
-// Japanese segmentation model. Runs without one are left as they are, because
-// a model trained on Japanese mangles them, and because that is what makes a
-// segmenting splitter's output on non-CJK text identical to
-// utf8_plain_text_splitter()'s.
-//
-// Measured on test/models/ja-ud-gsd.mod, feeding it one letter run at a time
-// (which is all this gate ever sees -- a run never contains a space):
-// "jumps" comes back as ju/mps, "created" as create/d, "known" as know/n and
-// "iPhone" as i/Phone, while most other English words survive intact. So the
-// damage is sporadic rather than total, which is worse than it sounds: it is
-// invisible until some particular word stops being findable.
-inline bool is_cjk_run(const std::u32string &str) {
-  for (auto cp : str) {
-    // No Han, Hiragana or Katakana codepoint exists below U+2E80 (verified by
-    // enumerating U+0000..U+10FFFF against the vendored unicodelib table), so
-    // Latin text settles this without touching the script tables at all.
-    if (cp < 0x2E80) {
-      continue;
+  ~WordScratchLease() {
+    if (!own_) {
+      slot().in_use = false;
     }
-    auto sc = unicode::script(cp);
-    if (sc == unicode::Script::Han || sc == unicode::Script::Hiragana ||
-        sc == unicode::Script::Katakana) {
+  }
+  WordScratchLease(const WordScratchLease &) = delete;
+  WordScratchLease &operator=(const WordScratchLease &) = delete;
+
+  WordScratch &operator*() const { return *scratch_; }
+
+private:
+  struct Slot {
+    WordScratch scratch;
+    bool in_use = false;
+  };
+  static Slot &slot() {
+    thread_local Slot slot;
+    return slot;
+  }
+
+  std::unique_ptr<WordScratch> own_;
+  WordScratch *scratch_;
+};
+
+inline bool is_word_like(const char32_t *cps, size_t n) {
+  for (size_t i = 0; i < n; i++) {
+    if (unicode::is_letter(cps[i]) || unicode::is_number(cps[i])) {
       return true;
     }
   }
   return false;
+}
+
+// What utf8_plain_text_splitter(segmenter, scripts) hands for_each_word.
+struct Delegation {
+  Segmenter segmenter;
+  std::vector<unicode::Script> scripts;
+
+  bool claims(char32_t cp) const {
+    auto sc = unicode::script(cp);
+    return std::find(scripts.begin(), scripts.end(), sc) != scripts.end();
+  }
+};
+
+// Runs the segmenter from scalar `i` and forwards what survives the checks
+// listed at Segmenter, then returns the scalar index to resume at. Grapheme
+// boundaries are tested relative to `i`, which is a word boundary and so a
+// grapheme boundary too; that is also what keeps the test linear, since
+// GB12/13 look back over Regional_Indicators the way WB15/16 do.
+template <typename Callback>
+size_t delegate_word(std::string_view text, const WordScratch &scratch,
+                     size_t i, const Delegation &delegation,
+                     std::vector<std::pair<std::u32string, TextRange>> &buffer,
+                     Callback &callback) {
+  const auto *cps = scratch.cps.data() + i;
+  auto n = scratch.cps.size() - i;
+  auto offset = scratch.offsets[i];
+
+  buffer.clear();
+  auto consumed = delegation.segmenter(
+      text, offset, [&](const std::u32string &str, TextRange range) {
+        buffer.emplace_back(str, range);
+      });
+
+  auto end = consumed == 0 ? std::string::npos
+                           : scratch.scalar_at(offset + consumed);
+  if (end == std::string::npos ||
+      !unicode::is_grapheme_boundary(cps, n, end - i)) {
+    return i + unicode::grapheme_length(cps, n);
+  }
+
+  auto cursor = offset;
+  for (const auto &[str, range] : buffer) {
+    auto stop = range.position + range.length;
+    if (range.length == 0 || range.position < cursor ||
+        stop > offset + consumed) {
+      continue;
+    }
+    auto from = scratch.scalar_at(range.position);
+    auto to = scratch.scalar_at(stop);
+    if (from == std::string::npos || to == std::string::npos ||
+        !unicode::is_grapheme_boundary(cps, n, from - i) ||
+        !unicode::is_grapheme_boundary(cps, n, to - i)) {
+      continue;
+    }
+    callback(str, range);
+    cursor = stop;
+  }
+  return end;
+}
+
+// Calls callback(str, range) once per word with the word's scalars and its
+// byte offsets into `text`. Words are emitted in increasing order and never
+// overlap. `delegation` may be null.
+//
+// A template taking the callback by deduced type, rather than a plain function
+// taking a std::function, because this is the indexing hot path and the
+// indirection dominates it (measured on the letter-run predecessor: 22.4 ms
+// tokenizing test/t_kjv.tsv as written, 34.0 ms behind a `const
+// std::function&`). Taken by forwarding reference rather than by value so that
+// a caller handing over a std::function (utf8_plain_text_splitter's `emit`,
+// and parse_query's per-token one) does not pay a copy of it -- that copy
+// heap-allocates, because the emitters here capture more than the inline
+// buffer holds.
+template <typename Callback>
+void for_each_word(std::string_view text, const Delegation *delegation,
+                   Callback &&callback) {
+  WordScratchLease lease;
+  auto &scratch = *lease;
+  scratch.decode(text);
+  const auto &cps = scratch.cps;
+  auto n = cps.size();
+
+  std::vector<std::pair<std::u32string, TextRange>> buffer;
+  size_t i = 0;
+  while (i < n) {
+    if (delegation && delegation->claims(cps[i])) {
+      i = delegate_word(text, scratch, i, *delegation, buffer, callback);
+      continue;
+    }
+    auto len = unicode::word_length(cps.data() + i, n - i);
+    if (is_word_like(cps.data() + i, len)) {
+      scratch.str.assign(cps.data() + i, len);
+      callback(scratch.str, scratch.range(i, i + len));
+    }
+    i += len;
+  }
 }
 
 
@@ -5368,7 +5491,23 @@ inline TextRange text_range(const TextRangeList<TextRange> &text_range_list,
 
 inline TextSplitter utf8_plain_text_splitter() {
   return [](std::string_view text, const auto &emit) {
-    detail::for_each_letter_run(text, emit);
+    detail::for_each_word(text, nullptr, emit);
+  };
+}
+
+inline TextSplitter utf8_plain_text_splitter(
+    Segmenter segmenter, std::vector<unicode::Script> scripts) {
+  if (!segmenter) {
+    throw std::invalid_argument(
+        "searchlib: utf8_plain_text_splitter needs a segmenter");
+  }
+  // Held through a shared_ptr, as subword_splitter holds its stages: a
+  // TextSplitter is copied into every SplitterTokenizer and every parse_query
+  // call, and the segmenter need not be copied with it.
+  auto delegation = std::make_shared<const detail::Delegation>(
+      detail::Delegation{std::move(segmenter), std::move(scripts)});
+  return [delegation](std::string_view text, const auto &emit) {
+    detail::for_each_word(text, delegation.get(), emit);
   };
 }
 
@@ -5432,8 +5571,8 @@ inline void UTF8PlainTextTokenizer::operator()(
                               TextRange text_range)>
                callback) {
   size_t term_pos = 0;
-  detail::for_each_letter_run(
-      text_, [&](const std::u32string &str, TextRange range) {
+  detail::for_each_word(
+      text_, nullptr, [&](const std::u32string &str, TextRange range) {
         // Spelled as an if rather than `callback(normalizer ? normalizer(str)
         // : str, ...)`: one arm of that conditional is a prvalue, so the whole
         // expression is a prvalue and `str` gets copied on every term even
@@ -5472,7 +5611,7 @@ inline void SplitterTokenizer::operator()(
   if (splitter_) {
     splitter_(text_, emit);
   } else {
-    detail::for_each_letter_run(text_, emit);
+    detail::for_each_word(text_, nullptr, emit);
   }
 }
 
@@ -5743,10 +5882,10 @@ parse_query(TextSplitter splitter, TermFilter filter, std::string_view query) {
     // Any other placement of `*` (leading, interior, or more than one) makes
     // the whole token a wildcard pattern instead of a prefix. Handled
     // separately from build() below, because the splitter treats `*` as a
-    // non-letter separator and would otherwise fragment the token into
-    // unrelated words -- the same way it fragments `well-known` -- which
-    // would lose the pattern structure. Each `*`-delimited piece is filtered
-    // as one opaque chunk rather than re-split into its own letter runs, so a
+    // separator and would otherwise fragment the token into unrelated words
+    // -- the same way it fragments `well-known` -- which would lose the
+    // pattern structure. Each `*`-delimited piece is filtered as one opaque
+    // chunk rather than re-split into its own words, so a
     // wildcard segment that itself contains punctuation (`well-kno*n`) is not
     // decomposed the way a plain phrase term would be; out of scope for v1.
     //

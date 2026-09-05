@@ -86,10 +86,11 @@ for (size_t i = 0; i < result->size(); i++) {
 | `( ... )` | Grouping |
 
 Terms are tokenized and normalized in the same way as documents, so Unicode
-terms work as long as the tokenizer indexed them. Languages written without
-spaces (Japanese, Chinese) need a segmenting splitter on both sides to be
-searchable at all -- see [Japanese word segmentation](#japanese-word-segmentation).
-`NOT` is only valid along with at least one positive term.
+terms work as long as the tokenizer indexed them. See
+[Words](#words) for what a term is, and
+[Japanese word segmentation](#japanese-word-segmentation) for languages
+written without spaces. `NOT` is only valid along with at least one positive
+term.
 
 A trailing `*` expands against the index's dictionary at search time, so
 `app*` is equivalent to an `OR` over every indexed term starting with `app`,
@@ -276,13 +277,38 @@ auto hits = perform_multi_field_search(index, *expr);
 There is no query-string `field:` syntax; field selection is a C++-level
 choice. `MultiFieldIndex::save`/`load` persist every field.
 
+## Words
+
+A term is a [UAX #29](https://unicode.org/reports/tr29/) word segment that
+contains a letter or a number; that is what `UTF8PlainTextTokenizer`,
+`utf8_plain_text_splitter()` and `parse_query` (when handed no splitter) all
+cut, on both sides. So `version 2.0` is `version` and `2.0`, `don't` and
+`U.S.A` and `1,234.56` are one term each, spaces and punctuation between words
+are not terms, and the scripts written with spaces come out word by word:
+
+```
+version 2.0 shipped   -> version / 2.0 / shipped
+don't say U.S.A.      -> don't / say / U.S.A
+Русский язык, 한국어   -> Русский / язык / 한국어
+```
+
+The scripts written *without* spaces are where UAX #29 itself defers to a
+dictionary: Han, Hiragana, Thai and their kin come out one scalar per term
+(a run of Katakana is one term), which is the unigram baseline --
+`東京タワー` indexes as `東` / `京` / `タワー` and a query for `東京` becomes the
+implicit phrase `東` + `京`, so it is found. `utf8_plain_text_splitter(segmenter,
+scripts)` plugs a dictionary in: every segment that starts with a scalar of
+one of `scripts` is handed to `segmenter` with the whole text and its offset,
+and the segmenter emits the words it finds from there and returns how many
+bytes it consumed. What comes back is checked, not trusted (see `Segmenter`
+in the header): a span that does not end on a grapheme cluster boundary is
+dropped whole, a word that overlaps its neighbour or is cut inside a cluster
+is dropped alone, and everything else is indexed exactly as emitted.
+
 ## Japanese word segmentation
 
-The default tokenizer cuts terms at runs of Unicode letters, which does not
-work for a language written without spaces: `私は東京タワーに行った` is one
-letter run, so it indexes as one enormous term and nothing inside it can be
-found. `load_segmenting_splitter` returns a `TextSplitter` that adds word
-boundaries inside such runs, using the vendored
+`load_segmenting_splitter` returns the default splitter with a Japanese
+segmenter plugged in for Han, Hiragana and Katakana, using the vendored
 [cpp-segmentlib](https://github.com/yhirose/cpp-segmentlib):
 
 ```cpp
@@ -306,9 +332,9 @@ auto expr = parse_query(splitter, nullptr, "東京タワー");
 A query token the splitter cuts up becomes an implicit phrase, the same
 treatment `well-known` gets. Insert a space to get an `AND` instead.
 
-Only runs containing Han, Hiragana or Katakana go through the model, so text
-with no CJK in it is split byte-for-byte the way the default splitter splits
-it -- a Japanese model would otherwise shred it (`iPhone` into `i`/`Phone`).
+Only runs of Han, Hiragana and Katakana go through the model, so everything
+else is split byte-for-byte the way the default splitter splits it -- a
+Japanese model would otherwise shred it (`iPhone` into `i`/`Phone`).
 `Analyzer<T>` chains, prefix (`東京タワ*`) and fuzzy (`東京タワー~1`) all
 compose with it as usual.
 

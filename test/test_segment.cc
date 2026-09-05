@@ -136,11 +136,11 @@ TEST(SegmentTest, TokenPositionsAndRangesAreConsistent) {
 
 TEST(SegmentTest, NonCJKTextIsUnchangedFromTheDefaultSplitter) {
   // The regression wall around every existing English index: because only
-  // Han/Hiragana/Katakana runs reach the model, everything else must come out
-  // byte-identical to what utf8_plain_text_splitter() produces. Without the
-  // gate the model mangles individual words -- "jumps" segments as ju/mps,
-  // "created" as create/d, "known" as know/n, "iPhone" as i/Phone -- which is
-  // what the first string below catches.
+  // runs of Han/Hiragana/Katakana reach the model, everything else must come
+  // out byte-identical to what utf8_plain_text_splitter() produces. Without
+  // the gate the model mangles individual words -- "jumps" segments as
+  // ju/mps, "created" as create/d, "known" as know/n, "iPhone" as i/Phone --
+  // which is what the first string below catches.
   const char *texts[] = {
       "The quick brown fox jumps over the lazy dog",
       "iPhone",
@@ -177,8 +177,8 @@ TEST(SegmentTest, NormalizerIsAppliedToEverySegment) {
 }
 
 TEST(SegmentTest, MalformedUtf8TerminatesInsteadOfHanging) {
-  // decode_codepoint returns 0 for bytes it cannot decode, so the letter-run
-  // loop used to advance by 0 and spin forever on a truncated sequence. That
+  // decode_codepoint returns 0 for bytes it cannot decode, so a walk that
+  // advanced by its answer used to spin forever on a truncated sequence. That
   // is reachable from an end-user query string through parse_query, not just
   // from documents, so it has to terminate on anything.
   const std::string truncated = "ab\xE3";        // 3-byte sequence cut short
@@ -195,8 +195,8 @@ TEST(SegmentTest, MalformedUtf8TerminatesInsteadOfHanging) {
             terms(tokenize(utf8_plain_text_splitter(), bad_continuation)));
   EXPECT_TRUE(terms(tokenize(utf8_plain_text_splitter(), out_of_range)).empty());
 
-  // The segmenting splitter must survive them too. It shares the letter-run
-  // loop, so it sees the same ill-formed bytes before its CJK gate can run.
+  // The segmenting splitter must survive them too. It shares the walk, so it
+  // sees the same ill-formed bytes before its script gate can run.
   EXPECT_NO_THROW({
     tokenize(segmenting_splitter(), truncated);
     tokenize(segmenting_splitter(), bad_continuation);
@@ -208,17 +208,17 @@ TEST(SegmentTest, MalformedUtf8TerminatesInsteadOfHanging) {
   EXPECT_NO_THROW(parse_query(segmenting_splitter(), nullptr, out_of_range));
 }
 
-TEST(SegmentTest, KnownLimitationsCarriedOverFromTheLetterRunRule) {
-  // Segmentation refines letter runs, it does not redefine them, so the
-  // existing rules still hold and are pinned here rather than left to be
-  // rediscovered: punctuation separates runs and is dropped, and digits are
-  // not letters (unicode::is_letter excludes Nd), so `2024年` indexes as `年`
-  // alone. Changing the latter means changing is_letter for every language at
-  // once, which is a separate decision.
+TEST(SegmentTest, TheDefaultSplittersRulesStillHoldAroundTheModel) {
+  // The model only sees runs of Japanese script; what surrounds them is cut
+  // by the default splitter's rules, pinned here so they are not rediscovered:
+  // punctuation is dropped, and a number is a term of its own rather than
+  // part of the run handed to the model.
   EXPECT_EQ((std::vector<std::string>{"東京"}),
             terms(tokenize(segmenting_splitter(), "「東京」。")));
-  EXPECT_EQ((std::vector<std::string>{"年"}),
+  EXPECT_EQ((std::vector<std::string>{"2024", "年"}),
             terms(tokenize(segmenting_splitter(), "2024年")));
+  EXPECT_EQ((std::vector<std::string>{"iPhone", "15", "を", "買っ", "た"}),
+            terms(tokenize(segmenting_splitter(), "iPhone 15を買った")));
 }
 
 //-----------------------------------------------------------------------------
