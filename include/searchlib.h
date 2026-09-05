@@ -1617,6 +1617,19 @@ public:
     size_t term_count = 0;
     tokenizer(normalizer_, [&](const auto &str, auto term_pos,
                                auto text_range) {
+      // Positions must arrive dense and in order: the text-range vector below
+      // is appended to per call but read back by term position (see the free
+      // text_range()), so a repeated one would quietly hand a term another
+      // term's range. Analyzer<T> refuses 1->N expansion for this reason;
+      // checking here covers a hand-written Tokenizer<T>, which does not go
+      // through it.
+      if (term_pos != term_count) {
+        throw std::runtime_error(
+            "searchlib: a tokenizer must emit term positions 0, 1, 2, ... in "
+            "order, because one term position holds exactly one text range; "
+            "to cut a word into a sequence of pieces use subword_splitter");
+      }
+
       if (index_.base_.term_dictionary_.find(str) ==
           index_.base_.term_dictionary_.end()) {
         index_.base_.term_dictionary_[str] = {str, 0};

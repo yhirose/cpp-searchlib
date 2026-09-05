@@ -204,6 +204,34 @@ TEST(AnalyzerTest, IndexSideOneToManyThrows) {
       std::runtime_error);
 }
 
+TEST(AnalyzerTest, RawTokenizerMustEmitDensePositions) {
+  // The same invariant one level down. Analyzer<T> is not the only way into
+  // the indexer, and a hand-written Tokenizer<T> that stacks two terms on one
+  // position used to be accepted -- after which text_range() answered with a
+  // neighbour's range, because the range vector is appended to per call but
+  // read back by term position.
+  InMemoryInvertedIndex<TextRange> index;
+  InMemoryIndexer indexer(index, nullptr);
+
+  Tokenizer<TextRange> stacking = [](Normalizer, auto callback) {
+    callback(U"seoul", 0, TextRange{0, 5});
+    callback(U"seo", 0, TextRange{0, 3});
+  };
+  EXPECT_THROW(indexer.index_document(0, stacking), std::runtime_error);
+
+  Tokenizer<TextRange> skipping = [](Normalizer, auto callback) {
+    callback(U"seoul", 0, TextRange{0, 5});
+    callback(U"tower", 2, TextRange{6, 5});
+  };
+  EXPECT_THROW(indexer.index_document(1, skipping), std::runtime_error);
+
+  Tokenizer<TextRange> dense = [](Normalizer, auto callback) {
+    callback(U"seoul", 0, TextRange{0, 5});
+    callback(U"tower", 1, TextRange{6, 5});
+  };
+  EXPECT_NO_THROW(indexer.index_document(2, dense));
+}
+
 TEST(AnalyzerTest, NormalizerAppliesAsStageZero) {
   // Identity chain, but the indexer carries a lowercasing normalizer. It must
   // be applied (as stage 0) rather than silently ignored.
