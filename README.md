@@ -297,10 +297,10 @@ dictionary: Han, Hiragana, Thai and their kin come out one scalar per term
 (a run of Katakana is one term), which is the unigram baseline --
 `東京タワー` indexes as `東` / `京` / `タワー` and a query for `東京` becomes the
 implicit phrase `東` + `京`, so it is found. `utf8_plain_text_splitter(segmenter,
-scripts)` plugs a dictionary in: every segment that starts with a scalar of
-one of `scripts` is handed to `segmenter` with the whole text and its offset,
-and the segmenter emits the words it finds from there and returns how many
-bytes it consumed. What comes back is checked, not trusted (see `Segmenter`
+claims)` plugs a dictionary in: every segment whose first scalar `claims`
+accepts is handed to `segmenter` with the whole text and its offset, and the
+segmenter emits the words it finds from there and returns how many bytes it
+consumed. What comes back is checked, not trusted (see `Segmenter`
 in the header): a span that does not end on a grapheme cluster boundary is
 dropped whole, a word that overlaps its neighbour or is cut inside a cluster
 is dropped alone, and everything else is indexed exactly as emitted.

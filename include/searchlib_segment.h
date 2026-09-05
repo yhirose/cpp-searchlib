@@ -31,18 +31,41 @@ namespace searchlib {
 // loaded. The returned splitter shares one immutable model between all its
 // copies and is safe to call from several threads.
 //
-// It is the default splitter with a Segmenter plugged in for Han, Hiragana and
-// Katakana: everything else is cut exactly as utf8_plain_text_splitter() cuts
-// it, and only a run of Japanese script reaches the model. That gate is what
-// keeps this splitter's output on English identical to the default's --
-// deliberately, because a model trained on Japanese otherwise shreds English
-// ("iPhone" -> i/Phone, "jumps" -> ju/mps).
+// It is the default splitter with a Segmenter plugged in for the scalars
+// detail::is_japanese accepts: everything else is cut exactly as
+// utf8_plain_text_splitter() cuts it, and only a run of Japanese script reaches
+// the model. That gate is what keeps this splitter's output on English
+// identical to the default's -- deliberately, because a model trained on
+// Japanese otherwise shreds English ("iPhone" -> i/Phone, "jumps" -> ju/mps).
 //
 // Pass the same splitter to SplitterTokenizer (to index) and to parse_query
 // (to search); using it on only one side gives an index where 東京 can be
 // found but 東京タワー cannot. Note that switching an existing index to it
 // requires a full re-index: the term boundaries, and therefore
 // document_term_count and every BM25 score, change.
+namespace detail {
+
+// A scalar Japanese is written with: the three scripts, plus the Common and
+// Inherited letters and marks that occur inside their words (ー, 々, the
+// combining voicing marks). Punctuation, spaces and digits are not, so they
+// end a run. One predicate decides both where a span starts and how far it
+// extends.
+inline bool is_japanese(char32_t cp) {
+  switch (unicode::script(cp)) {
+  case unicode::Script::Han:
+  case unicode::Script::Hiragana:
+  case unicode::Script::Katakana:
+    return true;
+  case unicode::Script::Common:
+  case unicode::Script::Inherited:
+    return unicode::is_letter(cp) || unicode::is_mark(cp);
+  default:
+    return false;
+  }
+}
+
+} // namespace detail
+
 inline TextSplitter load_segmenting_splitter(const std::string &model_path) {
   auto loaded = segmentlib::Segmenter::load(model_path);
   if (!loaded) {
@@ -57,30 +80,13 @@ inline TextSplitter load_segmenting_splitter(const std::string &model_path) {
   auto model =
       std::make_shared<const segmentlib::Segmenter>(std::move(*loaded));
 
-  // A scalar the model's run extends over: the three claimed scripts, plus
-  // the Common-script letters and marks Japanese is written with (ー, 々,
-  // combining voicing marks). Punctuation, spaces and digits end the run.
-  auto japanese = [](char32_t cp) {
-    switch (unicode::script(cp)) {
-    case unicode::Script::Han:
-    case unicode::Script::Hiragana:
-    case unicode::Script::Katakana:
-      return true;
-    case unicode::Script::Common:
-    case unicode::Script::Inherited:
-      return unicode::is_letter(cp) || unicode::is_mark(cp);
-    default:
-      return false;
-    }
-  };
-
-  Segmenter segmenter = [model, japanese](std::string_view text, size_t offset,
-                                          const SplitEmit &emit) -> size_t {
+  Segmenter segmenter = [model](std::string_view text, size_t offset,
+                                const SplitEmit &emit) -> size_t {
     auto end = offset;
     while (end < text.size()) {
       char32_t cp;
       auto len = unicode::utf8::decode_codepoint(&text[end], text.size() - end, cp);
-      if (len == 0 || !japanese(cp)) {
+      if (len == 0 || !detail::is_japanese(cp)) {
         break;
       }
       end += len;
@@ -108,9 +114,7 @@ inline TextSplitter load_segmenting_splitter(const std::string &model_path) {
     return run.size();
   };
 
-  return utf8_plain_text_splitter(
-      std::move(segmenter), {unicode::Script::Han, unicode::Script::Hiragana,
-                             unicode::Script::Katakana});
+  return utf8_plain_text_splitter(std::move(segmenter), detail::is_japanese);
 }
 
 } // namespace searchlib

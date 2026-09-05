@@ -67,7 +67,7 @@ TEST(SplitterTest, KeepsTheSegmentsUax29CallsWords) {
   EXPECT_EQ((Strings{}), terms(splitter, ""));
 
   // Emoji and other symbols are segments but not words.
-  EXPECT_EQ((Strings{"ok"}), terms(splitter, "\xF0\x9F\x98\x80 ok \xF0\x9F\x87\xBA\xF0\x9F\x87\xB8"));
+  EXPECT_EQ((Strings{"ok"}), terms(splitter, "😀 ok 🇺🇸"));
 }
 
 TEST(SplitterTest, ScriptsWrittenWithSpacesComeOutAsWords) {
@@ -150,12 +150,11 @@ TEST(SplitterTest, TheQuerySideSplitsTheSameWay) {
 }
 
 TEST(SplitterTest, StaysLinearOverARunOfFlags) {
-  // WB15/16 look back over the preceding Regional_Indicator run; a walk that
-  // asked is_word_boundary about every position would be quadratic here
-  // (minutes at this size), and both documents and queries come from outside.
+  // The walk unicodelib's segment_length describes: a per-position one would
+  // take minutes here, and both documents and queries come from outside.
   std::string text;
   for (size_t i = 0; i < 200000; i++) {
-    text += "\xF0\x9F\x87\xBA\xF0\x9F\x87\xB8"; // U+1F1FA U+1F1F8
+    text += "🇺🇸";
   }
 
   auto start = std::chrono::steady_clock::now();
@@ -181,9 +180,7 @@ struct Scripted {
     std::string rest;
   };
   std::vector<Call> calls;
-  std::function<size_t(std::string_view text, size_t offset,
-                       const SplitEmit &emit)>
-      answer;
+  Segmenter answer;
 
   Segmenter segmenter() {
     return [this](std::string_view text, size_t offset, const SplitEmit &emit) {
@@ -195,8 +192,8 @@ struct Scripted {
 
 // Emits `words` (each a byte range relative to `offset`) and reports
 // `consumed`.
-std::function<size_t(std::string_view, size_t, const SplitEmit &)>
-answer_with(std::vector<std::pair<size_t, size_t>> words, size_t consumed) {
+Segmenter answer_with(std::vector<std::pair<size_t, size_t>> words,
+                      size_t consumed) {
   return [=](std::string_view text, size_t offset, const SplitEmit &emit) {
     for (auto [from, to] : words) {
       auto range = TextRange{offset + from, to - from};
@@ -206,7 +203,7 @@ answer_with(std::vector<std::pair<size_t, size_t>> words, size_t consumed) {
   };
 }
 
-const std::vector<unicode::Script> kHan = {unicode::Script::Han};
+bool kHan(char32_t cp) { return unicode::script(cp) == unicode::Script::Han; }
 
 } // namespace
 
@@ -248,8 +245,9 @@ TEST(SplitterDelegationTest, AWholeTextSplitterFitsTheSameShape) {
     emit(U"everything", TextRange{offset, text.size() - offset});
     return text.size() - offset;
   };
-  auto splitter =
-      utf8_plain_text_splitter(scripted.segmenter(), {unicode::Script::Latin});
+  auto splitter = utf8_plain_text_splitter(scripted.segmenter(), [](char32_t cp) {
+    return unicode::script(cp) == unicode::Script::Latin;
+  });
 
   EXPECT_EQ((Strings{"everything"}), terms(splitter, "any text 2.0 東京"));
   EXPECT_EQ(1u, scripted.calls.size());
@@ -344,6 +342,8 @@ TEST(SplitterDelegationTest, ASegmenterMayCallTheDefaultSplitterBack) {
   expect_ranges_exact(text, words);
 }
 
-TEST(SplitterDelegationTest, ASegmenterIsRequired) {
+TEST(SplitterDelegationTest, ASegmenterAndItsClaimAreRequired) {
   EXPECT_THROW(utf8_plain_text_splitter(nullptr, kHan), std::invalid_argument);
+  EXPECT_THROW(utf8_plain_text_splitter(answer_with({}, 1), nullptr),
+               std::invalid_argument);
 }

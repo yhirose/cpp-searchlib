@@ -376,13 +376,14 @@ using Segmenter = std::function<size_t(std::string_view text, size_t offset,
 // a run of Katakana is one term while Han, Hiragana, Thai and the other
 // scripts written without spaces come out one scalar per term -- which is
 // where UAX #29 itself says a dictionary should take over. The second form
-// hands every segment that starts with a scalar of one of `scripts` to
-// `segmenter` instead (see Segmenter for the contract); the first is the
-// second with no scripts claimed. searchlib_segment.h builds a Japanese
-// segmenter on the second form.
+// hands every segment whose first scalar `claims` accepts to `segmenter`
+// instead (see Segmenter for the contract); the first is the second with
+// nothing claimed. searchlib_segment.h builds a Japanese segmenter on the
+// second form, and its `claims` is the same predicate that bounds the run it
+// hands the model, so "starts a span" and "belongs to a span" cannot drift.
 TextSplitter utf8_plain_text_splitter();
 TextSplitter utf8_plain_text_splitter(Segmenter segmenter,
-                                      std::vector<unicode::Script> scripts);
+                                      std::function<bool(char32_t)> claims);
 
 // Cuts every term `base` emits into the pieces `decompose` returns for it,
 // each with its own byte range. This is the shape a word-level morphological
@@ -2704,11 +2705,9 @@ private:
 //
 // The text is decoded once into scalars with a byte offset per scalar, and
 // the boundaries come from unicode::word_length handed the remainder from each
-// boundary. Not from asking is_word_boundary about every position of the
-// whole text: WB15/16 look back over the preceding Regional_Indicator run, so
-// that shape is quadratic over a run of flags (measured: 3607 ns/scalar at
-// 8,000 scalars and doubling with the size, against 8.4 flat), and both
-// documents and query strings arrive from outside.
+// boundary -- not from is_word_boundary at every position, which unicodelib's
+// segment_length explains is quadratic over a run of flags; both documents and
+// query strings arrive from outside.
 //
 // An ill-formed byte -- a truncated sequence, a bad continuation byte, an
 // overlong encoding, a surrogate, a value past U+10FFFF -- becomes U+FFFD and
@@ -2722,6 +2721,9 @@ struct WordScratch {
                                // entry holds text.size(), so every scalar
                                // boundary in [0, text.size()] is in the table
   std::u32string str;          // the term being emitted
+  std::vector<std::pair<std::u32string, TextRange>> delegated; // one span's
+                                                               // words, held
+                                                               // until checked
 
   void decode(std::string_view text) {
     cps.clear();
@@ -2757,43 +2759,24 @@ struct WordScratch {
   }
 };
 
-// One WordScratch per thread, reused across calls: decoding allocates three
+// The thread's WordScratch, reused across calls: decoding allocates its
 // buffers otherwise, and on test/t_kjv.tsv (31,103 short documents) that is 9%
-// of the whole index build. A walk that is already using the thread's scratch
-// -- a Segmenter that calls the default splitter back for a span it does not
-// handle -- gets a fresh one of its own instead, so re-entry is merely slower.
-class WordScratchLease {
-public:
-  WordScratchLease() : scratch_(&slot().scratch) {
-    if (slot().in_use) {
-      own_ = std::make_unique<WordScratch>();
-      scratch_ = own_.get();
-    } else {
-      slot().in_use = true;
-    }
-  }
-  ~WordScratchLease() {
-    if (!own_) {
-      slot().in_use = false;
-    }
-  }
+// of the whole index build. A lease moves it out for the duration of a walk
+// and back after, so a walk re-entered from inside -- a Segmenter calling the
+// default splitter back for a span it does not handle -- finds an empty
+// scratch, allocates its own and hands that back: re-entry is merely slower.
+struct WordScratchLease {
+  WordScratch scratch = std::move(slot());
+
+  WordScratchLease() = default;
   WordScratchLease(const WordScratchLease &) = delete;
   WordScratchLease &operator=(const WordScratchLease &) = delete;
+  ~WordScratchLease() { slot() = std::move(scratch); }
 
-  WordScratch &operator*() const { return *scratch_; }
-
-private:
-  struct Slot {
-    WordScratch scratch;
-    bool in_use = false;
-  };
-  static Slot &slot() {
-    thread_local Slot slot;
-    return slot;
+  static WordScratch &slot() {
+    thread_local WordScratch scratch;
+    return scratch;
   }
-
-  std::unique_ptr<WordScratch> own_;
-  WordScratch *scratch_;
 };
 
 inline bool is_word_like(const char32_t *cps, size_t n) {
@@ -2805,31 +2788,25 @@ inline bool is_word_like(const char32_t *cps, size_t n) {
   return false;
 }
 
-// What utf8_plain_text_splitter(segmenter, scripts) hands for_each_word.
+// What utf8_plain_text_splitter(segmenter, claims) hands for_each_word.
 struct Delegation {
   Segmenter segmenter;
-  std::vector<unicode::Script> scripts;
-
-  bool claims(char32_t cp) const {
-    auto sc = unicode::script(cp);
-    return std::find(scripts.begin(), scripts.end(), sc) != scripts.end();
-  }
+  std::function<bool(char32_t)> claims;
 };
 
 // Runs the segmenter from scalar `i` and forwards what survives the checks
 // listed at Segmenter, then returns the scalar index to resume at. Grapheme
 // boundaries are tested relative to `i`, which is a word boundary and so a
-// grapheme boundary too; that is also what keeps the test linear, since
-// GB12/13 look back over Regional_Indicators the way WB15/16 do.
+// grapheme boundary too -- and that keeps the test linear, for the reason
+// unicodelib's segment_length gives.
 template <typename Callback>
-size_t delegate_word(std::string_view text, const WordScratch &scratch,
-                     size_t i, const Delegation &delegation,
-                     std::vector<std::pair<std::u32string, TextRange>> &buffer,
-                     Callback &callback) {
+size_t delegate_word(std::string_view text, WordScratch &scratch, size_t i,
+                     const Delegation &delegation, Callback &callback) {
   const auto *cps = scratch.cps.data() + i;
   auto n = scratch.cps.size() - i;
   auto offset = scratch.offsets[i];
 
+  auto &buffer = scratch.delegated;
   buffer.clear();
   auto consumed = delegation.segmenter(
       text, offset, [&](const std::u32string &str, TextRange range) {
@@ -2880,16 +2857,15 @@ template <typename Callback>
 void for_each_word(std::string_view text, const Delegation *delegation,
                    Callback &&callback) {
   WordScratchLease lease;
-  auto &scratch = *lease;
+  auto &scratch = lease.scratch;
   scratch.decode(text);
   const auto &cps = scratch.cps;
   auto n = cps.size();
 
-  std::vector<std::pair<std::u32string, TextRange>> buffer;
   size_t i = 0;
   while (i < n) {
     if (delegation && delegation->claims(cps[i])) {
-      i = delegate_word(text, scratch, i, *delegation, buffer, callback);
+      i = delegate_word(text, scratch, i, *delegation, callback);
       continue;
     }
     auto len = unicode::word_length(cps.data() + i, n - i);
@@ -5496,16 +5472,17 @@ inline TextSplitter utf8_plain_text_splitter() {
 }
 
 inline TextSplitter utf8_plain_text_splitter(
-    Segmenter segmenter, std::vector<unicode::Script> scripts) {
-  if (!segmenter) {
+    Segmenter segmenter, std::function<bool(char32_t)> claims) {
+  if (!segmenter || !claims) {
     throw std::invalid_argument(
-        "searchlib: utf8_plain_text_splitter needs a segmenter");
+        "searchlib: utf8_plain_text_splitter needs a segmenter and what it "
+        "claims");
   }
   // Held through a shared_ptr, as subword_splitter holds its stages: a
   // TextSplitter is copied into every SplitterTokenizer and every parse_query
-  // call, and the segmenter need not be copied with it.
+  // call, and the two callables need not be copied with it.
   auto delegation = std::make_shared<const detail::Delegation>(
-      detail::Delegation{std::move(segmenter), std::move(scripts)});
+      detail::Delegation{std::move(segmenter), std::move(claims)});
   return [delegation](std::string_view text, const auto &emit) {
     detail::for_each_word(text, delegation.get(), emit);
   };

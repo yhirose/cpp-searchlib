@@ -2178,8 +2178,6 @@ const std::vector<std::string> fuzzy_documents = {
     "apple ample",
     "maple banana",
     "apply",
-    "東京",
-    "東京都",
 };
 
 auto fuzzy_index() {
@@ -2187,13 +2185,12 @@ auto fuzzy_index() {
   InMemoryIndexer indexer(invidx, normalizer);
   size_t document_key = 0;
   for (const auto &doc : fuzzy_documents) {
-    if (unicode::script(u32(doc)[0]) == unicode::Script::Han) {
-      indexer.index_document(document_key, whole_term(doc));
-    } else {
-      indexer.index_document(document_key, UTF8PlainTextTokenizer(doc));
-    }
-    document_key++;
+    indexer.index_document(document_key++, UTF8PlainTextTokenizer(doc));
   }
+  // Two Han terms, for the codepoints-not-bytes distance tests; the default
+  // splitter would cut them one character at a time.
+  indexer.index_document(document_key++, whole_term("東京"));
+  indexer.index_document(document_key++, whole_term("東京都"));
   return invidx;
 }
 
