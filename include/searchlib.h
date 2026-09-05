@@ -4365,7 +4365,8 @@ perform_near_operation(const IInvertedIndex &inverted_index,
             }
           }
 
-          auto near = true;
+          // Not `near`: windows.h defines that name as a macro.
+          auto within_distance = true;
           {
             auto it = slots_by_term_pos.begin();
             auto it_prev = it;
@@ -4376,7 +4377,7 @@ perform_near_operation(const IInvertedIndex &inverted_index,
               auto [term_pos, item] = *it;
               auto delta = term_pos - (prev_term_pos + prev_term_count - 1);
               if (delta > expr.near_operation_distance) {
-                near = false;
+                within_distance = false;
                 break;
               }
               it_prev = it;
@@ -4384,7 +4385,7 @@ perform_near_operation(const IInvertedIndex &inverted_index,
             }
           }
 
-          if (near) {
+          if (within_distance) {
             // Skip all search hit cursors
             for (auto [term_pos, item] : slots_by_term_pos) {
               auto [slot, term_length] = item;
