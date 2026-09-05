@@ -28,11 +28,7 @@ IPostings::~IPostings() = default;
 
 IInvertedIndex::~IInvertedIndex() = default;
 
-IMutableInvertedIndex::~IMutableInvertedIndex() = default;
-
 IScopeIndex::~IScopeIndex() = default;
-
-IKeyedIndex::~IKeyedIndex() = default;
 
 //-----------------------------------------------------------------------------
 
@@ -354,15 +350,9 @@ size_t InMemoryInvertedIndexBase::document_term_count(size_t ordinal) const {
   return documents_.at(ordinal).term_count;
 }
 
-size_t InMemoryInvertedIndexBase::allocate_ordinal(size_t document_key) {
-  auto it = key_to_ordinal_.find(document_key);
-  if (it != key_to_ordinal_.end()) {
-    tombstone_(it->second);
-  }
-  auto ordinal = documents_.size();
-  documents_.push_back(Document{0, document_key});
-  key_to_ordinal_[document_key] = ordinal;
-  return ordinal;
+size_t InMemoryInvertedIndexBase::push_document() {
+  documents_.push_back(Document{0});
+  return documents_.size() - 1;
 }
 
 void InMemoryInvertedIndexBase::set_document_term_count(size_t ordinal,
@@ -382,22 +372,9 @@ double InMemoryInvertedIndexBase::average_document_term_count() const {
          static_cast<double>(live);
 }
 
-size_t InMemoryInvertedIndexBase::document_key(size_t ordinal) const {
-  return documents_.at(ordinal).key;
-}
-
-std::optional<size_t>
-InMemoryInvertedIndexBase::document_ordinal(size_t document_key) const {
-  auto it = key_to_ordinal_.find(document_key);
-  if (it == key_to_ordinal_.end()) {
-    return std::nullopt;
-  }
-  return it->second;
-}
-
-void InMemoryInvertedIndexBase::tombstone_(size_t ordinal) {
+void InMemoryInvertedIndexBase::tombstone(size_t ordinal) {
   if (removed_ordinals_.insert(ordinal).second) {
-    total_document_term_count_ -= documents_[ordinal].term_count;
+    total_document_term_count_ -= documents_.at(ordinal).term_count;
   }
 }
 
@@ -576,22 +553,10 @@ bool InMemoryInvertedIndexBase::is_document_removed(size_t ordinal) const {
   return removed_ordinals_.find(ordinal) != removed_ordinals_.end();
 }
 
-void InMemoryInvertedIndexBase::remove_document(size_t document_key) {
-  auto it = key_to_ordinal_.find(document_key);
-  if (it != key_to_ordinal_.end()) {
-    tombstone_(it->second);
-  }
-}
-
 void InMemoryInvertedIndexBase::set_scope_ids(
-    const std::string &scope_name, size_t document_key,
+    const std::string &scope_name, size_t ordinal,
     const std::vector<size_t> &scope_ids) {
-  auto ordinal = document_ordinal(document_key);
-  if (!ordinal) {
-    throw std::invalid_argument(
-        "searchlib: set_scope_ids: the key names no document");
-  }
-  if (scope_ids.size() != document_term_count(*ordinal)) {
+  if (scope_ids.size() != document_term_count(ordinal)) {
     throw std::invalid_argument(
         "searchlib: scope_ids.size() must equal document_term_count()");
   }
@@ -608,7 +573,7 @@ void InMemoryInvertedIndexBase::set_scope_ids(
       scope_ids.empty() ? uint64_t(1) : uint64_t(scope_ids.back()) + 1;
   std::vector<uint64_t> values(scope_ids.begin(), scope_ids.end());
   scope_data_->by_name[scope_name].insert_or_assign(
-      *ordinal, detail::EliasFano(values, universe));
+      ordinal, detail::EliasFano(values, universe));
 }
 
 bool InMemoryInvertedIndexBase::has_scope(const std::string &scope_name,
@@ -643,13 +608,13 @@ size_t InMemoryInvertedIndexBase::scope_id(const std::string &scope_name,
 void InMemoryInvertedIndexBase::save(std::ostream &os,
                                      IndexFormat format) const {
   // Documents section, in ordinal order. The ordinal is the position, so
-  // each record carries only the term count and the caller's key; a
+  // each record is just the term count (the keys are a section of their own,
+  // written by the owner of the KeyTable right after this core); a
   // tombstoned document is written like any other, since its ordinal must
   // keep its slot for the postings that still name it.
   detail::write_scalar<uint64_t>(os, documents_.size());
   for (const auto &document : documents_) {
     detail::write_scalar<uint64_t>(os, document.term_count);
-    detail::write_scalar<uint64_t>(os, document.key);
   }
 
   // Term dictionary section, ordered by term string for deterministic output.
@@ -739,17 +704,11 @@ void InMemoryInvertedIndexBase::save(std::ostream &os,
 
 void InMemoryInvertedIndexBase::load(std::istream &is, IndexFormat format) {
   documents_.clear();
-  key_to_ordinal_.clear();
   auto document_count = detail::read_scalar<uint64_t>(is);
   documents_.reserve(static_cast<size_t>(document_count));
   for (uint64_t i = 0; i < document_count; i++) {
-    auto term_count = static_cast<size_t>(detail::read_scalar<uint64_t>(is));
-    auto key = static_cast<size_t>(detail::read_scalar<uint64_t>(is));
-    documents_.push_back(Document{term_count, key});
-    // Records are in ordinal order, so a key that was re-indexed ends up
-    // mapped to its newest ordinal -- the one that is live, unless it too
-    // was removed, which is exactly what the in-memory map would say.
-    key_to_ordinal_[key] = static_cast<size_t>(i);
+    documents_.push_back(
+        Document{static_cast<size_t>(detail::read_scalar<uint64_t>(is))});
   }
   // The running total is settled once the tombstones below are known.
   total_document_term_count_ = 0;

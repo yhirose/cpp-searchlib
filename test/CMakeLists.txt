@@ -30,7 +30,6 @@ add_executable(
   ../src/query.cpp
   ../src/tokenizer.cpp
   ../src/analyzer.cpp
-  ../src/federatedindex.cpp
 )
 
 target_include_directories(test-main PRIVATE ../include ../src ../third_party)

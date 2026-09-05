@@ -149,7 +149,9 @@ private:
 // coded. Terms below the compression threshold were written plain and are
 // held as ordinary Postings. Immutable after load, hence trivially safe to
 // share across reader threads.
-class CompressedInvertedIndex : public IInvertedIndexWithTextRange<TextRange> {
+template <typename Key>
+class CompressedInvertedIndex
+    : public IInvertedIndexWithTextRange<TextRange, Key> {
 public:
   void load(std::istream &is) {
     char magic[sizeof(detail::kIndexMagic)];
@@ -166,18 +168,15 @@ public:
       throw std::runtime_error("searchlib: unsupported index schema_version");
     }
 
-    // Section order mirrors InMemoryInvertedIndexBase::load followed by the
-    // text-range section of InMemoryInvertedIndex<TextRange>::load. Document
-    // records are in ordinal order, so the vectors index by ordinal directly.
+    // Section order mirrors InMemoryInvertedIndexBase::load, then the key
+    // section, then the text-range section of
+    // InMemoryInvertedIndex<TextRange, Key>::load. Document records are in
+    // ordinal order, so the vector indexes by ordinal directly.
     auto document_count = detail::read_scalar<uint64_t>(is);
     term_counts_.reserve(static_cast<size_t>(document_count));
-    keys_.reserve(static_cast<size_t>(document_count));
     for (uint64_t i = 0; i < document_count; i++) {
       term_counts_.push_back(
           static_cast<size_t>(detail::read_scalar<uint64_t>(is)));
-      keys_.push_back(static_cast<size_t>(detail::read_scalar<uint64_t>(is)));
-      // A re-indexed key ends on its newest ordinal, as in the in-memory map.
-      key_to_ordinal_[keys_.back()] = static_cast<size_t>(i);
     }
 
     // Term dictionary: the FST stays as the dictionary rather than being
@@ -229,6 +228,12 @@ public:
       }
     }
 
+    keys_.load(is);
+    if (keys_.size() != term_counts_.size()) {
+      throw std::runtime_error(
+          "searchlib: the key section disagrees with the documents section");
+    }
+
     if (detail::read_scalar<uint32_t>(is) != 1) {
       throw std::runtime_error(
           "searchlib: index text-range section requires TextRange");
@@ -246,16 +251,13 @@ public:
     return term_counts_.at(ordinal);
   }
 
-  size_t document_key(size_t ordinal) const override {
-    return keys_.at(ordinal);
+  const Key &document_key(size_t ordinal) const override {
+    return keys_.key(ordinal);
   }
 
-  std::optional<size_t> document_ordinal(size_t document_key) const override {
-    auto it = key_to_ordinal_.find(document_key);
-    if (it == key_to_ordinal_.end()) {
-      return std::nullopt;
-    }
-    return it->second;
+  std::optional<size_t>
+  document_ordinal(const Key &document_key) const override {
+    return keys_.ordinal(document_key);
   }
 
   double average_document_term_count() const override {
@@ -397,8 +399,7 @@ private:
   }
 
   std::vector<size_t> term_counts_; // indexed by ordinal
-  std::vector<size_t> keys_;        // indexed by ordinal
-  std::unordered_map<size_t /*key*/, size_t /*ordinal*/> key_to_ordinal_;
+  KeyTable<Key> keys_;
 
   // Holding this makes the whole index non-copyable and non-movable, which
   // is required: the FST points into its own byte buffer (see termdict.h).
@@ -412,21 +413,34 @@ private:
 
 } // namespace
 
-std::shared_ptr<IInvertedIndexWithTextRange<TextRange>>
+template <typename Key>
+std::shared_ptr<IInvertedIndexWithTextRange<TextRange, Key>>
 load_compressed_index(std::istream &is) {
-  auto index = std::make_shared<CompressedInvertedIndex>();
+  auto index = std::make_shared<CompressedInvertedIndex<Key>>();
   index->load(is);
   return index;
 }
 
-std::shared_ptr<IInvertedIndexWithTextRange<TextRange>>
+template <typename Key>
+std::shared_ptr<IInvertedIndexWithTextRange<TextRange, Key>>
 load_compressed_index(const std::string &path) {
   std::ifstream is(path, std::ios::binary);
   if (!is) {
     throw std::runtime_error("searchlib: cannot open index file for reading: " +
                              path);
   }
-  return load_compressed_index(is);
+  return load_compressed_index<Key>(is);
 }
+
+// The key types KeyTable serializes without help; another Key means adding
+// its instantiation here, since the backend stays out of the public header.
+template std::shared_ptr<IInvertedIndexWithTextRange<TextRange, size_t>>
+load_compressed_index<size_t>(std::istream &is);
+template std::shared_ptr<IInvertedIndexWithTextRange<TextRange, size_t>>
+load_compressed_index<size_t>(const std::string &path);
+template std::shared_ptr<IInvertedIndexWithTextRange<TextRange, std::string>>
+load_compressed_index<std::string>(std::istream &is);
+template std::shared_ptr<IInvertedIndexWithTextRange<TextRange, std::string>>
+load_compressed_index<std::string>(const std::string &path);
 
 } // namespace searchlib

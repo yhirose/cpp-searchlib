@@ -1209,7 +1209,7 @@ TEST(RemoveDocumentTest, MutableInterface) {
 
   // Removal is reachable through the IMutableInvertedIndex interface, as a
   // FederationMember's mutable_index would be.
-  IMutableInvertedIndex &mutable_index = invidx;
+  IMutableInvertedIndex<size_t> &mutable_index = invidx;
   mutable_index.remove_document(0);
 
   auto expr = parse_query(normalizer, "the");
@@ -2665,4 +2665,81 @@ TEST(AverageDocumentTermCountTest, MatchesTheCompressedBackend) {
 
   EXPECT_DOUBLE_EQ(invidx.average_document_term_count(),
                    loaded->average_document_term_count());
+}
+
+TEST(StringKeyTest, IndexesRemovesAndRoundTrips) {
+  // The other key type KeyTable serializes without help. Paths are the
+  // natural key for a file corpus, and what the CLI uses.
+  InMemoryInvertedIndex<TextRange, std::string> invidx;
+  InMemoryIndexer indexer(invidx, normalizer);
+  indexer.index_document("notes/a.md", UTF8PlainTextTokenizer("the first note"));
+  indexer.index_document("notes/b.md", UTF8PlainTextTokenizer("the second note"));
+  indexer.index_document("notes/c.md", UTF8PlainTextTokenizer("something else"));
+
+  EXPECT_EQ(3, invidx.document_count());
+  EXPECT_EQ("notes/b.md", invidx.document_key(1));
+  EXPECT_EQ(1, *invidx.document_ordinal("notes/b.md"));
+  EXPECT_FALSE(invidx.document_ordinal("notes/z.md"));
+
+  auto expr = parse_query(normalizer, "note");
+  auto postings = perform_search(invidx, *expr);
+  ASSERT_EQ(2, postings->size());
+  EXPECT_EQ("notes/a.md", invidx.document_key(postings->document_ordinal(0)));
+  EXPECT_EQ("notes/b.md", invidx.document_key(postings->document_ordinal(1)));
+
+  invidx.remove_document("notes/a.md");
+  invidx.remove_document("notes/nope.md"); // names nothing: a no-op
+  EXPECT_EQ(2, invidx.document_count());
+  EXPECT_EQ(1, perform_search(invidx, *expr)->size());
+
+  for (auto format : {IndexFormat::Plain, IndexFormat::Compressed}) {
+    std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+    invidx.save(ss, {}, format);
+
+    InMemoryInvertedIndex<TextRange, std::string> loaded;
+    loaded.load(ss);
+    EXPECT_EQ(2, loaded.document_count());
+    EXPECT_TRUE(
+        loaded.is_document_removed(*loaded.document_ordinal("notes/a.md")));
+    auto found = perform_search(loaded, *expr);
+    ASSERT_EQ(1, found->size());
+    EXPECT_EQ("notes/b.md", loaded.document_key(found->document_ordinal(0)));
+  }
+
+  // And through the read-only compressed backend, instantiated for strings.
+  std::stringstream compressed(std::ios::in | std::ios::out |
+                               std::ios::binary);
+  invidx.save(compressed, {}, IndexFormat::Compressed);
+  auto ro = load_compressed_index<std::string>(compressed);
+  EXPECT_EQ(2, ro->document_count());
+  auto found = perform_search(*ro, *expr);
+  ASSERT_EQ(1, found->size());
+  EXPECT_EQ("notes/b.md", ro->document_key(found->document_ordinal(0)));
+  EXPECT_EQ(2, *ro->document_ordinal("notes/c.md"));
+}
+
+TEST(KeyTableTest, IntegerKeysRoundTripDenseOrNot) {
+  // 0..n-1 in order is the identity and collapses to a flag on disk; any
+  // other integer keys are written out. Both must come back as they went in.
+  auto dense = sample_index(); // keys 0..4, in that order
+  InMemoryInvertedIndex<TextRange> sparse;
+  {
+    InMemoryIndexer indexer(sparse, normalizer);
+    indexer.index_document(1001001, UTF8PlainTextTokenizer("first"));
+    indexer.index_document(3, UTF8PlainTextTokenizer("second"));
+  }
+
+  for (auto *invidx : {&dense, &sparse}) {
+    for (auto format : {IndexFormat::Plain, IndexFormat::Compressed}) {
+      std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+      invidx->save(ss, {}, format);
+      InMemoryInvertedIndex<TextRange> loaded;
+      loaded.load(ss);
+      ASSERT_EQ(invidx->document_count(), loaded.document_count());
+      for (size_t ordinal = 0; ordinal < loaded.document_count(); ordinal++) {
+        EXPECT_EQ(invidx->document_key(ordinal), loaded.document_key(ordinal));
+        EXPECT_EQ(ordinal, *loaded.document_ordinal(loaded.document_key(ordinal)));
+      }
+    }
+  }
 }

@@ -11,7 +11,6 @@ add_executable(
   ../src/query.cpp
   ../src/tokenizer.cpp
   ../src/analyzer.cpp
-  ../src/federatedindex.cpp
 )
 
 target_include_directories(searchlib-bench PRIVATE ../include ../src ../third_party)

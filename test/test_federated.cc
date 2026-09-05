@@ -22,13 +22,13 @@ auto make_index(const std::vector<std::string> &documents) {
 
 // Records remove_document calls without actually deleting anything; real
 // logical deletion is out of scope for this test (see roadmap section 3).
-class MockMutableInvertedIndex : public IMutableInvertedIndex {
+class MockMutableInvertedIndex : public IMutableInvertedIndex<size_t> {
 public:
-  void remove_document(size_t document_key) override {
-    removed_document_ids.push_back(document_key);
+  void remove_document(const size_t &document_key) override {
+    removed_document_keys.push_back(document_key);
   }
 
-  std::vector<size_t> removed_document_ids;
+  std::vector<size_t> removed_document_keys;
 };
 
 } // namespace
@@ -47,11 +47,14 @@ TEST(FederatedSearchTest, SearchAcrossMembers) {
   auto hits = perform_federated_search(federation, *expr);
   ASSERT_EQ(2, hits.size());
 
+  // Both members hold their hit under key 0 -- in their own ordinal spaces,
+  // which is why a hit carries the key rather than leaving the caller to
+  // compare ordinals across members.
   EXPECT_EQ(book, hits[0].index);
-  EXPECT_EQ(0, hits[0].postings->document_ordinal(hits[0].index_in_postings));
+  EXPECT_EQ(0, hits[0].document_key);
 
   EXPECT_EQ(notes, hits[1].index);
-  EXPECT_EQ(0, hits[1].postings->document_ordinal(hits[1].index_in_postings));
+  EXPECT_EQ(0, hits[1].document_key);
 }
 
 TEST(FederatedSearchTest, RemoveMember) {
@@ -77,20 +80,29 @@ TEST(FederatedSearchTest, MutableMemberWiring) {
   auto mock_mutable = std::make_shared<MockMutableInvertedIndex>();
 
   FederatedIndex federation;
-  federation.add(book);              // read-only: no mutable_index
-  federation.add(notes, mock_mutable); // mutable member
+  // Registered read-only on purpose: add(index) would wire the index's own
+  // mutable view in, so withholding it is the hand-wired form's job.
+  federation.add(book, book, nullptr);
+  // Hand-wired the other way: the notes index answers keys, the mock takes
+  // the removals.
+  federation.add(notes, notes, mock_mutable);
 
   auto members = federation.snapshot();
   ASSERT_EQ(2, members.size());
 
   EXPECT_EQ(book, members[0].index);
+  EXPECT_EQ(book, members[0].keyed);
   EXPECT_EQ(nullptr, members[0].mutable_index);
 
   EXPECT_EQ(notes, members[1].index);
+  EXPECT_EQ(notes, members[1].keyed);
   ASSERT_EQ(mock_mutable, members[1].mutable_index);
 
   members[1].mutable_index->remove_document(0);
-  EXPECT_EQ(std::vector<size_t>{0}, mock_mutable->removed_document_ids);
+  EXPECT_EQ(std::vector<size_t>{0}, mock_mutable->removed_document_keys);
+
+  // A member without a keyed view could not fill in a hit's key.
+  EXPECT_THROW(federation.add(book, nullptr, nullptr), std::invalid_argument);
 }
 
 TEST(FederatedSearchTest, RemoveDocumentExcludesFromFederatedSearch) {
@@ -102,8 +114,8 @@ TEST(FederatedSearchTest, RemoveDocumentExcludesFromFederatedSearch) {
   auto notes = make_index({"A note about the book.", "Unrelated memo."});
 
   FederatedIndex federation;
-  federation.add(book);            // read-only member
-  federation.add(notes, notes);    // mutable member (real InMemoryInvertedIndex)
+  federation.add(book);  // read-only member
+  federation.add(notes); // an InMemoryInvertedIndex: its own mutable view too
 
   auto expr = parse_query(federated_normalizer, "book");
   ASSERT_TRUE(expr);
@@ -144,7 +156,7 @@ TEST(FederatedSearchTest, MixedInMemoryAndCompressedMembers) {
 
   FederatedIndex federation;
   federation.add(book); // read-only: no mutable_index
-  federation.add(notes, notes);
+  federation.add(notes);
 
   auto expr = parse_query(federated_normalizer, "book");
   ASSERT_TRUE(expr);
@@ -153,10 +165,10 @@ TEST(FederatedSearchTest, MixedInMemoryAndCompressedMembers) {
   ASSERT_EQ(2, hits.size());
 
   EXPECT_EQ(book, hits[0].index);
-  EXPECT_EQ(0, hits[0].postings->document_ordinal(hits[0].index_in_postings));
+  EXPECT_EQ(0, hits[0].document_key);
 
   EXPECT_EQ(notes, hits[1].index);
-  EXPECT_EQ(0, hits[1].postings->document_ordinal(hits[1].index_in_postings));
+  EXPECT_EQ(0, hits[1].document_key);
 
   // Highlighting works through the compressed member's text_range.
   auto range = book->text_range(*hits[0].postings, hits[0].index_in_postings, 0);
