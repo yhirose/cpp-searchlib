@@ -106,6 +106,26 @@ static void verify_elias_fano(const std::vector<uint64_t> &values,
     ASSERT_EQ(values[i], ef.access(i)) << "access(" << i << ")";
   }
 
+  // read() must answer exactly what a run of access() calls would, from every
+  // start and in every block size -- it reaches the values by a different
+  // route (one select, then a forward scan) than access() does.
+  for (size_t block : {size_t(1), size_t(2), size_t(7), size_t(64),
+                       size_t(1000)}) {
+    std::vector<uint64_t> out(block + 1, ~uint64_t(0));
+    for (size_t start = 0; start <= values.size(); start++) {
+      auto written = ef.read(start, out.data(), block);
+      ASSERT_EQ(std::min(block, values.size() - start), written)
+          << "read(" << start << ", " << block << ")";
+      for (size_t i = 0; i < written; i++) {
+        ASSERT_EQ(values[start + i], out[i])
+            << "read(" << start << ", " << block << ")[" << i << "]";
+      }
+      // Past the end is empty, never a partial write.
+      ASSERT_EQ(~uint64_t(0), out[block]);
+    }
+    ASSERT_EQ(0u, ef.read(values.size() + 5, out.data(), block));
+  }
+
   auto expect_next_geq = [&](uint64_t target) {
     auto expected = static_cast<size_t>(
         std::lower_bound(values.begin(), values.end(), target) -
