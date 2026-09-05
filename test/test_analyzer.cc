@@ -185,10 +185,12 @@ TEST(AnalyzerTest, DropsCloseThePositionGap) {
                 .substr(range.position, range.length));
 }
 
-TEST(AnalyzerTest, IndexSideOneToManyThrows) {
-  // A filter that emits twice for one token (index-time synonym expansion).
-  // Alternatives have no place at consecutive positions; a *sequence* of
-  // pieces is what subword_splitter is for (see SubwordSplitterTest).
+TEST(AnalyzerTest, IndexSideOneToManyStacksOnOnePosition) {
+  // A filter that emits twice for one token (index-time synonym expansion):
+  // the outputs are alternatives at that token's position -- Lucene's
+  // positionIncrement == 0 -- and the position's range is the token's. A
+  // *sequence* of pieces is what subword_splitter is for (see
+  // SubwordSplitterTest).
   TermFilter duplicating = [](const std::u32string &s,
                               std::function<void(std::u32string)> emit) {
     emit(s);
@@ -197,19 +199,58 @@ TEST(AnalyzerTest, IndexSideOneToManyThrows) {
 
   InMemoryInvertedIndex<TextRange> index;
   InMemoryIndexer indexer(index, nullptr);
-  EXPECT_THROW(
-      indexer.index_document(
-          0, Analyzer<TextRange>{UTF8PlainTextTokenizer("hello world"),
-                                 duplicating}),
-      std::runtime_error);
+  indexer.index_document(
+      0, Analyzer<TextRange>{UTF8PlainTextTokenizer("hello world"),
+                             duplicating});
+
+  auto hello2 = index.postings(U"hello2");
+  auto world2 = index.postings(U"world2");
+  ASSERT_EQ(1u, hello2->size());
+  ASSERT_EQ(1u, world2->size());
+  EXPECT_EQ(0u, hello2->term_position(0, 0));
+  EXPECT_EQ(1u, world2->term_position(0, 0));
+  // The document is as long as its positions, not its alternatives.
+  EXPECT_EQ(2u, index.document_term_count(0));
+
+  // Either alternative takes part in a phrase, and the two at one position
+  // are never adjacent to each other.
+  EXPECT_EQ((std::vector<size_t>{0}),
+            search_ids(index, "\"hello2 world\"", lc_normalizer));
+  EXPECT_EQ((std::vector<size_t>{}),
+            search_ids(index, "\"hello hello2\"", lc_normalizer));
+
+  auto range = index.text_range(*hello2, 0, 0);
+  EXPECT_EQ("hello",
+            std::string("hello world").substr(range.position, range.length));
 }
 
-TEST(AnalyzerTest, RawTokenizerMustEmitDensePositions) {
+TEST(AnalyzerTest, TheSameTermStackedTwiceIsOneOccurrence) {
+  // A filter that answers the same string twice would otherwise count the
+  // term twice in one position, inflating tf.
+  TermFilter twice = [](const std::u32string &s,
+                        std::function<void(std::u32string)> emit) {
+    emit(s);
+    emit(s);
+  };
+
+  InMemoryInvertedIndex<TextRange> index;
+  InMemoryIndexer indexer(index, nullptr);
+  indexer.index_document(
+      0, Analyzer<TextRange>{UTF8PlainTextTokenizer("hello"), twice});
+
+  auto hello = index.postings(U"hello");
+  ASSERT_EQ(1u, hello->size());
+  EXPECT_EQ(1u, hello->search_hit_count(0));
+  EXPECT_EQ(1u, index.term_count(U"hello"));
+}
+
+TEST(AnalyzerTest, RawTokenizerMayStackButNotSkipOrGoBack) {
   // The same invariant one level down. Analyzer<T> is not the only way into
-  // the indexer, and a hand-written Tokenizer<T> that stacks two terms on one
-  // position used to be accepted -- after which text_range() answered with a
-  // neighbour's range, because the range vector is appended to per call but
-  // read back by term position.
+  // the indexer, and a hand-written Tokenizer<T> does not go through it: it
+  // may repeat the position it just emitted (a stack, which brings no range
+  // of its own), but a position skipped or revisited would hand a term a
+  // neighbour's range, because the range vector is appended to once per
+  // position and read back by term position.
   InMemoryInvertedIndex<TextRange> index;
   InMemoryIndexer indexer(index, nullptr);
 
@@ -217,7 +258,11 @@ TEST(AnalyzerTest, RawTokenizerMustEmitDensePositions) {
     callback(U"seoul", 0, TextRange{0, 5});
     callback(U"seo", 0, TextRange{0, 3});
   };
-  EXPECT_THROW(indexer.index_document(0, stacking), std::runtime_error);
+  EXPECT_NO_THROW(indexer.index_document(0, stacking));
+  auto seo = index.postings(U"seo");
+  ASSERT_EQ(1u, seo->size());
+  EXPECT_EQ(0u, seo->term_position(0, 0));
+  EXPECT_EQ(5u, index.text_range(*seo, 0, 0).length); // seoul's, the first
 
   Tokenizer<TextRange> skipping = [](Normalizer, auto callback) {
     callback(U"seoul", 0, TextRange{0, 5});
@@ -225,11 +270,18 @@ TEST(AnalyzerTest, RawTokenizerMustEmitDensePositions) {
   };
   EXPECT_THROW(indexer.index_document(1, skipping), std::runtime_error);
 
+  Tokenizer<TextRange> revisiting = [](Normalizer, auto callback) {
+    callback(U"seoul", 0, TextRange{0, 5});
+    callback(U"tower", 1, TextRange{6, 5});
+    callback(U"seo", 0, TextRange{0, 3});
+  };
+  EXPECT_THROW(indexer.index_document(2, revisiting), std::runtime_error);
+
   Tokenizer<TextRange> dense = [](Normalizer, auto callback) {
     callback(U"seoul", 0, TextRange{0, 5});
     callback(U"tower", 1, TextRange{6, 5});
   };
-  EXPECT_NO_THROW(indexer.index_document(2, dense));
+  EXPECT_NO_THROW(indexer.index_document(3, dense));
 }
 
 TEST(AnalyzerTest, NormalizerAppliesAsStageZero) {

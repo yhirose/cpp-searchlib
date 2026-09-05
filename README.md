@@ -302,8 +302,8 @@ accepts is handed to `segmenter` with the whole text and its offset, and the
 segmenter emits the words it finds from there and returns how many bytes it
 consumed. What comes back is checked, not trusted (see `Segmenter`
 in the header): a span that does not end on a grapheme cluster boundary is
-dropped whole, a word that overlaps its neighbour or is cut inside a cluster
-is dropped alone, and everything else is indexed exactly as emitted.
+dropped whole, a word that starts before its neighbour or is cut inside a
+cluster is dropped alone, and everything else is indexed exactly as emitted.
 
 ## Japanese word segmentation
 
@@ -368,8 +368,11 @@ The pieces are a sequence, so a query for the whole word becomes an implicit
 phrase over them, the same way a token the segmenting splitter cuts up does.
 This is the difference from a `TermFilter` that emits several times: those
 outputs are alternatives (a synonym set), which `parse_query` turns into an
-`OR` and which the index side refuses, since alternatives have no place at
-consecutive positions. The pieces must be the word's own bytes in order (an
+`OR` and which the index side stacks on one term position (Lucene's
+`positionIncrement == 0`). A `TextSplitter` stacks the same way, by emitting
+terms whose ranges start at the same byte -- a compound beside its parts --
+and a query token it splits so parses as an `Adjacent` of one `OR` per
+position. The pieces must be the word's own bytes in order (an
 analyzer that answers with a lemma rather than the surface form should be a
 `TextSplitter` of its own, carrying its offsets); an empty answer drops the
 word.

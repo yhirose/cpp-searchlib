@@ -340,12 +340,17 @@ using SplitEmit =
 // and is the whole point of the type. Wrap one in SplitterTokenizer to index
 // with it, or pass it to parse_query to parse with it.
 //
-// A splitter must emit strictly non-overlapping ranges in increasing order,
-// each spanning the bytes its term was cut from: the text-range machinery
-// indexes the emitted ranges by term position, so a splitter that reorders or
-// overlaps them corrupts highlighting. The emitted string need not equal those
-// bytes -- SplitterTokenizer applies the Normalizer on top of it, and a
-// splitter may normalize on its own -- but the range must still point at them.
+// A splitter must emit ranges whose starts never decrease, each spanning the
+// bytes its term was cut from. Terms whose ranges start at the same byte are
+// alternatives at one term position -- a compound beside its parts, a surface
+// form beside its lemma -- which is Lucene's positionIncrement == 0; the first
+// one's range is the position's range. A term starting after the previous one
+// takes the next position, whether or not the two ranges overlap. The
+// text-range machinery indexes one range per term position, so a splitter
+// whose starts go back corrupts highlighting. The emitted string need not
+// equal the bytes -- SplitterTokenizer applies the Normalizer on top of it,
+// and a splitter may normalize on its own -- but the range must still point
+// at them.
 using TextSplitter =
     std::function<void(std::string_view text, const SplitEmit &emit)>;
 
@@ -362,10 +367,11 @@ using TextSplitter =
 // dropped whole -- its words too, since a segmenter that gets the span wrong
 // gives no reason to believe its words -- and the walk resumes at the next
 // grapheme cluster. Within a valid span, a word is dropped on its own when it
-// lies outside the span, is empty, overlaps or precedes the word before it, or
-// is not cut on grapheme cluster boundaries. Nothing is reported: the query
-// side runs this from inside a parser action, and both sides degrading
-// identically is what keeps their term boundaries in agreement.
+// lies outside the span, is empty, starts before the word before it, or is
+// not cut on grapheme cluster boundaries; one starting where the word before
+// it started stacks on its position (see TextSplitter). Nothing is reported:
+// the query side runs this from inside a parser action, and both sides
+// degrading identically is what keeps their term boundaries in agreement.
 using Segmenter = std::function<size_t(std::string_view text, size_t offset,
                                        const SplitEmit &emit)>;
 
@@ -418,13 +424,12 @@ TextSplitter subword_splitter(TextSplitter base, Decomposer decompose);
 // trait, but kept in the same push-style (continuation-passing) shape as
 // Tokenizer<T>.
 //
-// Note: the type can express 1->N, but the index-side Analyzer<T> supports
-// only 1->0 / 1->1: several outputs from a filter mean alternatives (a
-// synonym set), which parse_query turns into an Or and which have no place
-// at consecutive index positions. Splitting one word into a *sequence* of
-// pieces is subword_splitter's job. It is intentionally independent of the
-// text-range type T so that the same string logic can be reused by
-// parse_query (design section 6).
+// Several outputs from a filter are alternatives (a synonym set): parse_query
+// turns them into an Or, and the index-side Analyzer<T> stacks them on one
+// term position, as Lucene's SynonymFilter does. Splitting one word into a
+// *sequence* of pieces is subword_splitter's job. It is intentionally
+// independent of the text-range type T so that the same string logic can be
+// reused by parse_query (design section 6).
 using TermFilter =
     std::function<void(const std::u32string &str,
                        std::function<void(std::u32string)> emit)>;
@@ -909,7 +914,9 @@ private:
 
 // Lifts a TextSplitter into a Tokenizer<TextRange>, which is all an index
 // needs: the splitter decides the term boundaries, this adds the 0,1,2,...
-// term positions on top and applies the Normalizer the Tokenizer<T> contract
+// term positions on top -- one per range start, so terms starting at one
+// byte share a position (TextSplitter) -- and applies the Normalizer the
+// Tokenizer<T> contract
 // hands it (as stage 0, exactly as UTF8PlainTextTokenizer does -- ignoring it
 // would silently drop a normalizer-equipped InMemoryIndexer's normalization).
 //
@@ -941,18 +948,18 @@ private:
 // -- callers just swap UTF8PlainTextTokenizer for
 // Analyzer<T>{UTF8PlainTextTokenizer(text), chain}.
 //
-// Position policy (v1): only tokens that survive the chain get 0,1,2,...
-// term positions; dropped tokens do NOT consume a position (gaps are
-// closed). This keeps the term_pos == text_range array-index invariant that
+// Position policy: only tokens that survive the chain get 0,1,2,... term
+// positions; dropped tokens do NOT consume a position (gaps are closed).
+// This keeps the term_pos == text_range array-index invariant that
 // InMemoryIndexer and the text-range machinery (including the format_type=2
 // on-disk layout) depend on -- see design section 1.1. The known trade-off
 // is that a phrase spanning removed stop-words can false-match (e.g. "apple
 // of the tree" indexes as "apple tree"); gap-preservation is a future step.
 //
-// If a filter emits more than once for one token (1->N), operator() throws:
-// silently accepting it would break the same invariant and make text_range
-// read out of bounds. Index-side synonym expansion is intentionally
-// unsupported; do it query-side (design section 5). Cutting a word into a
+// Tokens the base tokenizer put on one position stay on one position, and a
+// filter that emits more than once for one token (1->N, synonyms) puts every
+// output there too: alternatives at a position, the same stacking a splitter
+// expresses with equal range starts (see TextSplitter). Cutting a word into a
 // sequence of pieces is a different thing and has its own home,
 // subword_splitter, where each piece gets a position and a range.
 //
@@ -972,28 +979,31 @@ public:
   void operator()(Normalizer normalizer,
                   std::function<void(const std::u32string &, size_t, T)>
                       callback) {
+    // The output position opens with the first token that survives at an
+    // input position and advances when the input position moves on, so
+    // drops close the gap (term_pos stays == text_range array index) and a
+    // stack stays a stack.
+    constexpr auto npos = std::numeric_limits<size_t>::max();
+    size_t in_pos = npos;
     size_t term_pos = 0;
-    base_tokenizer_(normalizer, [&](const std::u32string &str, size_t,
+    bool opened = false;
+    base_tokenizer_(normalizer, [&](const std::u32string &str, size_t pos,
                                     T text_range) {
-      size_t emit_count = 0;
-      auto emit = [&](std::u32string out) {
-        if (++emit_count > 1) {
-          throw std::runtime_error(
-              "searchlib: Analyzer does not support 1->N (synonym) expansion "
-              "on the index side; expand synonyms query-side instead, or use "
-              "subword_splitter to cut a word into a sequence of pieces");
+      if (pos != in_pos) {
+        if (opened) {
+          term_pos++;
+          opened = false;
         }
+        in_pos = pos;
+      }
+      auto emit = [&](std::u32string out) {
         callback(out, term_pos, text_range);
+        opened = true;
       };
       if (filter_) {
         filter_(str, emit);
       } else {
         emit(str);
-      }
-      // Only advance the position when at least one token survived, so drops
-      // close the gap (term_pos stays == text_range array index).
-      if (emit_count > 0) {
-        term_pos++;
       }
     });
   }
@@ -1243,8 +1253,9 @@ public:
     // Appends term_pos for `ordinal`, which must be >= the last ordinal
     // appended: ordinals are handed out in indexing order and never
     // revisited (re-indexing gets a fresh one), so a postings list is
-    // append-only.
-    void add_term_position(size_t ordinal, size_t term_pos);
+    // append-only. Returns false, appending nothing, when the entry is
+    // already the last one: the same term stacked on one position twice.
+    bool add_term_position(size_t ordinal, size_t term_pos);
 
     void save(std::ostream &os) const;
     void load(std::istream &is);
@@ -1676,20 +1687,28 @@ public:
     auto ordinal = index_.base_.push_document();
     index_.keys_.push(document_key, ordinal);
 
-    size_t term_count = 0;
+    // Positions must arrive in order, each either the next one or the one
+    // just handed out: the text-range vector below is appended to once per
+    // position but read back by term position (see the free text_range()),
+    // so a position skipped or revisited would quietly hand a term another
+    // term's range. The first term at a position brings the position's
+    // range; the ones stacked on it are alternatives there and bring none.
+    // Analyzer<T> keeps to this by construction; checking here covers a
+    // hand-written Tokenizer<T>, which does not go through it.
+    size_t position_count = 0;
     tokenizer(normalizer_, [&](const auto &str, auto term_pos,
                                auto text_range) {
-      // Positions must arrive dense and in order: the text-range vector below
-      // is appended to per call but read back by term position (see the free
-      // text_range()), so a repeated one would quietly hand a term another
-      // term's range. Analyzer<T> refuses 1->N expansion for this reason;
-      // checking here covers a hand-written Tokenizer<T>, which does not go
-      // through it.
-      if (term_pos != term_count) {
+      if (term_pos == position_count) {
+        if (text_ranges_ == TextRangeStorage::Store) {
+          index_.text_range_list_[ordinal].push_back(std::move(text_range));
+        }
+        position_count++;
+      } else if (term_pos + 1 != position_count) {
         throw std::runtime_error(
-            "searchlib: a tokenizer must emit term positions 0, 1, 2, ... in "
-            "order, because one term position holds exactly one text range; "
-            "to cut a word into a sequence of pieces use subword_splitter");
+            "searchlib: a tokenizer must emit term positions in order, each "
+            "the next one or the one just emitted (a stacked term), because "
+            "one term position holds exactly one text range; to cut a word "
+            "into a sequence of pieces use subword_splitter");
       }
 
       if (index_.base_.term_dictionary_.find(str) ==
@@ -1697,18 +1716,17 @@ public:
         index_.base_.term_dictionary_[str] = {str, 0};
       }
 
+      // A term stacked on itself (a filter that answered the same string
+      // twice) is one occurrence, not two.
       auto &term = index_.base_.term_dictionary_.at(str);
-      term.term_count++;
-      term.postings.add_term_position(ordinal, term_pos);
-
-      if (text_ranges_ == TextRangeStorage::Store) {
-        index_.text_range_list_[ordinal].push_back(std::move(text_range));
+      if (term.postings.add_term_position(ordinal, term_pos)) {
+        term.term_count++;
       }
-
-      term_count++;
     });
 
-    index_.base_.set_document_term_count(ordinal, term_count);
+    // A document is as long as its positions: alternatives stacked on one
+    // do not make the text longer.
+    index_.base_.set_document_term_count(ordinal, position_count);
   }
 
 private:
@@ -2820,10 +2838,12 @@ size_t delegate_word(std::string_view text, WordScratch &scratch, size_t i,
     return i + unicode::grapheme_length(cps, n);
   }
 
-  auto cursor = offset;
+  // Starts may repeat (a stack) and may not go back; the span's own start
+  // is the first floor.
+  auto last_start = offset;
   for (const auto &[str, range] : buffer) {
     auto stop = range.position + range.length;
-    if (range.length == 0 || range.position < cursor ||
+    if (range.length == 0 || range.position < last_start ||
         stop > offset + consumed) {
       continue;
     }
@@ -2835,14 +2855,15 @@ size_t delegate_word(std::string_view text, WordScratch &scratch, size_t i,
       continue;
     }
     callback(str, range);
-    cursor = stop;
+    last_start = range.position;
   }
   return end;
 }
 
 // Calls callback(str, range) once per word with the word's scalars and its
-// byte offsets into `text`. Words are emitted in increasing order and never
-// overlap. `delegation` may be null.
+// byte offsets into `text`. Words come out with starts that never decrease:
+// the default rule's never overlap, a segmenter's may stack (see
+// TextSplitter). `delegation` may be null.
 //
 // A template taking the callback by deduced type, rather than a plain function
 // taking a std::function, because this is the indexing hot path and the
@@ -4823,7 +4844,7 @@ inline bool InMemoryInvertedIndexBase::Postings::is_term_position(
                             positions_.begin() + offsets_[index + 1], term_pos);
 }
 
-inline void
+inline bool
 InMemoryInvertedIndexBase::Postings::add_term_position(size_t ordinal,
                                                        size_t term_pos) {
   // Ordinals arrive in indexing order and each document's positions in
@@ -4833,14 +4854,18 @@ InMemoryInvertedIndexBase::Postings::add_term_position(size_t ordinal,
   // to be a sorted-insert path here for callers indexing out of order, and
   // it is gone with them.
   if (!document_ordinals_.empty() && document_ordinals_.back() == ordinal) {
+    if (positions_.back() == term_pos) {
+      return false;
+    }
     positions_.push_back(term_pos);
     offsets_.back() = positions_.size();
-    return;
+    return true;
   }
   assert(document_ordinals_.empty() || document_ordinals_.back() < ordinal);
   document_ordinals_.push_back(ordinal);
   positions_.push_back(term_pos);
   offsets_.push_back(positions_.size());
+  return true;
 }
 
 inline void InMemoryInvertedIndexBase::Postings::save(std::ostream &os) const {
@@ -5575,8 +5600,14 @@ inline void SplitterTokenizer::operator()(
            std::function<void(const std::u32string &str, size_t term_pos,
                               TextRange text_range)>
                callback) {
+  constexpr auto npos = std::numeric_limits<size_t>::max();
   size_t term_pos = 0;
+  size_t last_start = npos;
   auto emit = [&](const std::u32string &str, TextRange range) {
+    if (last_start != npos && range.position != last_start) {
+      term_pos++;
+    }
+    last_start = range.position;
     // Not a ternary, for the reason given in UTF8PlainTextTokenizer above: it
     // would copy every term whether or not a normalizer is configured.
     if (normalizer) {
@@ -5584,7 +5615,6 @@ inline void SplitterTokenizer::operator()(
     } else {
       callback(str, term_pos, range);
     }
-    term_pos++;
   };
   if (splitter_) {
     splitter_(text_, emit);
@@ -5923,18 +5953,38 @@ parse_query(TextSplitter splitter, TermFilter filter, std::string_view query) {
     };
 
     auto build = [&]() -> Expression {
+      // One node per term position. Terms the splitter starts at the same
+      // byte are alternatives at one position (TextSplitter's stacking
+      // rule), so they and their filter expansions pool into one Or -- the
+      // shape a filter's 1->N already takes -- and a new start opens the
+      // next node. A position every term was dropped from (stop words)
+      // leaves no node, closing the gap as Analyzer<T> does on the index
+      // side.
       std::vector<Expression> nodes;
-      bool split_any = false;
-      splitter(token, [&](const std::u32string &str, TextRange) {
-        split_any = true;
-        auto emitted = run_filter(str);
-        if (emitted.empty()) {
-          // Dropped (e.g. stop word); close the gap, matching how
-          // Analyzer<T> closes position gaps on the index side.
-          return;
+      std::vector<std::u32string> at_position;
+      constexpr auto npos = std::numeric_limits<size_t>::max();
+      size_t last_start = npos;
+      auto close_position = [&]() {
+        if (!at_position.empty()) {
+          nodes.push_back(to_expression(std::move(at_position)));
+          at_position.clear();
         }
-        nodes.push_back(to_expression(std::move(emitted)));
+      };
+      bool split_any = false;
+      splitter(token, [&](const std::u32string &str, TextRange range) {
+        split_any = true;
+        if (range.position != last_start) {
+          close_position();
+          last_start = range.position;
+        }
+        for (auto &term : run_filter(str)) {
+          if (std::find(at_position.begin(), at_position.end(), term) ==
+              at_position.end()) {
+            at_position.push_back(std::move(term));
+          }
+        }
       });
+      close_position();
 
       if (!split_any) {
         // No letter sequence in the token (e.g. digits only); such a term can

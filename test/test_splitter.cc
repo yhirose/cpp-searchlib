@@ -35,15 +35,29 @@ std::vector<std::string> terms(const TextSplitter &splitter,
   return terms(split(splitter, text));
 }
 
-// Every range spans exactly the bytes of its term, and the ranges advance.
+// Every range spans exactly the bytes of its term, and the starts never go
+// back (a segmenter's words may stack or overlap; the default rule's are
+// disjoint, which RangesAreTheBytesOfTheTerm pins on its own).
 void expect_ranges_exact(std::string_view text, const std::vector<Word> &words) {
-  size_t previous_end = 0;
+  size_t previous_start = 0;
   for (const auto &word : words) {
-    EXPECT_GE(word.range.position, previous_end) << word.str;
+    EXPECT_GE(word.range.position, previous_start) << word.str;
     EXPECT_EQ(word.str, text.substr(word.range.position, word.range.length));
-    previous_end = word.range.position + word.range.length;
+    previous_start = word.range.position;
   }
 }
+
+// The (term, position) pairs SplitterTokenizer hands an index.
+std::vector<std::pair<std::string, size_t>>
+positioned(const TextSplitter &splitter, std::string_view text) {
+  std::vector<std::pair<std::string, size_t>> out;
+  SplitterTokenizer tokenizer(splitter, text);
+  tokenizer(nullptr, [&](const std::u32string &str, size_t term_pos,
+                         TextRange) { out.emplace_back(u8(str), term_pos); });
+  return out;
+}
+
+using Positioned = std::vector<std::pair<std::string, size_t>>;
 
 using Strings = std::vector<std::string>;
 
@@ -289,8 +303,9 @@ TEST(SplitterDelegationTest, ABadSpanIsDroppedAndTheWalkSkipsOneGraphemeCluster)
 
 TEST(SplitterDelegationTest, ABadWordIsDroppedOnItsOwn) {
   // Within a valid span, each word is checked by itself: outside the span,
-  // empty, overlapping or preceding the word before it, or cut off a grapheme
-  // cluster boundary -- the others stay.
+  // empty, starting before the word before it, or cut off a grapheme cluster
+  // boundary -- the others stay. Starting where the previous word started
+  // (a stack) or inside it (a later start) is not a fault.
   const std::string text = "東京都庁 x";
   const std::string voiced = "東\xE3\x82\x99京 x";
   struct Case {
@@ -303,7 +318,8 @@ TEST(SplitterDelegationTest, ABadWordIsDroppedOnItsOwn) {
            {"all good", text, {{0, 6}, {6, 12}}, {"東京", "都庁", "x"}},
            {"outside the span", text, {{0, 6}, {6, 12}, {13, 14}}, {"東京", "都庁", "x"}},
            {"empty", text, {{0, 6}, {6, 6}, {6, 12}}, {"東京", "都庁", "x"}},
-           {"overlapping", text, {{0, 6}, {3, 9}, {9, 12}}, {"東京", "庁", "x"}},
+           {"a later start", text, {{0, 6}, {3, 9}, {9, 12}}, {"東京", "京都", "庁", "x"}},
+           {"the same start", text, {{0, 6}, {0, 3}, {6, 12}}, {"東京", "東", "都庁", "x"}},
            {"out of order", text, {{6, 12}, {0, 6}}, {"都庁", "x"}},
            {"mid-scalar", text, {{0, 4}, {6, 12}}, {"都庁", "x"}},
            {"mid-cluster", voiced, {{0, 3}, {6, 9}}, {"京", "x"}},
@@ -318,6 +334,19 @@ TEST(SplitterDelegationTest, ABadWordIsDroppedOnItsOwn) {
     EXPECT_EQ(c.expected, terms(words)) << c.what;
     expect_ranges_exact(c.text, words);
   }
+}
+
+TEST(SplitterDelegationTest, WordsStartingAtOneByteShareATermPosition) {
+  // TextSplitter's stacking rule as SplitterTokenizer applies it: a word
+  // starting where the previous one started is an alternative at that
+  // position (a compound beside its parts), and any later start -- inside
+  // the previous word or after it -- is the next position.
+  Scripted scripted;
+  scripted.answer = answer_with({{0, 12}, {0, 6}, {6, 12}}, 12);
+  auto splitter = utf8_plain_text_splitter(scripted.segmenter(), kHan);
+
+  EXPECT_EQ((Positioned{{"東京都庁", 0}, {"東京", 0}, {"都庁", 1}, {"x", 2}}),
+            positioned(splitter, "東京都庁 x"));
 }
 
 TEST(SplitterDelegationTest, ASegmenterMayCallTheDefaultSplitterBack) {

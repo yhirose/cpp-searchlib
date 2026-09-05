@@ -272,6 +272,59 @@ TEST(SegmentTest, TermFilterExpansionStillBecomesAnOr) {
             parsed(segmenting_splitter(), "東京タワー", synonyms));
 }
 
+TEST(SegmentTest, StackedTermsAreAlternativesAtOnePosition) {
+  // A splitter answering a compound beside its parts -- what a Korean
+  // analyzer's mixed decompounding does -- stacks 학교 on 학교에서's position
+  // by starting it at the same byte; 에서 takes the next one. The same
+  // splitter on both sides, as always.
+  TextSplitter stacking = [](std::string_view text, const SplitEmit &emit) {
+    if (text == "학교에서") {
+      emit(U"학교에서", TextRange{0, 12});
+      emit(U"학교", TextRange{0, 6});
+      emit(U"에서", TextRange{6, 6});
+    } else {
+      emit(u32(text), TextRange{0, text.size()});
+    }
+  };
+
+  // The query side: an Or per position, Adjacent between positions -- so a
+  // phrase over the parts and the compound alone both answer it.
+  EXPECT_EQ("(adj (or 학교에서 학교) 에서)", parsed(stacking, "학교에서"));
+
+  auto check = [&](const IInvertedIndexWithTextRange<TextRange> &index) {
+    for (const char *query : {"학교에서", "학교", "에서", "\"학교 에서\""}) {
+      auto expr = parse_query(stacking, nullptr, query);
+      ASSERT_TRUE(expr) << query;
+      EXPECT_EQ((std::vector<size_t>{0}), search_ids(index, *expr)) << query;
+    }
+    auto part = index.postings(U"학교");
+    ASSERT_EQ(1u, part->size());
+    EXPECT_EQ(0u, part->term_position(0, 0));
+    EXPECT_EQ(1u, index.postings(U"에서")->term_position(0, 0));
+    EXPECT_EQ(2u, index.document_term_count(0));
+    // The position's range is the first term's: the compound, so a hit on
+    // the part highlights the word as written.
+    auto range = index.text_range(*part, 0, 0);
+    EXPECT_EQ("학교에서",
+              std::string("학교에서").substr(range.position, range.length));
+  };
+
+  InMemoryInvertedIndex<TextRange> index;
+  {
+    InMemoryIndexer indexer(index, nullptr);
+    indexer.index_document(0, SplitterTokenizer(stacking, "학교에서"));
+  }
+  check(index);
+
+  // The stack survives the compressed layout unchanged: one range per
+  // position is exactly what it stores.
+  std::stringstream ss;
+  index.save(ss, {}, IndexFormat::Compressed);
+  InMemoryInvertedIndex<TextRange> loaded;
+  loaded.load(ss);
+  check(loaded);
+}
+
 //-----------------------------------------------------------------------------
 // Index and search, end to end
 //-----------------------------------------------------------------------------
