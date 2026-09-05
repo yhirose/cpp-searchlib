@@ -333,8 +333,8 @@ word.
 `cli/` builds a small `searchlib-cli` executable exercising the library:
 
 ```sh
-# Index every file under a directory into INDEX_PATH (plus an
-# INDEX_PATH.manifest sidecar mapping document ids back to file paths).
+# Index every file under a directory into INDEX_PATH. Each file's path is
+# its document key, so a hit comes back as the path it was read from.
 searchlib-cli index SOURCE INDEX_PATH
 
 # Search INDEX_PATH, printing the top hits ranked by BM25 with their

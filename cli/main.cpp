@@ -36,12 +36,9 @@ int error(const std::string &message) {
   return 1;
 }
 
-std::string manifest_path(const std::string &index_path) {
-  return index_path + ".manifest";
-}
-
 // Collects regular files under `source` (or just `source` itself if it's a
-// file), sorted by path so that document ids are deterministic across runs.
+// file), sorted by path so that the index is the same across runs (its
+// ordinals follow indexing order).
 std::vector<fs::path> collect_source_files(const fs::path &source) {
   std::vector<fs::path> files;
   if (fs::is_regular_file(source)) {
@@ -76,57 +73,31 @@ int cmd_index(const std::string &source, const std::string &index_path,
     return error("no files found under: " + source);
   }
 
-  InMemoryInvertedIndex<TextRange> invidx;
+  // A file's path is its document key, so a hit comes back as the path it
+  // was read from and nothing has to be kept beside the index file.
+  InMemoryInvertedIndex<TextRange, std::string> invidx;
   InMemoryIndexer indexer(invidx, normalizer);
 
-  size_t document_key = 0;
   for (const auto &path : files) {
     if (verbose) {
-      std::cout << "indexing [" << document_key << "] " << path.string()
-                << std::endl;
+      std::cout << "indexing " << path.string() << std::endl;
     }
     auto content = read_file(path);
     UTF8PlainTextTokenizer tokenizer(content);
-    indexer.index_document(document_key, tokenizer);
-    document_key++;
+    indexer.index_document(path.string(), tokenizer);
   }
 
   invidx.save(index_path);
-
-  std::ofstream manifest(manifest_path(index_path), std::ios::binary);
-  if (!manifest) {
-    return error("cannot write manifest file for: " + index_path);
-  }
-  for (const auto &path : files) {
-    manifest << path.string() << '\n';
-  }
 
   std::cout << "indexed " << files.size() << " document(s) into "
             << index_path << std::endl;
   return 0;
 }
 
-std::vector<std::string> load_manifest(const std::string &index_path) {
-  std::ifstream is(manifest_path(index_path));
-  if (!is) {
-    throw std::runtime_error("cannot open manifest file for: " + index_path +
-                             " (was it indexed with this CLI?)");
-  }
-  std::vector<std::string> paths;
-  std::string line;
-  while (std::getline(is, line)) {
-    if (!line.empty()) {
-      paths.push_back(line);
-    }
-  }
-  return paths;
-}
-
 int cmd_search(const std::string &index_path, const std::string &query_str,
                size_t limit, bool verbose) {
-  InMemoryInvertedIndex<TextRange> invidx;
+  InMemoryInvertedIndex<TextRange, std::string> invidx;
   invidx.load(index_path);
-  auto document_paths = load_manifest(index_path);
 
   auto parsed = parse_query(normalizer, query_str);
   if (!parsed) {
@@ -149,11 +120,7 @@ int cmd_search(const std::string &index_path, const std::string &query_str,
 
   size_t rank = 1;
   for (const auto &hit : hits) {
-    auto document_key =
-        invidx.document_key(result->document_ordinal(hit.index));
-    const auto &path = document_key < document_paths.size()
-                           ? document_paths[document_key]
-                           : "<unknown>";
+    const auto &path = invidx.document_key(result->document_ordinal(hit.index));
 
     std::cout << rank << ". " << path << "  score=" << hit.score
               << std::endl;
