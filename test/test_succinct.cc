@@ -197,7 +197,6 @@ TEST(EliasFanoTest, Randomized) {
   }
 }
 
-
 // The varint codec the Compressed format's expanded sections are written
 // with (document term counts, per-term frequencies, the short postings).
 TEST(VarintTest, RoundTripsEveryWidth) {
@@ -223,11 +222,13 @@ TEST(VarintTest, RoundTripsEveryWidth) {
 // One byte per seven bits, so the small values these sections are full of
 // cost one byte where a fixed-width field costs eight.
 TEST(VarintTest, SpendsOneByteOnSmallValues) {
-  std::stringstream ss;
-  searchlib::detail::write_varint(ss, 127);
-  EXPECT_EQ(1u, ss.str().size());
-  searchlib::detail::write_varint(ss, 128);
-  EXPECT_EQ(3u, ss.str().size());
+  std::stringstream small;
+  searchlib::detail::write_varint(small, 127);
+  EXPECT_EQ(1u, small.str().size());
+
+  std::stringstream just_over;
+  searchlib::detail::write_varint(just_over, 128);
+  EXPECT_EQ(2u, just_over.str().size());
 }
 
 // A truncated or over-long sequence is a corrupt file, not a value: the
@@ -244,5 +245,26 @@ TEST(VarintTest, RejectsMalformedInput) {
       ss.write("\xff", 1); // more bytes than 64 bits can hold
     }
     EXPECT_THROW(searchlib::detail::read_varint(ss), std::runtime_error);
+  }
+  {
+    // Ten bytes is the widest a 64-bit value takes, but the tenth carries
+    // only bit 63. Masking and shifting a wider one would silently drop the
+    // excess, which is how this reader used to answer UINT64_MAX here.
+    std::stringstream ss;
+    for (int i = 0; i < 9; i++) {
+      ss.write("\xff", 1);
+    }
+    ss.write("\x7f", 1);
+    EXPECT_THROW(searchlib::detail::read_varint(ss), std::runtime_error);
+  }
+  {
+    // The canonical UINT64_MAX, which is that same width and must be read.
+    std::stringstream ss;
+    for (int i = 0; i < 9; i++) {
+      ss.write("\xff", 1);
+    }
+    ss.write("\x01", 1);
+    EXPECT_EQ(std::numeric_limits<uint64_t>::max(),
+              searchlib::detail::read_varint(ss));
   }
 }
