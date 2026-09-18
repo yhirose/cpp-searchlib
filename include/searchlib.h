@@ -1090,7 +1090,7 @@ private:
 // Position policy: only tokens that survive the chain get 0,1,2,... term
 // positions; dropped tokens do NOT consume a position (gaps are closed).
 // This keeps the term_pos == text_range array-index invariant that
-// InMemoryIndexer and the text-range machinery (including the format_type=2
+// InMemoryIndexer and the text-range machinery (including the Compressed
 // on-disk layout) depend on -- see design section 1.1. The known trade-off
 // is that a phrase spanning removed stop-words can false-match (e.g. "apple
 // of the tree" indexes as "apple tree"); gap-preservation is a future step.
@@ -1181,8 +1181,8 @@ void load_text_ranges_compressed(std::istream &is,
 
 } // namespace detail
 
-// Read-only backend for a Compressed-format (format_type=2) index file that
-// keeps the Elias-Fano postings and text-range structures compressed in
+// Read-only backend for a Compressed-format index file that keeps the
+// Elias-Fano postings and text-range structures compressed in
 // memory, instead of expanding them into the InMemoryInvertedIndex
 // representation the way InMemoryInvertedIndex<TextRange>::load does. Use it
 // when memory footprint matters more than write access (e.g. an installed
