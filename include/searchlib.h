@@ -3133,7 +3133,15 @@ void for_each_word(std::string_view text, const Delegation *delegation,
 // structures' fixed overhead would exceed the savings. The chosen
 // representation is recorded per term in the file, so this threshold can be
 // tuned without breaking compatibility.
-inline constexpr size_t kCompressedPostingsThreshold = 64;
+//
+// Measured on KJV (31,103 documents, 12,816 terms): Elias-Fano first pays for
+// itself at 9 entries, and the file shrinks 5.14 -> 4.29 MB (-16.7%) moving
+// the threshold from 64 to 16, against 4.18 MB (-18.7%) at 9. A term that
+// crosses into Elias-Fano costs 1.5-2x to read back -- a 60-entry term's
+// top-10 goes from 1.12 to 1.71 us -- so the last two percent of file size
+// are not worth the extra 1,215 terms paying that. See
+// docs/postings_compression_design.ja.md section 6.2.
+inline constexpr size_t kCompressedPostingsThreshold = 16;
 
 // Definition of the type declared opaque up in the interface. One Elias-Fano
 // sequence per (scope_name, ordinal), each mapping term_pos -> scope ordinal
