@@ -3,6 +3,8 @@
 
 #include <filesystem>
 #include <fstream>
+#include <map>
+#include <optional>
 #include <sstream>
 
 #include "test_utils.h"
@@ -344,3 +346,136 @@ TEST(KJVTest, UTF8DecodePerformance) {
   }
 }
 
+// Every document a result names, with the (position, length) of each hit.
+using Hits = std::map<size_t, std::vector<std::pair<size_t, size_t>>>;
+
+static Hits collect_hits(const IPostings &postings) {
+  Hits hits;
+  for (size_t i = 0; i < postings.size(); i++) {
+    auto &positions = hits[postings.document_ordinal(i)];
+    for (size_t j = 0; j < postings.search_hit_count(i); j++) {
+      positions.emplace_back(postings.term_position(i, j),
+                             postings.term_length(i, j));
+    }
+    std::sort(positions.begin(), positions.end());
+  }
+  return hits;
+}
+
+// And, Or and Not evaluated here, over maps, with every other node handed to
+// perform_search whole. perform_search gives the node it is handed no
+// filter, so as long as those nodes do not nest an And or an Or themselves,
+// nothing on this side is filter-pushed-down, and the answer is what the
+// query means rather than what the pushdown computes.
+static Hits reference_hits(const IInvertedIndex &index,
+                           const Expression &expr) {
+  auto merge = [](std::vector<std::pair<size_t, size_t>> a,
+                  const std::vector<std::pair<size_t, size_t>> &b) {
+    a.insert(a.end(), b.begin(), b.end());
+    std::sort(a.begin(), a.end());
+    return a;
+  };
+
+  switch (expr.operation) {
+  case Operation::And: {
+    std::optional<Hits> hits;
+    std::vector<Hits> negatives;
+    for (const auto &node : expr.nodes) {
+      if (node.operation == Operation::Not) {
+        negatives.push_back(reference_hits(index, node.nodes[0]));
+        continue;
+      }
+      auto operand = reference_hits(index, node);
+      if (!hits) {
+        hits = std::move(operand);
+        continue;
+      }
+      Hits both;
+      for (const auto &[ordinal, positions] : *hits) {
+        auto it = operand.find(ordinal);
+        if (it != operand.end()) {
+          both[ordinal] = merge(positions, it->second);
+        }
+      }
+      hits = std::move(both);
+    }
+    if (!hits) {
+      return {};
+    }
+    for (const auto &negative : negatives) {
+      for (const auto &[ordinal, _] : negative) {
+        hits->erase(ordinal);
+      }
+    }
+    return *hits;
+  }
+  case Operation::Or: {
+    Hits hits;
+    for (const auto &node : expr.nodes) {
+      for (const auto &[ordinal, positions] : reference_hits(index, node)) {
+        hits[ordinal] = merge(hits[ordinal], positions);
+      }
+    }
+    return hits;
+  }
+  default:
+    return collect_hits(*perform_search(index, expr));
+  }
+}
+
+// An And hands its most selective operand to the rest as a filter, and an
+// Or, a phrase or a Near under that filter answers only at the filter's
+// documents. None of that may change what a query matches or where: each
+// query here is one of those shapes, checked against reference_hits on both
+// backends, since the probing goes through each backend's own advance.
+TEST(KJVTest, FilterPushdownMatchesPlainEvaluation) {
+  const auto &invidx = kjv_index();
+
+  std::stringstream compressed(std::ios::in | std::ios::out | std::ios::binary);
+  invidx.save(compressed, {}, IndexFormat::Compressed);
+  auto loaded = load_compressed_index(compressed);
+
+  const char *queries[] = {
+      // A rare Term leads, and the Or is probed at its documents.
+      "leviathan (the | and)",
+      "(the | and) leviathan",
+      "leviathan (the | and) -god",
+      "leviathan -(the | and)",
+      "leviathan (the | zzzzqqq)",
+      "zzzzqqq (the | and)",
+      // The filter passes down through an And into an Or, a phrase and a
+      // Near, where it joins the intersection as the leading operand.
+      "leviathan (the (and | of))",
+      "leviathan \"of the\"",
+      "leviathan (the ~ and)",
+      "leviathan (the | \"of the\")",
+      "jesus \"the lord\" -(peter | john)",
+      // The Or leads, as the rarer side, with Terms filtered by it.
+      "the (leviathan | behemoth)",
+      "(love | hate) (god | lord) the",
+      "peace (love | (joy (hope | faith)))",
+      // Expansions rank last, and are probed only when the filter is short.
+      "sanctif* (the | and)",
+      "leviathan sanctif*",
+      "leviathen~1 (the | and)",
+      "l*viathan (the | of)",
+      // A filter long enough that the Or is unioned in full instead.
+      "god (lord | jesus) -(david | moses)",
+  };
+
+  size_t documents = 0;
+  for (const IInvertedIndex *index :
+       {static_cast<const IInvertedIndex *>(&invidx),
+        static_cast<const IInvertedIndex *>(loaded.get())}) {
+    for (auto query : queries) {
+      SCOPED_TRACE(query);
+      auto expr = parse_query(normalizer, query);
+      ASSERT_TRUE(expr);
+      auto expected = reference_hits(*index, *expr);
+      EXPECT_EQ(expected, collect_hits(*perform_search(*index, *expr)));
+      documents += expected.size();
+    }
+  }
+  // Guards against a query set that matches nothing and so proves nothing.
+  EXPECT_GT(documents, 1000u);
+}

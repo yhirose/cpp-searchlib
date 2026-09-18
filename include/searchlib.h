@@ -3704,20 +3704,137 @@ private:
 // so that removed documents are filtered exactly once, at the public entry.
 // scope_index is threaded through purely so that a nested Operation::SameScope
 // node can reach it; every other operation just forwards it unused.
+//
+// `filter`, when given, is a promise from the caller: it will intersect what
+// comes back with filter's documents, so the result may leave out any
+// document filter does not name. It is how an intersection hands its most
+// selective operand to the others -- `leviathan (the | and)` then answers
+// the Or at leviathan's 40 documents instead of unioning two lists of
+// 240,000 and throwing nearly all of it away. It is only ever a hint: a node
+// with no cheaper way to honor it answers in full, which is always correct.
 inline std::shared_ptr<IPostings>
 perform_search_operation(const IInvertedIndex &inverted_index,
-                         const Expression &expr,
-                         const IScopeIndex *scope_index);
+                         const Expression &expr, const IScopeIndex *scope_index,
+                         const IPostings *filter = nullptr);
 
 inline auto positings_list(const IInvertedIndex &inverted_index,
                            const std::vector<Expression> &nodes,
-                           const IScopeIndex *scope_index) {
+                           const IScopeIndex *scope_index,
+                           const IPostings *filter = nullptr) {
   std::vector<std::shared_ptr<IPostings>> positings_list;
   for (const auto &expr : nodes) {
     positings_list.push_back(
-        perform_search_operation(inverted_index, expr, scope_index));
+        perform_search_operation(inverted_index, expr, scope_index, filter));
   }
   return positings_list;
+}
+
+// An upper bound on how many documents expr can match, cheap enough to take
+// before evaluating it: a Term's df, the smallest operand of an
+// intersection, the sum of a union's. It only picks which operand of an
+// intersection runs first and filters the rest, so it has to rank well, not
+// be exact. Prefix, Wildcard and Fuzzy would have to expand against the
+// dictionary to answer, and evaluating them expands again, so they rank last
+// rather than pay that twice.
+inline size_t estimate_matches(const IInvertedIndex &inverted_index,
+                               const Expression &expr) {
+  constexpr auto unknown = std::numeric_limits<size_t>::max();
+  switch (expr.operation) {
+  case Operation::Term:
+    return inverted_index.df(expr.term_str);
+  case Operation::And:
+  case Operation::Adjacent:
+  case Operation::Near:
+  case Operation::SameScope: {
+    auto bound = unknown;
+    for (const auto &node : expr.nodes) {
+      if (node.operation != Operation::Not) {
+        bound = std::min(bound, estimate_matches(inverted_index, node));
+      }
+    }
+    return bound;
+  }
+  case Operation::Or: {
+    size_t bound = 0;
+    for (const auto &node : expr.nodes) {
+      auto matches = estimate_matches(inverted_index, node);
+      if (matches > unknown - bound) {
+        return unknown;
+      }
+      bound += matches;
+    }
+    return bound;
+  }
+  default:
+    return unknown;
+  }
+}
+
+// The tighter of two filters, either of which may be absent.
+inline const IPostings *tighter_filter(const IPostings *a, const IPostings *b) {
+  if (!a) {
+    return b;
+  }
+  if (!b) {
+    return a;
+  }
+  return b->size() < a->size() ? b : a;
+}
+
+// The operands of an intersection, evaluated, plus the filter they were
+// evaluated under.
+struct IntersectionOperands {
+  std::vector<std::shared_ptr<IPostings>> postings;
+  const IPostings *filter;
+};
+
+// Evaluates an intersection's operands, the most selective first, and hands
+// each later one the tighter of the caller's filter and the first one's
+// result, since the intersection keeps only documents both of those name.
+// A Term costs nothing to evaluate -- its result is its own postings -- so
+// Terms are taken first and ranked by their real size; anything else is
+// ranked by estimate_matches before it runs. The operands come back in the
+// order given, because Adjacent and Near read them by slot.
+inline IntersectionOperands
+intersection_operands(const IInvertedIndex &inverted_index,
+                      const std::vector<Expression> &nodes,
+                      const IScopeIndex *scope_index, const IPostings *filter) {
+  IntersectionOperands operands{
+      std::vector<std::shared_ptr<IPostings>>(nodes.size()), filter};
+  auto &postings = operands.postings;
+
+  auto lead = nodes.size();
+  auto lead_matches = std::numeric_limits<size_t>::max();
+  for (size_t i = 0; i < nodes.size(); i++) {
+    size_t matches;
+    if (nodes[i].operation == Operation::Term) {
+      postings[i] =
+          perform_search_operation(inverted_index, nodes[i], scope_index);
+      matches = postings[i]->size();
+    } else {
+      matches = estimate_matches(inverted_index, nodes[i]);
+    }
+    if (lead == nodes.size() || matches < lead_matches) {
+      lead = i;
+      lead_matches = matches;
+    }
+  }
+  if (lead == nodes.size()) {
+    return operands;
+  }
+
+  if (!postings[lead]) {
+    postings[lead] = perform_search_operation(inverted_index, nodes[lead],
+                                              scope_index, filter);
+  }
+  operands.filter = tighter_filter(filter, postings[lead].get());
+  for (size_t i = 0; i < nodes.size(); i++) {
+    if (!postings[i]) {
+      postings[i] = perform_search_operation(inverted_index, nodes[i],
+                                             scope_index, operands.filter);
+    }
+  }
+  return operands;
 }
 
 // Defined below, after the windows; OrdinalWindows::advance gallops through
@@ -4342,10 +4459,42 @@ inline void for_each_intersection(
   }
 }
 
+// positings_list with the filter appended as one more, non-owning, last slot:
+// the caller holds the filter for the whole walk, and the cast is as safe as
+// perform_term_operation's -- IPostings is all-const.
+inline std::vector<std::shared_ptr<IPostings>>
+with_filter_slot(const std::vector<std::shared_ptr<IPostings>> &positings_list,
+                 const IPostings &filter) {
+  auto walk = positings_list;
+  walk.emplace_back(std::shared_ptr<IPostings>(),
+                    const_cast<IPostings *>(&filter));
+  return walk;
+}
+
+// for_each_intersection under a caller's filter (see perform_search_operation).
+// When the filter is more selective than every operand, it joins the walk as
+// one more operand and leads it: `rare "of the"` then checks the phrase at
+// rare's documents rather than at every document the two words share. It
+// goes last, so the operands keep their slots and fn, which reads only
+// those, never sees it. A less selective filter is left out, since it would
+// only add a cursor to every step.
+template <typename T>
+inline void for_each_filtered_intersection(
+    const std::vector<std::shared_ptr<IPostings>> &positings_list,
+    const IPostings *filter, T fn) {
+  if (filter && !positings_list.empty() &&
+      std::all_of(positings_list.begin(), positings_list.end(),
+                  [&](const auto &p) { return filter->size() < p->size(); })) {
+    for_each_intersection(with_filter_slot(positings_list, *filter), fn);
+  } else {
+    for_each_intersection(positings_list, fn);
+  }
+}
+
 template <typename T>
 inline std::shared_ptr<IPostings> intersect_postings(
     const std::vector<std::shared_ptr<IPostings>> &positings_list,
-    T make_positions) {
+    const IPostings *filter, T make_positions) {
   auto result = std::make_shared<SearchResult>();
 
   // Filled and cleared once per matched document rather than reallocated:
@@ -4354,8 +4503,8 @@ inline std::shared_ptr<IPostings> intersect_postings(
   std::vector<size_t> term_positions;
   std::vector<size_t> term_lengths;
 
-  for_each_intersection(
-      positings_list, [&](const auto &cursors, size_t ordinal) {
+  for_each_filtered_intersection(
+      positings_list, filter, [&](const auto &cursors, size_t ordinal) {
         if (make_positions(positings_list, cursors, ordinal, term_positions,
                            term_lengths)) {
           result->push_back(ordinal, term_positions, term_lengths);
@@ -4370,11 +4519,6 @@ inline std::shared_ptr<IPostings> intersect_postings(
 
 inline std::shared_ptr<IPostings>
 union_postings(std::vector<std::shared_ptr<IPostings>> &&positings_list) {
-  positings_list.erase(
-      std::remove_if(positings_list.begin(), positings_list.end(),
-                     [](const auto &postings) { return postings->size() == 0; }),
-      positings_list.end());
-
   // The result views every operand, so it takes its own copy of the list
   // before the walk below starts dropping the ones that run out
   // (increment_cursors erases them). Built from the leftovers instead, it
@@ -4420,6 +4564,82 @@ union_postings(std::vector<std::shared_ptr<IPostings>> &&positings_list) {
   return result;
 }
 
+// Whether to answer a union under a filter by probing (probe_union_postings
+// below) rather than walking every operand end to end: when the filter's
+// documents times the operands, the most advances probing can take, is
+// fewer than the operands' entries, which the full union reads one by one.
+// Probing stops at the first operand that names a document, so it usually
+// takes fewer. On KJV x10, `X (the | and)` probed beats the full union at
+// every X up to `of` (181,220 against 479,590 entries), taking 0.59x its
+// time on the in-memory backend and 0.92x on the compressed one, which is
+// where this line sits.
+inline bool probing_pays(const IPostings &filter,
+                         const std::vector<std::shared_ptr<IPostings>> &list) {
+  size_t total = 0;
+  for (const auto &postings : list) {
+    total += postings->size();
+  }
+  return filter.size() * list.size() < total;
+}
+
+inline std::shared_ptr<IPostings>
+probe_union_postings(std::vector<std::shared_ptr<IPostings>> &&positings_list,
+                     const IPostings &filter) {
+  auto result = std::make_shared<LazyMergeResult>(positings_list);
+  if (positings_list.empty()) {
+    return result;
+  }
+
+  // Everything is read through windows, the filter included as the last
+  // slot, for the same reason the other walks are: on Elias-Fano a
+  // document_ordinal or an advance through the virtual interface restarts
+  // its search every time. Probing a filter of 38,770 against two operands
+  // that way took 12.7ms, slower than the 11.2ms full union it was meant to
+  // beat; through windows it takes 4.8ms.
+  auto operands = positings_list.size();
+  auto walk = with_filter_slot(positings_list, filter);
+  std::vector<size_t> sizes;
+  sizes.reserve(walk.size());
+  for (const auto &postings : walk) {
+    sizes.push_back(postings->size());
+  }
+  std::vector<size_t> cursors(operands, 0);
+  OrdinalWindows windows(walk);
+
+  // A cursor is only ever a lower bound, so stopping at the first operand
+  // that names the document leaves the others where advance can resume.
+  auto probe = [&](auto read, auto advance) {
+    for (size_t i = 0; i < sizes[operands]; i++) {
+      auto ordinal = read(operands, i);
+      for (size_t slot = 0; slot < operands; slot++) {
+        auto &cursor = cursors[slot];
+        if (cursor < sizes[slot] && read(slot, cursor) < ordinal) {
+          cursor = advance(slot, cursor, sizes[slot], ordinal);
+        }
+        if (cursor < sizes[slot] && read(slot, cursor) == ordinal) {
+          result->push_back(ordinal);
+          break;
+        }
+      }
+    }
+  };
+  // Instantiated once per read, as the other walks write their loop twice.
+  if (windows.buffered()) {
+    probe([&](size_t slot, size_t index) { return windows.at(slot, index); },
+          [&](size_t slot, size_t cursor, size_t size, size_t ordinal) {
+            return windows.advance(slot, cursor, size, ordinal);
+          });
+  } else {
+    probe(
+        [&](size_t slot, size_t index) { return windows.direct(slot, index); },
+        [&](size_t slot, size_t cursor, size_t size, size_t ordinal) {
+          return gallop_lower_bound(*walk[slot], cursor, size, ordinal);
+        });
+  }
+
+  return result;
+}
+
 //-----------------------------------------------------------------------------
 
 inline std::shared_ptr<IPostings>
@@ -4442,8 +4662,8 @@ perform_term_operation(const IInvertedIndex &inverted_index,
 
 inline std::shared_ptr<IPostings>
 perform_and_operation(const IInvertedIndex &inverted_index,
-                      const Expression &expr,
-                      const IScopeIndex *scope_index) {
+                      const Expression &expr, const IScopeIndex *scope_index,
+                      const IPostings *filter) {
   std::vector<Expression> positive_nodes;
   std::vector<Expression> negative_nodes;
   for (const auto &node : expr.nodes) {
@@ -4454,16 +4674,20 @@ perform_and_operation(const IInvertedIndex &inverted_index,
     }
   }
 
-  auto negative_postings_list =
-      positings_list(inverted_index, negative_nodes, scope_index);
+  auto positive = intersection_operands(inverted_index, positive_nodes,
+                                        scope_index, filter);
+  const auto &positive_postings_list = positive.postings;
+
+  // A negative operand is only ever asked about documents every positive one
+  // names, so it can take the same filter they did.
+  auto negative_postings_list = positings_list(inverted_index, negative_nodes,
+                                               scope_index, positive.filter);
   std::vector<size_t> negative_cursors(negative_postings_list.size(), 0);
 
-  auto positive_postings_list =
-      positings_list(inverted_index, positive_nodes, scope_index);
   auto result = std::make_shared<LazyMergeResult>(positive_postings_list);
 
-  for_each_intersection(
-      positive_postings_list, [&](const auto &, size_t ordinal) {
+  for_each_filtered_intersection(
+      positive_postings_list, filter, [&](const auto &, size_t ordinal) {
         // Exclude documents that appear in any negative postings. Both sides
         // are iterated in ascending document id order, so a negative cursor
         // only moves forward -- and it jumps rather than steps, because the
@@ -4487,10 +4711,9 @@ perform_and_operation(const IInvertedIndex &inverted_index,
   return result;
 }
 
-inline std::shared_ptr<IPostings>
-perform_adjacent_operation(const IInvertedIndex &inverted_index,
-                           const Expression &expr,
-                           const IScopeIndex *scope_index) {
+inline std::shared_ptr<IPostings> perform_adjacent_operation(
+    const IInvertedIndex &inverted_index, const Expression &expr,
+    const IScopeIndex *scope_index, const IPostings *filter) {
   // Every operand's positions for the document, read whole
   // (read_term_positions) into buffers reused across documents. The check
   // is then a merge: the shortest list leads, and each other list's pointer
@@ -4500,9 +4723,11 @@ perform_adjacent_operation(const IInvertedIndex &inverted_index,
   std::vector<size_t> pointers;
 
   return intersect_postings(
-      positings_list(inverted_index, expr.nodes, scope_index),
-      [&](const auto &positings_list, const auto &cursors,
-          size_t /*ordinal*/, auto &term_positions, auto &term_lengths) {
+      intersection_operands(inverted_index, expr.nodes, scope_index, filter)
+          .postings,
+      filter,
+      [&](const auto &positings_list, const auto &cursors, size_t /*ordinal*/,
+          auto &term_positions, auto &term_lengths) {
         auto slot_count = positings_list.size();
         positions.resize(slot_count);
         size_t target_slot = 0;
@@ -4554,9 +4779,20 @@ perform_adjacent_operation(const IInvertedIndex &inverted_index,
 
 inline std::shared_ptr<IPostings>
 perform_or_operation(const IInvertedIndex &inverted_index,
-                     const Expression &expr,
-                     const IScopeIndex *scope_index) {
-  return union_postings(positings_list(inverted_index, expr.nodes, scope_index));
+                     const Expression &expr, const IScopeIndex *scope_index,
+                     const IPostings *filter) {
+  auto operands =
+      positings_list(inverted_index, expr.nodes, scope_index, filter);
+  // Both unions below take the operands with the empty ones already gone.
+  operands.erase(std::remove_if(operands.begin(), operands.end(),
+                                [](const auto &postings) {
+                                  return postings->size() == 0;
+                                }),
+                 operands.end());
+  if (filter && probing_pays(*filter, operands)) {
+    return probe_union_postings(std::move(operands), *filter);
+  }
+  return union_postings(std::move(operands));
 }
 
 // A Prefix node is answered by expanding it against the index's dictionary
@@ -4566,10 +4802,11 @@ perform_or_operation(const IInvertedIndex &inverted_index,
 // a parsed Expression is meant to stay reusable across indexes.
 inline std::shared_ptr<IPostings>
 perform_prefix_operation(const IInvertedIndex &inverted_index,
-                         const Expression &expr,
-                         const IScopeIndex *scope_index) {
-  return perform_search_operation(
-      inverted_index, expand_prefixes(inverted_index, expr), scope_index);
+                         const Expression &expr, const IScopeIndex *scope_index,
+                         const IPostings *filter) {
+  return perform_search_operation(inverted_index,
+                                  expand_prefixes(inverted_index, expr),
+                                  scope_index, filter);
 }
 
 // A Wildcard node is answered the same way a Prefix node is: expand against
@@ -4578,37 +4815,39 @@ perform_prefix_operation(const IInvertedIndex &inverted_index,
 // different mechanisms -- literal-prefix descent vs. an automaton walk -- and
 // mixing that behind one enumerate_terms_with_prefix call would lose the
 // cheaper path for the common trailing-`*` case.
-inline std::shared_ptr<IPostings>
-perform_wildcard_operation(const IInvertedIndex &inverted_index,
-                           const Expression &expr,
-                           const IScopeIndex *scope_index) {
-  return perform_search_operation(
-      inverted_index, expand_wildcards(inverted_index, expr), scope_index);
+inline std::shared_ptr<IPostings> perform_wildcard_operation(
+    const IInvertedIndex &inverted_index, const Expression &expr,
+    const IScopeIndex *scope_index, const IPostings *filter) {
+  return perform_search_operation(inverted_index,
+                                  expand_wildcards(inverted_index, expr),
+                                  scope_index, filter);
 }
 
 // And likewise for Fuzzy, which differs from the two above only in which
 // dictionary enumeration it expands through.
 inline std::shared_ptr<IPostings>
 perform_fuzzy_operation(const IInvertedIndex &inverted_index,
-                        const Expression &expr,
-                        const IScopeIndex *scope_index) {
+                        const Expression &expr, const IScopeIndex *scope_index,
+                        const IPostings *filter) {
   return perform_search_operation(
-      inverted_index, expand_fuzzy(inverted_index, expr), scope_index);
+      inverted_index, expand_fuzzy(inverted_index, expr), scope_index, filter);
 }
 
 inline std::shared_ptr<IPostings>
 perform_near_operation(const IInvertedIndex &inverted_index,
-                       const Expression &expr,
-                       const IScopeIndex *scope_index) {
+                       const Expression &expr, const IScopeIndex *scope_index,
+                       const IPostings *filter) {
   // Reused across candidate documents (assign() below), same as the And
   // path's scratch buffers: the callback runs once per document where all
   // cursors align, and this was its one remaining per-document allocation.
   std::vector<size_t> search_hit_cursors;
 
   return intersect_postings(
-      positings_list(inverted_index, expr.nodes, scope_index),
-      [&](const auto &positings_list, const auto &cursors,
-          size_t /*ordinal*/, auto &term_positions, auto &term_lengths) {
+      intersection_operands(inverted_index, expr.nodes, scope_index, filter)
+          .postings,
+      filter,
+      [&](const auto &positings_list, const auto &cursors, size_t /*ordinal*/,
+          auto &term_positions, auto &term_lengths) {
         search_hit_cursors.assign(positings_list.size(), 0);
 
         auto done = false;
@@ -4685,10 +4924,9 @@ perform_near_operation(const IInvertedIndex &inverted_index,
 // scope_index is null, or a candidate document has no scope data registered
 // for expr.scope_name, it contributes no matches -- the same "no match"
 // treatment as an empty And/Or operand, not an error.
-inline std::shared_ptr<IPostings>
-perform_same_scope_operation(const IInvertedIndex &inverted_index,
-                             const Expression &expr,
-                             const IScopeIndex *scope_index) {
+inline std::shared_ptr<IPostings> perform_same_scope_operation(
+    const IInvertedIndex &inverted_index, const Expression &expr,
+    const IScopeIndex *scope_index, const IPostings *filter) {
   if (!scope_index) {
     return std::make_shared<SearchResult>();
   }
@@ -4697,7 +4935,9 @@ perform_same_scope_operation(const IInvertedIndex &inverted_index,
   std::vector<size_t> search_hit_cursors;
 
   return intersect_postings(
-      positings_list(inverted_index, expr.nodes, scope_index),
+      intersection_operands(inverted_index, expr.nodes, scope_index, filter)
+          .postings,
+      filter,
       [&](const auto &positings_list, const auto &cursors, size_t ordinal,
           auto &term_positions, auto &term_lengths) {
         if (!scope_index->has_scope(expr.scope_name, ordinal)) {
@@ -4769,27 +5009,30 @@ perform_same_scope_operation(const IInvertedIndex &inverted_index,
 
 inline std::shared_ptr<IPostings>
 perform_search_operation(const IInvertedIndex &inverted_index,
-                         const Expression &expr,
-                         const IScopeIndex *scope_index) {
+                         const Expression &expr, const IScopeIndex *scope_index,
+                         const IPostings *filter) {
   switch (expr.operation) {
   case Operation::Term:
     return perform_term_operation(inverted_index, expr);
   case Operation::And:
-    return perform_and_operation(inverted_index, expr, scope_index);
+    return perform_and_operation(inverted_index, expr, scope_index, filter);
   case Operation::Adjacent:
-    return perform_adjacent_operation(inverted_index, expr, scope_index);
+    return perform_adjacent_operation(inverted_index, expr, scope_index,
+                                      filter);
   case Operation::Or:
-    return perform_or_operation(inverted_index, expr, scope_index);
+    return perform_or_operation(inverted_index, expr, scope_index, filter);
   case Operation::Near:
-    return perform_near_operation(inverted_index, expr, scope_index);
+    return perform_near_operation(inverted_index, expr, scope_index, filter);
   case Operation::SameScope:
-    return perform_same_scope_operation(inverted_index, expr, scope_index);
+    return perform_same_scope_operation(inverted_index, expr, scope_index,
+                                        filter);
   case Operation::Prefix:
-    return perform_prefix_operation(inverted_index, expr, scope_index);
+    return perform_prefix_operation(inverted_index, expr, scope_index, filter);
   case Operation::Wildcard:
-    return perform_wildcard_operation(inverted_index, expr, scope_index);
+    return perform_wildcard_operation(inverted_index, expr, scope_index,
+                                      filter);
   case Operation::Fuzzy:
-    return perform_fuzzy_operation(inverted_index, expr, scope_index);
+    return perform_fuzzy_operation(inverted_index, expr, scope_index, filter);
   default:
     return nullptr;
   }
