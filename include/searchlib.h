@@ -100,12 +100,14 @@ namespace detail {
 // independently. Both schema versions restarted from 0 when documents
 // became ordinal-addressed (see the note on IPostings::document_ordinal):
 // nothing had shipped on the earlier numbering, so there is no file to
-// migrate.
+// migrate. Compressed is at 1 since its expanded sections -- document term
+// counts, per-term frequencies, and the postings too short for Elias-Fano --
+// became varint instead of fixed-width fields.
 inline constexpr char kIndexMagic[4] = {'S', 'I', 'D', 'X'};
 inline constexpr uint32_t kFormatTypePlain = 0;
 inline constexpr uint32_t kFormatTypeCompressed = 1;
 inline constexpr uint32_t kSchemaVersionPlain = 0;
-inline constexpr uint32_t kSchemaVersionCompressed = 0;
+inline constexpr uint32_t kSchemaVersionCompressed = 1;
 
 // Opaque storage for InMemoryInvertedIndexBase's scope data (a map of
 // Elias-Fano encoded position->scope-ordinal sequences, one per
@@ -129,6 +131,35 @@ template <typename T> inline T read_scalar(std::istream &is) {
     throw std::runtime_error("searchlib: unexpected end of index stream");
   }
   return value;
+}
+
+// Variable-length integer: seven bits per byte, least significant first, the
+// top bit of each byte saying whether another follows. A value below 128 takes
+// one byte where a fixed-width field takes eight, which is what the Compressed
+// format's expanded sections are made of -- a document's term count, a term's
+// frequency, the gap between two ordinals. Fixed-width stays where a reader
+// has to address a field rather than read the section through (every header
+// tag, and the Plain format, whose whole point is decode simplicity).
+inline void write_varint(std::ostream &os, uint64_t value) {
+  while (value >= 0x80) {
+    write_scalar<uint8_t>(os, static_cast<uint8_t>(value) | 0x80);
+    value >>= 7;
+  }
+  write_scalar<uint8_t>(os, static_cast<uint8_t>(value));
+}
+
+inline uint64_t read_varint(std::istream &is) {
+  uint64_t value = 0;
+  for (int shift = 0;; shift += 7) {
+    if (shift >= 64) {
+      throw std::runtime_error("searchlib: malformed varint in index stream");
+    }
+    auto byte = read_scalar<uint8_t>(is);
+    value |= static_cast<uint64_t>(byte & 0x7f) << shift;
+    if (!(byte & 0x80)) {
+      return value;
+    }
+  }
 }
 
 inline void write_u32string(std::ostream &os, const std::u32string &s) {
@@ -1483,6 +1514,16 @@ public:
 
     void save(std::ostream &os) const;
     void load(std::istream &is);
+
+    // The same data as save(), delta-coded and varint-packed: ordinals
+    // ascend, and so do the positions within one entry, so what gets written
+    // are small gaps rather than 64-bit values. This is what the Compressed
+    // format uses for the postings below kCompressedPostingsThreshold, where
+    // Elias-Fano's fixed overhead would cost more than it saves. They load
+    // into the very same three arrays, so this changes the file and nothing
+    // else.
+    void save_varint(std::ostream &os) const;
+    void load_varint(std::istream &is);
 
     // Elias-Fano encoding of the same data as four monotone sequences:
     // the ordinals, the end offsets into the concatenated position array,
@@ -3435,8 +3476,7 @@ public:
     auto document_count = read_scalar<uint64_t>(is);
     term_counts_.reserve(static_cast<size_t>(document_count));
     for (uint64_t i = 0; i < document_count; i++) {
-      term_counts_.push_back(
-          static_cast<size_t>(read_scalar<uint64_t>(is)));
+      term_counts_.push_back(static_cast<size_t>(read_varint(is)));
     }
 
     // Term dictionary: the FST stays as the dictionary rather than being
@@ -3450,15 +3490,17 @@ public:
     terms_.resize(term_count);
     for (size_t i = 0; i < term_count; i++) {
       auto &term = terms_[i];
-      term.term_count = static_cast<size_t>(read_scalar<uint64_t>(is));
-      if (read_scalar<uint32_t>(is)) {
+      term.term_count = static_cast<size_t>(read_varint(is));
+      if (read_scalar<uint8_t>(is)) {
         auto postings = std::make_shared<EFPostings>();
         postings->load(is);
         term.postings = std::move(postings);
       } else {
+        // Below the threshold: varint on disk, expanded into the ordinary
+        // Postings here, exactly as InMemoryInvertedIndexBase::load does.
         auto postings =
             std::make_shared<InMemoryInvertedIndexBase::Postings>();
-        postings->load(is);
+        postings->load_varint(is);
         term.postings = std::move(postings);
       }
     }
@@ -5487,6 +5529,43 @@ inline void InMemoryInvertedIndexBase::Postings::load(std::istream &is) {
   }
 }
 
+inline void
+InMemoryInvertedIndexBase::Postings::save_varint(std::ostream &os) const {
+  detail::write_varint(os, document_ordinals_.size());
+  size_t previous_ordinal = 0;
+  for (size_t i = 0; i < document_ordinals_.size(); i++) {
+    detail::write_varint(os, document_ordinals_[i] - previous_ordinal);
+    previous_ordinal = document_ordinals_[i];
+    detail::write_varint(os, offsets_[i + 1] - offsets_[i]);
+    size_t previous_position = 0;
+    for (auto j = offsets_[i]; j < offsets_[i + 1]; j++) {
+      detail::write_varint(os, positions_[j] - previous_position);
+      previous_position = positions_[j];
+    }
+  }
+}
+
+inline void InMemoryInvertedIndexBase::Postings::load_varint(std::istream &is) {
+  auto entry_count = detail::read_varint(is);
+  document_ordinals_.clear();
+  offsets_.assign(1, 0);
+  positions_.clear();
+  document_ordinals_.reserve(static_cast<size_t>(entry_count));
+  offsets_.reserve(static_cast<size_t>(entry_count) + 1);
+  size_t previous_ordinal = 0;
+  for (uint64_t i = 0; i < entry_count; i++) {
+    previous_ordinal += static_cast<size_t>(detail::read_varint(is));
+    document_ordinals_.push_back(previous_ordinal);
+    auto position_count = detail::read_varint(is);
+    size_t previous_position = 0;
+    for (uint64_t j = 0; j < position_count; j++) {
+      previous_position += static_cast<size_t>(detail::read_varint(is));
+      positions_.push_back(previous_position);
+    }
+    offsets_.push_back(positions_.size());
+  }
+}
+
 inline void InMemoryInvertedIndexBase::Postings::save_compressed(
            std::ostream &os) const {
   // Everything becomes a monotone sequence and is Elias-Fano coded:
@@ -5886,10 +5965,17 @@ inline void InMemoryInvertedIndexBase::save(std::ostream &os,
   // each record is just the term count (the keys are a section of their own,
   // written by the owner of the KeyTable right after this core); a
   // tombstoned document is written like any other, since its ordinal must
-  // keep its slot for the postings that still name it.
+  // keep its slot for the postings that still name it. Compressed writes the
+  // counts as varint -- a document is tens of terms long, so a fixed u64
+  // spends seven bytes a document on leading zeros.
+  auto compact = format == IndexFormat::Compressed;
   detail::write_scalar<uint64_t>(os, documents_.size());
   for (const auto &document : documents_) {
-    detail::write_scalar<uint64_t>(os, document.term_count);
+    if (compact) {
+      detail::write_varint(os, document.term_count);
+    } else {
+      detail::write_scalar<uint64_t>(os, document.term_count);
+    }
   }
 
   // Term dictionary section, ordered by term string for deterministic output.
@@ -5916,22 +6002,23 @@ inline void InMemoryInvertedIndexBase::save(std::ostream &os,
   }
 
   for (const auto *term : terms) {
-    if (format != IndexFormat::Compressed) {
+    if (!compact) {
       detail::write_u32string(os, term->str);
-    }
-    detail::write_scalar<uint64_t>(os, term->term_count);
-    if (format == IndexFormat::Compressed) {
-      // Per-term representation flag; see kCompressedPostingsThreshold.
-      uint32_t compressed =
-          term->postings.size() >= detail::kCompressedPostingsThreshold;
-      detail::write_scalar<uint32_t>(os, compressed);
-      if (compressed) {
-        term->postings.save_compressed(os);
-      } else {
-        term->postings.save(os);
-      }
-    } else {
+      detail::write_scalar<uint64_t>(os, term->term_count);
       term->postings.save(os);
+      continue;
+    }
+    detail::write_varint(os, term->term_count);
+    // Per-term representation flag; see kCompressedPostingsThreshold. One
+    // byte, since it says one thing: Elias-Fano, or the varint postings used
+    // below the threshold.
+    bool elias_fano =
+        term->postings.size() >= detail::kCompressedPostingsThreshold;
+    detail::write_scalar<uint8_t>(os, elias_fano ? 1 : 0);
+    if (elias_fano) {
+      term->postings.save_compressed(os);
+    } else {
+      term->postings.save_varint(os);
     }
   }
 
@@ -5980,12 +6067,14 @@ inline void InMemoryInvertedIndexBase::save(std::ostream &os,
 
 inline void InMemoryInvertedIndexBase::load(std::istream &is,
                                             IndexFormat format) {
+  auto compact = format == IndexFormat::Compressed;
   documents_.clear();
   auto document_count = detail::read_scalar<uint64_t>(is);
   documents_.reserve(static_cast<size_t>(document_count));
   for (uint64_t i = 0; i < document_count; i++) {
-    documents_.push_back(
-        Document{static_cast<size_t>(detail::read_scalar<uint64_t>(is))});
+    documents_.push_back(Document{static_cast<size_t>(
+        compact ? detail::read_varint(is)
+                : detail::read_scalar<uint64_t>(is))});
   }
   // The running total is settled once the tombstones below are known.
   total_document_term_count_ = 0;
@@ -6005,22 +6094,20 @@ inline void InMemoryInvertedIndexBase::load(std::istream &is,
   }
 
   for (uint64_t i = 0; i < term_count; i++) {
-    auto str = format == IndexFormat::Compressed
-                   ? fst_terms[static_cast<size_t>(i)]
-                   : detail::read_u32string(is);
-    auto count = static_cast<size_t>(detail::read_scalar<uint64_t>(is));
+    auto str = compact ? fst_terms[static_cast<size_t>(i)]
+                       : detail::read_u32string(is);
+    auto count = static_cast<size_t>(compact
+                                         ? detail::read_varint(is)
+                                         : detail::read_scalar<uint64_t>(is));
     auto &term = term_dictionary_[str];
     term.str = str;
     term.term_count = count;
-    if (format == IndexFormat::Compressed) {
-      auto compressed = detail::read_scalar<uint32_t>(is);
-      if (compressed) {
-        term.postings.load_compressed(is);
-      } else {
-        term.postings.load(is);
-      }
-    } else {
+    if (!compact) {
       term.postings.load(is);
+    } else if (detail::read_scalar<uint8_t>(is)) {
+      term.postings.load_compressed(is);
+    } else {
+      term.postings.load_varint(is);
     }
   }
 

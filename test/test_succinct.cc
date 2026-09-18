@@ -1,7 +1,9 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <limits>
 #include <random>
+#include <sstream>
 #include <vector>
 
 #include <searchlib.h>
@@ -192,5 +194,55 @@ TEST(EliasFanoTest, Randomized) {
         ASSERT_EQ(expected, ef.next_geq(target));
       }
     }
+  }
+}
+
+
+// The varint codec the Compressed format's expanded sections are written
+// with (document term counts, per-term frequencies, the short postings).
+TEST(VarintTest, RoundTripsEveryWidth) {
+  std::vector<uint64_t> values = {0,
+                                  1,
+                                  127,
+                                  128,
+                                  129,
+                                  16383,
+                                  16384,
+                                  1ull << 32,
+                                  std::numeric_limits<uint64_t>::max() - 1,
+                                  std::numeric_limits<uint64_t>::max()};
+  std::stringstream ss;
+  for (auto v : values) {
+    searchlib::detail::write_varint(ss, v);
+  }
+  for (auto v : values) {
+    EXPECT_EQ(v, searchlib::detail::read_varint(ss));
+  }
+}
+
+// One byte per seven bits, so the small values these sections are full of
+// cost one byte where a fixed-width field costs eight.
+TEST(VarintTest, SpendsOneByteOnSmallValues) {
+  std::stringstream ss;
+  searchlib::detail::write_varint(ss, 127);
+  EXPECT_EQ(1u, ss.str().size());
+  searchlib::detail::write_varint(ss, 128);
+  EXPECT_EQ(3u, ss.str().size());
+}
+
+// A truncated or over-long sequence is a corrupt file, not a value: the
+// reader must say so rather than return a silently wrong number.
+TEST(VarintTest, RejectsMalformedInput) {
+  {
+    std::stringstream ss;
+    ss.write("\x80", 1); // continuation bit set, then nothing
+    EXPECT_THROW(searchlib::detail::read_varint(ss), std::runtime_error);
+  }
+  {
+    std::stringstream ss;
+    for (int i = 0; i < 11; i++) {
+      ss.write("\xff", 1); // more bytes than 64 bits can hold
+    }
+    EXPECT_THROW(searchlib::detail::read_varint(ss), std::runtime_error);
   }
 }

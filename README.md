@@ -247,8 +247,9 @@ loaded on the same platform that wrote it.
 ### Compressed format
 
 `IndexFormat::Compressed` (`format_type` 1) stores the postings and text
-ranges as Elias-Fano sequences and the term dictionary as an FST, which on
-the KJV corpus brings the index down to about 20% of the plain size:
+ranges as Elias-Fano sequences, the term dictionary as an FST, and everything
+that stays a plain integer as a varint, which on the KJV corpus brings the
+index down to about a tenth of the plain size (30.2 MB to 3.1 MB):
 
 ```cpp
 invidx.save("index.bin", {}, IndexFormat::Compressed);
