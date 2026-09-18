@@ -1484,9 +1484,9 @@ public:
     void save(std::ostream &os) const;
     void load(std::istream &is);
 
-    // Elias-Fano encoding of the same data: document_ids and the end
-    // offsets into a concatenated position array are stored as two
-    // monotone Elias-Fano sequences, the positions as fixed-width words
+    // Elias-Fano encoding of the same data as four monotone sequences:
+    // the ordinals, the end offsets into the concatenated position array,
+    // the positions made monotone by a per-entry base, and those bases
     // (docs/postings_compression_design.ja.md section 3). Only used for
     // postings long enough that the succinct-structure overhead pays off.
     void save_compressed(std::ostream &os) const;
@@ -3237,7 +3237,7 @@ inline bool within_edit_distance(const std::u32string &a,
 
 // IPostings served directly from the four Elias-Fano sequences written by
 // Postings::save_compressed, without expanding them (see
-// docs/postings_compression_design.ja.md section 5.5). Every accessor is an
+// docs/postings_compression_design.ja.md section 5). Every accessor is an
 // O(1) EF access; is_term_position uses next_geq on the monotonized
 // position sequence instead of a binary search over a materialized vector.
 class EFPostings : public IPostings {
@@ -5431,7 +5431,7 @@ InMemoryInvertedIndexBase::Postings::add_term_position(size_t ordinal,
   // Ordinals arrive in indexing order and each document's positions in
   // ascending order, so this is append-only: extend the current document's
   // slice, or open a new one. An ordinal below the last would mean a
-  // document was revisited, which allocate_ordinal rules out -- there used
+  // document was revisited, which push_document rules out -- there used
   // to be a sorted-insert path here for callers indexing out of order, and
   // it is gone with them.
   if (!document_ordinals_.empty() && document_ordinals_.back() == ordinal) {

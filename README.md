@@ -4,8 +4,8 @@ C++17 full-text search engine library (WIP. Far from release...)
 
 TODO:
 - [x] Save/load index to/from storage
-- [ ] Posting list compression
-- [ ] Search scope (document, section, paragraph)
+- [x] Posting list compression
+- [x] Search scope (document, section, paragraph)
 
 ## Installation
 
