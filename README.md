@@ -224,7 +224,7 @@ loaded on the same platform that wrote it.
 
 ### Compressed format
 
-`IndexFormat::Compressed` (`format_type` 2) stores the postings and text
+`IndexFormat::Compressed` (`format_type` 1) stores the postings and text
 ranges as Elias-Fano sequences and the term dictionary as an FST, which on
 the KJV corpus brings the index down to about 20% of the plain size:
 
