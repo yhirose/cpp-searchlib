@@ -1,8 +1,10 @@
 ﻿#include <gtest/gtest.h>
 #include <searchlib.h>
 
+#include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <optional>
 #include <sstream>
@@ -478,4 +480,149 @@ TEST(KJVTest, FilterPushdownMatchesPlainEvaluation) {
   }
   // Guards against a query set that matches nothing and so proves nothing.
   EXPECT_GT(documents, 1000u);
+}
+
+// bm25_top_k must rank exactly as perform_search, BM25Scorer and top_k do
+// together: the same documents in the same order, the same scores to the bit,
+// and a result that answers each ranked document's hits the same way.
+static void expect_same_ranking(const IInvertedIndex &index,
+                                const Expression &expr, size_t k,
+                                double k1 = 1.2, double b = 0.75) {
+  auto result = perform_search(index, expr);
+  BM25Scorer scorer(index, expr, k1, b);
+  auto expected =
+      top_k(*result, k, [&](size_t i) { return scorer(*result, i); });
+
+  auto ranked = bm25_top_k(index, expr, k, k1, b);
+  ASSERT_EQ(expected.size(), ranked.hits.size());
+  for (size_t i = 0; i < expected.size(); i++) {
+    SCOPED_TRACE(i);
+    auto e = expected[i].index;
+    auto a = ranked.hits[i].index;
+    ASSERT_LT(a, ranked.postings->size());
+    EXPECT_EQ(result->document_ordinal(e),
+              ranked.postings->document_ordinal(a));
+    // k1 = 0 scores every document NaN (an absent term adds 0 / 0), on both
+    // paths alike.
+    if (std::isnan(expected[i].score)) {
+      EXPECT_TRUE(std::isnan(ranked.hits[i].score));
+    } else {
+      EXPECT_EQ(expected[i].score, ranked.hits[i].score);
+    }
+    ASSERT_EQ(result->search_hit_count(e),
+              ranked.postings->search_hit_count(a));
+    for (size_t h = 0; h < result->search_hit_count(e); h++) {
+      EXPECT_EQ(result->term_position(e, h),
+                ranked.postings->term_position(a, h));
+      EXPECT_EQ(result->term_length(e, h), ranked.postings->term_length(a, h));
+    }
+  }
+}
+
+static void expect_same_rankings(const IInvertedIndex &index) {
+  const char *queries[] = {
+      // Or over terms: answered by MaxScore.
+      "leviathan | the",
+      "love | the | and",
+      "god | lord",
+      "peace | love | hope | faith",
+      "jesus | god | christ",
+      "the | and | of",
+      "leviathan",
+      "the",
+      "love | love",
+      "zzzzqqq | leviathan",
+      "zzzzqqq",
+      "(god | lord) | (jesus | christ)",
+      "sanctif*",
+      "lo* | the",
+      "l*viathan | god",
+      "leviathen~1 | lord",
+      // Anything else: answered the plain way.
+      "god lord",
+      "\"the lord\"",
+      "god -lord",
+      "god ~ lord",
+      "leviathan (the | and)",
+  };
+  for (auto query : queries) {
+    SCOPED_TRACE(query);
+    auto expr = parse_query(normalizer, query);
+    ASSERT_TRUE(expr);
+    for (size_t k : {1, 10, 100}) {
+      SCOPED_TRACE(k);
+      expect_same_ranking(index, *expr, k);
+    }
+  }
+
+  // Other BM25 parameters, and ones no bound holds for (k1 = 0), which fall
+  // back to the plain way.
+  auto expr = parse_query(normalizer, "leviathan | god | the");
+  ASSERT_TRUE(expr);
+  expect_same_ranking(index, *expr, 10, 2.0, 0.3);
+  expect_same_ranking(index, *expr, 10, 0.5, 1.0);
+  expect_same_ranking(index, *expr, 10, 1.2, 0.0);
+  expect_same_ranking(index, *expr, 10, 0.0, 0.75);
+}
+
+TEST(KJVTest, BM25TopKMatchesPlainRanking) {
+  const auto &invidx = kjv_index();
+  expect_same_rankings(invidx);
+
+  std::stringstream compressed(std::ios::in | std::ios::out | std::ios::binary);
+  invidx.save(compressed, {}, IndexFormat::Compressed);
+  auto loaded = load_compressed_index(compressed);
+  expect_same_rankings(*loaded);
+}
+
+// Removed documents are skipped by MaxScore's walk as perform_search skips
+// them, on both backends. Every seventh document goes, which takes out some
+// of each query's best.
+TEST(KJVTest, BM25TopKMatchesPlainRankingWithRemovals) {
+  auto invidx = kjv_index();
+  std::vector<size_t> keys;
+  for (size_t ordinal = 0; ordinal < invidx.document_count(); ordinal += 7) {
+    keys.push_back(invidx.document_key(ordinal));
+  }
+  for (auto key : keys) {
+    invidx.remove_document(key);
+  }
+  ASSERT_TRUE(invidx.has_removed_documents());
+  expect_same_rankings(invidx);
+
+  std::stringstream compressed(std::ios::in | std::ios::out | std::ios::binary);
+  invidx.save(compressed, {}, IndexFormat::Compressed);
+  auto loaded = load_compressed_index(compressed);
+  ASSERT_TRUE(loaded->has_removed_documents());
+  expect_same_rankings(*loaded);
+}
+
+// Runs of identical documents put many equal scores on the k-th place, where
+// which of them survive depends on the order hits reach the heap. MaxScore
+// skips documents, so it only agrees with top_k if every document it skips
+// is one top_k would not have let in either.
+TEST(KJVTest, BM25TopKKeepsTheSameTies) {
+  InMemoryInvertedIndex<TextRange> invidx;
+  {
+    InMemoryIndexer indexer(invidx, normalizer);
+    const char *texts[] = {"apple banana",       "apple",  "banana cherry",
+                           "cherry apple apple", "durian", "apple banana"};
+    size_t key = 0;
+    for (int round = 0; round < 40; round++) {
+      for (auto text : texts) {
+        indexer.index_document(key++, UTF8PlainTextTokenizer(text));
+      }
+    }
+  }
+  for (auto query : {"apple | banana | cherry", "apple | durian", "cherry",
+                     "banana | durian"}) {
+    SCOPED_TRACE(query);
+    auto expr = parse_query(normalizer, query);
+    ASSERT_TRUE(expr);
+    for (size_t k : {size_t(1), size_t(3), size_t(7), size_t(25), size_t(60),
+                     size_t(1000), std::numeric_limits<size_t>::max()}) {
+      SCOPED_TRACE(k);
+      expect_same_ranking(invidx, *expr, k);
+    }
+  }
 }

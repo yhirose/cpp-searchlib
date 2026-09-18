@@ -334,8 +334,8 @@ int main(int argc, char **argv) {
   const IInvertedIndex &index =
       loaded ? static_cast<const IInvertedIndex &>(*loaded) : invidx;
 
-  std::printf("\n%-24s %10s %10s %10s %10s %10s\n", "query", "hits",
-              "search_us", "score_us", "scorer_us", "top10_us");
+  std::printf("\n%-24s %10s %10s %10s %10s %10s %10s\n", "query", "hits",
+              "search_us", "score_us", "scorer_us", "top10_us", "bm25k_us");
 
   for (const auto &query : queries) {
     auto parsed = splitter ? parse_query(splitter, to_term_filter(normalizer),
@@ -397,7 +397,16 @@ int main(int argc, char **argv) {
     } else {
       std::printf("%10.2f ", score_us);
     }
-    std::printf("%10.2f %10.2f\n", scorer_us, top10_us);
+    // The same top 10 through bm25_top_k, which ranks an Or of terms by
+    // MaxScore instead of scoring every match.
+    auto bm25k_us = best_of(runs, [&] {
+      auto ranked = bm25_top_k(index, expr, 10);
+      if (ranked.hits.size() == 999) {
+        std::printf(" ");
+      }
+    });
+
+    std::printf("%10.2f %10.2f %10.2f\n", scorer_us, top10_us, bm25k_us);
   }
 
   return 0;

@@ -746,6 +746,10 @@ double bm25_score(const IInvertedIndex &invidx, const Expression &expr,
                   const IPostings &postings, size_t index, double k1 = 1.2,
                   double b = 0.75);
 
+namespace detail {
+struct MaxScore;
+}
+
 // Same BM25 score as bm25_score, but with the per-term state -- the postings
 // list and the idf -- resolved once at construction rather than once per
 // scored hit. bm25_score reaches both through the term dictionary on every
@@ -775,6 +779,14 @@ public:
   double operator()(const IPostings &postings, size_t index) const;
 
 private:
+  // bm25_top_k's MaxScore walk reads the terms and scores by ordinal.
+  friend struct detail::MaxScore;
+
+  // operator() for a document given by ordinal rather than by its place in
+  // a result, with the same arithmetic, so the two agree to the bit. Same
+  // rule as operator(): ordinals ascending across calls.
+  double score_ordinal_(size_t ordinal) const;
+
   struct TermState {
     std::shared_ptr<const IPostings> postings;
     double idf;
@@ -840,6 +852,61 @@ struct ScoredHit {
   double score;
 };
 
+namespace detail {
+
+// top_k's bounded min-heap, on its own so that bm25_top_k keeps the same k
+// hits top_k would. Which of several equal lowest scores an eviction drops
+// depends on the heap's layout, so agreeing on ties means feeding the same
+// hits, in the same order, to the same heap.
+class TopKCollector {
+public:
+  TopKCollector(size_t k, size_t count) : k_(k) {
+    heap_.reserve(std::min(count, k));
+  }
+
+  // Whether k hits are held; only then does threshold() mean anything.
+  bool full() const { return heap_.size() == k_; }
+
+  // The lowest score held. Once full(), a hit gets in only by scoring
+  // strictly more than this.
+  double threshold() const { return heap_.front().score; }
+
+  void offer(size_t index, double score) {
+    if (heap_.size() < k_) {
+      heap_.push_back(ScoredHit{index, score});
+      std::push_heap(heap_.begin(), heap_.end(), min_heap_order);
+    } else if (score > heap_.front().score) {
+      std::pop_heap(heap_.begin(), heap_.end(), min_heap_order);
+      heap_.back() = ScoredHit{index, score};
+      std::push_heap(heap_.begin(), heap_.end(), min_heap_order);
+    }
+  }
+
+  // The hits held, by descending score, ties by ascending index.
+  std::vector<ScoredHit> take_sorted() {
+    std::sort(heap_.begin(), heap_.end(),
+              [](const ScoredHit &a, const ScoredHit &b) {
+                if (a.score != b.score) {
+                  return a.score > b.score;
+                }
+                return a.index < b.index;
+              });
+    return std::move(heap_);
+  }
+
+private:
+  // Heap top is the smallest score currently kept, so it's the first
+  // candidate to evict when a better-scoring hit shows up.
+  static bool min_heap_order(const ScoredHit &a, const ScoredHit &b) {
+    return a.score > b.score;
+  }
+
+  size_t k_;
+  std::vector<ScoredHit> heap_;
+};
+
+} // namespace detail
+
 // Collects the k highest-scoring hits out of [0, count) using a bounded
 // min-heap, i.e. O(count * log k) instead of the naive "score everything,
 // then sort everything" O(count * log count). score_fn(i) computes the
@@ -847,37 +914,14 @@ struct ScoredHit {
 // sorted by descending score, ties broken by ascending index.
 template <typename ScoreFn>
 std::vector<ScoredHit> top_k(size_t count, size_t k, ScoreFn score_fn) {
-  std::vector<ScoredHit> heap;
   if (k == 0 || count == 0) {
-    return heap;
+    return {};
   }
-  heap.reserve(std::min(count, k));
-
-  // Heap top is the smallest score currently kept, so it's the first
-  // candidate to evict when a better-scoring hit shows up.
-  auto min_heap_order = [](const ScoredHit &a, const ScoredHit &b) {
-    return a.score > b.score;
-  };
-
+  detail::TopKCollector collector(k, count);
   for (size_t i = 0; i < count; i++) {
-    double score = static_cast<double>(score_fn(i));
-    if (heap.size() < k) {
-      heap.push_back(ScoredHit{i, score});
-      std::push_heap(heap.begin(), heap.end(), min_heap_order);
-    } else if (score > heap.front().score) {
-      std::pop_heap(heap.begin(), heap.end(), min_heap_order);
-      heap.back() = ScoredHit{i, score};
-      std::push_heap(heap.begin(), heap.end(), min_heap_order);
-    }
+    collector.offer(i, static_cast<double>(score_fn(i)));
   }
-
-  std::sort(heap.begin(), heap.end(), [](const ScoredHit &a, const ScoredHit &b) {
-    if (a.score != b.score) {
-      return a.score > b.score;
-    }
-    return a.index < b.index;
-  });
-  return heap;
+  return collector.take_sorted();
 }
 
 // Convenience overload for the common case of ranking a single IPostings
@@ -890,6 +934,46 @@ std::vector<ScoredHit> top_k(const IPostings &postings, size_t k,
                              ScoreFn score_fn) {
   return top_k(postings.size(), k, std::move(score_fn));
 }
+
+// What bm25_top_k returns: the ranked hits, and a result to read them from.
+struct RankedResult {
+  // Holds every ranked document with the hits and positions perform_search
+  // would give it, so it reads exactly like a perform_search result
+  // (text_range included). It may hold other matching documents too, so its
+  // size() is not the number of matches.
+  std::shared_ptr<IPostings> postings;
+  // Best first, ties by ascending index; each index is into `postings`.
+  std::vector<ScoredHit> hits;
+};
+
+// The k best documents for expr by BM25, ranked:
+//
+//   auto ranked = bm25_top_k(invidx, *expr, 10);
+//   for (const auto &hit : ranked.hits) {
+//     auto key = invidx.document_key(
+//         ranked.postings->document_ordinal(hit.index));
+//     // hit.score, invidx.text_range(*ranked.postings, hit.index, 0), ...
+//   }
+//
+// The same documents, scores (to the bit) and order, ties included, as
+//
+//   auto result = perform_search(invidx, expr);
+//   BM25Scorer scorer(invidx, expr, k1, b);
+//   top_k(*result, k, [&](size_t i) { return scorer(*result, i); });
+//
+// but, for a query that is an Or of terms (a bare term, and Prefix,
+// Wildcard and Fuzzy, which expand to one, included), without scoring every
+// match: it runs MaxScore, skipping every document whose best possible
+// score cannot beat the k-th best found so far, and every document that
+// carries only terms too weak to beat it. Any other query -- one with an
+// And, a phrase, a Near or a Not -- is answered exactly as above.
+//
+// Takes no IScopeIndex, so a query with a SameScope node matches nothing
+// here, as it does in perform_search without one. Lifetime and threading as
+// for perform_search and BM25Scorer: the result aliases the index, and one
+// call's result belongs to one thread.
+RankedResult bm25_top_k(const IInvertedIndex &invidx, const Expression &expr,
+                        size_t k, double k1 = 1.2, double b = 0.75);
 
 //-----------------------------------------------------------------------------
 // Federated Search
@@ -6231,18 +6315,33 @@ inline Expression expand_fuzzy(const IInvertedIndex &inverted_index,
   return expanded;
 }
 
+namespace detail {
+
+// perform_search under a filter (see perform_search_operation): what
+// bm25_top_k builds its result with, so that result stays exactly what
+// perform_search would give.
 inline std::shared_ptr<IPostings>
-perform_search(const IInvertedIndex &inverted_index, const Expression &expr,
-               const IScopeIndex *scope_index) {
+perform_filtered_search(const IInvertedIndex &inverted_index,
+                        const Expression &expr, const IScopeIndex *scope_index,
+                        const IPostings *filter) {
   auto result =
-      detail::perform_search_operation(inverted_index, expr, scope_index);
+      perform_search_operation(inverted_index, expr, scope_index, filter);
   // Exclude logically-deleted documents from the final result. Skipped
   // entirely when the index has no tombstones, so the common path is free.
   if (result && inverted_index.has_removed_documents()) {
-    return std::make_shared<detail::FilteredPostings>(inverted_index,
-                                                      std::move(result));
+    return std::make_shared<FilteredPostings>(inverted_index,
+                                              std::move(result));
   }
   return result;
+}
+
+} // namespace detail
+
+inline std::shared_ptr<IPostings>
+perform_search(const IInvertedIndex &inverted_index, const Expression &expr,
+               const IScopeIndex *scope_index) {
+  return detail::perform_filtered_search(inverted_index, expr, scope_index,
+                                         nullptr);
 }
 
 inline size_t term_count_score(const IInvertedIndex &invidx,
@@ -6361,6 +6460,260 @@ inline double BM25Scorer::operator()(const IPostings &postings,
   }
   return score_(result_window_, index,
                 [&](size_t t) -> PostingsWindow & { return windows_[t]; });
+}
+
+inline double BM25Scorer::score_ordinal_(size_t ordinal) const {
+  // score_ asks its result for the ordinal at an index; this one has the
+  // single document.
+  struct Document {
+    size_t ordinal;
+    size_t document_ordinal(size_t) const { return ordinal; }
+  } document{ordinal};
+  if (!windowed_) {
+    return score_(document, 0, [&](size_t t) -> const IPostings & {
+      return *terms_[t].postings;
+    });
+  }
+  return score_(document, 0,
+                [&](size_t t) -> PostingsWindow & { return windows_[t]; });
+}
+
+namespace detail {
+
+// Whether expr matches exactly the union of the terms BM25Scorer scores for
+// it: an Or over terms, at any depth, where Prefix, Wildcard and Fuzzy count
+// as the Or they expand to. That is what lets bm25_top_k enumerate the
+// candidates from the scored terms' own postings.
+inline bool is_term_disjunction(const Expression &expr) {
+  switch (expr.operation) {
+  case Operation::Term:
+  case Operation::Prefix:
+  case Operation::Wildcard:
+  case Operation::Fuzzy:
+    return true;
+  case Operation::Or:
+    return std::all_of(
+        expr.nodes.begin(), expr.nodes.end(),
+        [](const auto &node) { return is_term_disjunction(node); });
+  default:
+    return false;
+  }
+}
+
+// MaxScore (Turtle & Flaherty 1995) over the terms a BM25Scorer scores. Each
+// term gets an upper bound on what it can add to a document's score, the
+// terms are ordered by it, and once k hits are held, the weakest terms whose
+// bounds together cannot beat the k-th best score become non-essential:
+// a document carrying only those cannot get in, so only the other terms'
+// documents are enumerated, and the weak terms are merely looked up in
+// them. A candidate is dropped as soon as its bound falls to the k-th best,
+// and only survivors are scored, by the scorer itself.
+struct MaxScore {
+  // The k best hits, with each ScoredHit::index an ordinal. nullopt when the
+  // scorer's parameters leave no bound to prune with (k1 <= 0 makes an
+  // absent term's contribution 0/0; b outside [0, 1] or an empty corpus's
+  // avgdl of 0 break the monotonicity the bounds rest on).
+  static std::optional<std::vector<ScoredHit>>
+  top_k(const IInvertedIndex &invidx, const BM25Scorer &scorer, size_t k) {
+    auto k1 = scorer.k1_;
+    auto b = scorer.b_;
+    auto avgdl = scorer.avgdl_;
+    if (!(k1 > 0.0 && b >= 0.0 && b <= 1.0 && avgdl > 0.0)) {
+      return std::nullopt;
+    }
+
+    // BM25Scorer::score_'s arithmetic for one term a document carries.
+    auto contribution = [&](double idf, size_t count, size_t length) {
+      auto dl = static_cast<double>(length);
+      auto tf = static_cast<double>(count) / dl;
+      return idf *
+             ((tf * (k1 + 1.0)) / (tf + k1 * (1.0 - b + b * (dl / avgdl))));
+    };
+
+    constexpr auto kEnd = std::numeric_limits<size_t>::max();
+    struct List {
+      PostingsWindow window;
+      size_t size;
+      size_t cursor;
+      // The ordinal at `cursor`, or kEnd past the last: the walk compares it
+      // several times per document, and each read through a vector-backed
+      // window is a virtual call.
+      size_t ordinal;
+      double idf;
+      // The most this term adds to any document, and never below 0, which
+      // is what it adds to a document without it.
+      double bound;
+    };
+    // Re-reads the ordinal at a list's cursor after the cursor moves.
+    auto settle = [&](List &list) {
+      list.ordinal = list.cursor < list.size
+                         ? list.window.document_ordinal(list.cursor)
+                         : kEnd;
+    };
+    std::vector<List> lists;
+    lists.reserve(scorer.terms_.size());
+    // At least as many as the documents the walk can reach, which is all the
+    // collector needs to size itself for a k larger than that.
+    size_t candidates = 0;
+    // How far apart a bound and the scorer's own sum over the same terms can
+    // round: each term adds at most |idf| * (k1 + 1).
+    double magnitude = 1.0;
+    for (const auto &term : scorer.terms_) {
+      // A term with idf <= 0 (in more than half the documents) never adds
+      // anything positive, so its bound is 0 with no need to look. The
+      // others take one pass over their postings: a bound from idf alone,
+      // idf * (k1 + 1), is what tf saturates to, but tf here is a share of
+      // the document's length and saturates nowhere near it -- on KJV the
+      // real maximum is 7% to 59% of that, and so loose a bound prunes
+      // next to nothing.
+      double bound = 0.0;
+      if (scorer.terms_.size() == 1) {
+        // With one term there is nothing to skip to: its bound would only
+        // ever end the walk at the last document, and finding it is a whole
+        // extra pass over the list. Each document's own contribution still
+        // prunes it before the scorer runs.
+        bound = std::numeric_limits<double>::infinity();
+      } else if (term.idf > 0.0) {
+        PostingsWindow scan(term.postings.get());
+        for (size_t i = 0; i < term.size; i++) {
+          auto count = scan.search_hit_count(i);
+          auto length = invidx.document_term_count(scan.document_ordinal(i));
+          bound = std::max(bound, contribution(term.idf, count, length));
+        }
+      }
+      lists.push_back(List{PostingsWindow(term.postings.get()), term.size, 0,
+                           kEnd, term.idf, bound});
+      settle(lists.back());
+      magnitude += std::abs(term.idf) * (k1 + 1.0);
+      candidates += term.size;
+    }
+
+    // The lists by ascending bound, and what the first j of them can add
+    // together: the lists before `essential` are the non-essential ones.
+    auto term_count = lists.size();
+    std::vector<size_t> order(term_count);
+    std::iota(order.begin(), order.end(), size_t(0));
+    std::stable_sort(order.begin(), order.end(), [&](size_t x, size_t y) {
+      return lists[x].bound < lists[y].bound;
+    });
+    std::vector<double> prefix(term_count + 1, 0.0);
+    for (size_t j = 0; j < term_count; j++) {
+      prefix[j + 1] = prefix[j] + lists[order[j]].bound;
+    }
+    size_t essential = 0;
+
+    TopKCollector collector(k, candidates);
+    // Whether a document whose score is at most `bound` cannot get in. The
+    // bound and the scorer sum the same terms in different orders, so it
+    // must clear the threshold by more than their rounding can differ.
+    auto slack = magnitude * 1e-9;
+    auto cannot_enter = [&](double bound) {
+      return collector.full() && bound + slack <= collector.threshold();
+    };
+    auto removals = invidx.has_removed_documents();
+
+    for (;;) {
+      // The next document any essential list names.
+      auto ordinal = kEnd;
+      for (auto j = essential; j < term_count; j++) {
+        ordinal = std::min(ordinal, lists[order[j]].ordinal);
+      }
+      if (ordinal == kEnd) {
+        break;
+      }
+
+      // Its bound: exact for the essential terms it carries, their whole
+      // bound for the non-essential ones.
+      auto length = invidx.document_term_count(ordinal);
+      auto bound = prefix[essential];
+      for (auto j = essential; j < term_count; j++) {
+        auto &list = lists[order[j]];
+        if (list.ordinal == ordinal) {
+          bound += contribution(
+              list.idf, list.window.search_hit_count(list.cursor), length);
+        }
+      }
+      // Then the non-essential terms, strongest first, each bound traded for
+      // the exact contribution, until it is out or the terms run out.
+      auto out = cannot_enter(bound);
+      for (auto j = essential; !out && j-- > 0;) {
+        auto &list = lists[order[j]];
+        bound -= list.bound;
+        if (list.ordinal < ordinal) {
+          list.cursor = list.window.advance(list.cursor, ordinal);
+          settle(list);
+        }
+        if (list.ordinal == ordinal) {
+          bound += contribution(
+              list.idf, list.window.search_hit_count(list.cursor), length);
+        }
+        out = cannot_enter(bound);
+      }
+      if (!out && !(removals && invidx.is_document_removed(ordinal))) {
+        collector.offer(ordinal, scorer.score_ordinal_(ordinal));
+      }
+
+      for (auto j = essential; j < term_count; j++) {
+        auto &list = lists[order[j]];
+        if (list.ordinal == ordinal) {
+          list.cursor++;
+          settle(list);
+        }
+      }
+      // The threshold only rises, so the non-essential lists only grow.
+      while (essential < term_count && cannot_enter(prefix[essential + 1])) {
+        essential++;
+      }
+    }
+
+    return collector.take_sorted();
+  }
+};
+
+} // namespace detail
+
+inline RankedResult bm25_top_k(const IInvertedIndex &invidx,
+                               const Expression &expr, size_t k, double k1,
+                               double b) {
+  BM25Scorer scorer(invidx, expr, k1, b);
+  if (k > 0 && detail::is_term_disjunction(expr)) {
+    if (auto hits = detail::MaxScore::top_k(invidx, scorer, k)) {
+      // The ranked documents' result entries, from perform_search's own
+      // evaluation pushed down to just these documents (see the filter on
+      // perform_search_operation), so they carry the same hits. A Term's
+      // result is its postings whatever the filter, so it gets none.
+      std::shared_ptr<IPostings> postings;
+      if (expr.operation == Operation::Term) {
+        postings =
+            detail::perform_filtered_search(invidx, expr, nullptr, nullptr);
+      } else {
+        std::vector<size_t> ordinals;
+        ordinals.reserve(hits->size());
+        for (const auto &hit : *hits) {
+          ordinals.push_back(hit.index);
+        }
+        std::sort(ordinals.begin(), ordinals.end());
+        detail::SearchResult filter;
+        std::vector<size_t> none;
+        for (auto ordinal : ordinals) {
+          filter.push_back(ordinal, none, none);
+        }
+        postings =
+            detail::perform_filtered_search(invidx, expr, nullptr, &filter);
+      }
+      for (auto &hit : *hits) {
+        hit.index =
+            detail::find_postings_index_for_ordinal(*postings, hit.index);
+        assert(hit.index < postings->size());
+      }
+      return RankedResult{std::move(postings), std::move(*hits)};
+    }
+  }
+
+  auto postings = perform_search(invidx, expr);
+  auto hits =
+      top_k(*postings, k, [&](size_t i) { return scorer(*postings, i); });
+  return RankedResult{std::move(postings), std::move(hits)};
 }
 
 //-----------------------------------------------------------------------------
