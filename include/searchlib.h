@@ -4465,14 +4465,18 @@ perform_and_operation(const IInvertedIndex &inverted_index,
   for_each_intersection(
       positive_postings_list, [&](const auto &, size_t ordinal) {
         // Exclude documents that appear in any negative postings. Both sides
-        // are iterated in ascending document id order.
+        // are iterated in ascending document id order, so a negative cursor
+        // only moves forward -- and it jumps rather than steps, because the
+        // positive side is typically the sparse one (`rare -common`), where
+        // stepping walked the whole negative list: 494us -> 2us on KJV x10.
         for (size_t slot = 0; slot < negative_postings_list.size(); slot++) {
           const auto &p = negative_postings_list[slot];
           auto &cursor = negative_cursors[slot];
-          while (cursor < p->size() && p->document_ordinal(cursor) < ordinal) {
-            cursor++;
+          auto size = p->size();
+          if (cursor < size && p->document_ordinal(cursor) < ordinal) {
+            cursor = p->advance(cursor, ordinal);
           }
-          if (cursor < p->size() && p->document_ordinal(cursor) == ordinal) {
+          if (cursor < size && p->document_ordinal(cursor) == ordinal) {
             return;
           }
         }
