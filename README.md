@@ -195,10 +195,11 @@ for (const auto &hit : hits) {
 
 `bm25_top_k` searches and ranks in one call, and returns the same
 documents, scores and order as the code above (each `hit.index` is into
-`ranked.postings`). When the query is an Or of terms
-(including `foo*`, wildcard and fuzzy terms, which expand to one), it uses
-MaxScore: it skips documents that cannot make the top k instead of scoring
-every match. Any other query is ranked the same way as above.
+`ranked.postings`). For an OR of terms (`|`, and `app*`, wildcard and fuzzy
+terms, which expand to one), it uses MaxScore: it skips documents that
+cannot make the top k instead of scoring every match. Any other query,
+including a plain `apple banana` AND, is ranked exactly as above, so the
+speedup is for OR queries only.
 
 ```cpp
 auto ranked = bm25_top_k(invidx, *expr, 10);
@@ -211,7 +212,8 @@ for (const auto &hit : ranked.hits) {
 ```
 
 `ranked.postings` holds every ranked document, but not necessarily every
-match, so its `size()` is not a match count.
+match, so its `size()` is not a match count. When you need the match count,
+or a score other than BM25, use the steps above.
 
 ## Persistence
 
