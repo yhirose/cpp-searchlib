@@ -111,7 +111,8 @@ TEST(PerfTest, ScorerDoesNotScaleWithVocabulary) {
   // Five "zqx..." terms spread over kHits documents, plus `vocabulary`
   // single-use filler terms. The postings actually being scored are
   // identical in both indexes; only the surrounding dictionary differs.
-  auto build = [](size_t vocabulary) {
+  // [&]: MSVC does not let a lambda read a constexpr local without a capture.
+  auto build = [&](size_t vocabulary) {
     InMemoryInvertedIndex<TextRange> invidx;
     InMemoryIndexer indexer(invidx, perf_normalizer);
     size_t document_key = 0;
