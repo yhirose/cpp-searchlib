@@ -41,3 +41,7 @@ vendor-update *name:
 # Remove the build directory
 clean:
     rm -rf {{build_dir}}
+
+# Release a new version (dry run by default; `just release --run` to publish)
+release *args:
+    @./scripts/release.sh {{args}}

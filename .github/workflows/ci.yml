@@ -1,0 +1,29 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+    - uses: actions/checkout@v6
+
+    # The build directory has to be ./build: the tests read the model and the
+    # corpora by paths relative to build/test (test/test_segment.cc's
+    # MODEL_PATH, test/test_kjv.cc), the same way `just test` runs them.
+    - name: Configure
+      shell: bash
+      run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+    - name: Build
+      shell: bash
+      run: cmake --build build --config Release --parallel
+
+    - name: Test
+      shell: bash
+      run: ctest --test-dir build -C Release --output-on-failure

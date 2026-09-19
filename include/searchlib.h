@@ -18,6 +18,9 @@
 
 #pragma once
 
+#define CPPSEARCHLIB_VERSION "0.1.0"
+#define CPPSEARCHLIB_VERSION_NUM "0x000100"
+
 #include <algorithm>
 #include <array>
 #include <cassert>
