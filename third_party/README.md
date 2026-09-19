@@ -10,7 +10,7 @@ with no argument checks and updates all of them); see
 
 | Directory      | Upstream          | Tracks           |
 |----------------|--------------------|-------------------|
-| `fstlib/`      | cpp-fstlib         | branch tip (no tags) |
+| `fstlib/`      | cpp-fstlib         | latest `vX.Y.Z` tag |
 | `peglib/`      | cpp-peglib         | latest `vX.Y.Z` tag |
 | `unicodelib/`  | cpp-unicodelib     | branch tip (no tags) |
 | `segmentlib/`  | cpp-segmentlib     | latest `vX.Y.Z` tag |

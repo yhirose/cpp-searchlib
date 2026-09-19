@@ -1,7 +1,7 @@
 # cpp-segmentlib (vendored)
 
 Upstream: https://github.com/yhirose/cpp-segmentlib
-Revision: v0.1.0
+Revision: v0.2.0
 
 Japanese word segmentation (KyTea-compatible and MLP backends), for the CJK
 tokenization the built-in `UTF8PlainTextTokenizer` cannot do: it splits on

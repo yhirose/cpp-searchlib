@@ -12,6 +12,8 @@
 #include <variant>
 #include <vector>
 
+#include "segmentlib/ed/ed_backend.h"
+#include "segmentlib/ed/model.h"
 #include "segmentlib/kytea/kytea_backend.h"
 #include "segmentlib/kytea/model.h"
 #include "segmentlib/mlp/mlp_backend.h"
@@ -81,7 +83,7 @@ std::vector<Expected<Result, Error>> run_batch(Span<const std::string_view> text
 }  // namespace detail
 
 // The public segmentation API. A Segmenter owns one backend and dispatches to
-// it; the backend type is hidden from callers. KyTea-compatible and MLP
+// it; the backend type is hidden from callers. KyTea-compatible, MLP and EDLA
 // backends exist today; Vaporetto will join the variant later.
 //
 // Thread safety: a loaded Segmenter is immutable, and the per-call scratch
@@ -90,26 +92,41 @@ std::vector<Expected<Result, Error>> run_batch(Span<const std::string_view> text
 // way to share one: load once, then hand out `const Segmenter&`.
 class Segmenter {
 public:
-    // Loads a model, auto-detecting its format: a "SegmentLibMLP " header
-    // line selects the MLP backend (design.ja.md 4.7), anything else is
-    // treated as a KyTea binary model.
+    // Loads a model, auto-detecting its format: a "SegmentLibMLP " header line
+    // selects the MLP backend (design.ja.md 4.7) and "SegmentLibED " the EDLA
+    // one, anything else is treated as a KyTea binary model.
     static Expected<Segmenter, Error> load(const std::filesystem::path& model_path) {
-        // Auto-detection by the file's leading bytes: the MLP format opens with
-        // its ASCII signature line (design.ja.md 4.7); KyTea models start with
-        // "KyTea " and anything unrecognized falls through to the KyTea loader's
-        // own diagnostics. (Vaporetto's zstd magic joins here later.)
+        // Auto-detection by the file's leading bytes: the native formats open
+        // with an ASCII signature line (design.ja.md 4.7); KyTea models start
+        // with "KyTea " and anything unrecognized falls through to the KyTea
+        // loader's own diagnostics. (Vaporetto's zstd magic joins here later.)
+        //
+        // The signatures differ in length, so this reads the longest one and
+        // compares each candidate over its own length — a short file simply
+        // matches nothing rather than reading past what was read.
         std::ifstream in(model_path, std::ios::binary);
         if (!in) {
             return Unexpected(Error{ErrorCode::IoError, "cannot open model file"});
         }
-        std::string head(mlp::kModelSignature.size(), '\0');
+        constexpr std::size_t kMaxSignature =
+            mlp::kModelSignature.size() > ed::kModelSignature.size()
+                ? mlp::kModelSignature.size()
+                : ed::kModelSignature.size();
+        std::string head(kMaxSignature, '\0');
         in.read(head.data(), static_cast<std::streamsize>(head.size()));
-        if (in.gcount() == static_cast<std::streamsize>(head.size()) &&
-            head == mlp::kModelSignature) {
-            in.close();
+        const auto got = static_cast<std::size_t>(in.gcount());
+        in.close();
+
+        const auto starts_with = [&](std::string_view signature) {
+            return got >= signature.size() &&
+                   std::string_view(head).substr(0, signature.size()) == signature;
+        };
+        if (starts_with(mlp::kModelSignature)) {
             return load_mlp(model_path);
         }
-        in.close();
+        if (starts_with(ed::kModelSignature)) {
+            return load_ed(model_path);
+        }
         return load_kytea(model_path);
     }
 
@@ -129,6 +146,15 @@ public:
             return Unexpected(model.error());
         }
         return Segmenter(mlp::MlpBackend(std::move(*model)));
+    }
+
+    // Loads a model, forcing the EDLA backend.
+    static Expected<Segmenter, Error> load_ed(const std::filesystem::path& model_path) {
+        auto model = ed::Model::load(model_path);
+        if (!model) {
+            return Unexpected(model.error());
+        }
+        return Segmenter(ed::EdBackend(std::move(*model)));
     }
 
     // Move-only. A Segmenter owns its model outright — 128 MB for the
@@ -159,7 +185,8 @@ public:
     }
 
 private:
-    using AnyBackend = std::variant<kytea::KyteaBackend, mlp::MlpBackend>;
+    using AnyBackend =
+        std::variant<kytea::KyteaBackend, mlp::MlpBackend, ed::EdBackend>;
 
     explicit Segmenter(AnyBackend backend) noexcept : backend_(std::move(backend)) {}
 

@@ -2,7 +2,7 @@
 # Updates the vendored copy of cpp-peglib (third_party/peglib) to the newest
 # release tag, and records it in README.md.
 #
-# Unlike fstlib/unicodelib, upstream tags releases (vX.Y.Z), so this tracks
+# Unlike unicodelib, upstream tags releases (vX.Y.Z), so this tracks
 # the newest tag rather than the default branch's tip -- a vendor bump never
 # pulls in unreleased work.
 set -euo pipefail

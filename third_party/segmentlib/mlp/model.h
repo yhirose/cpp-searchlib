@@ -27,6 +27,29 @@ namespace segmentlib::mlp {
 // 5.7/2節); the full first line is "SegmentLibMLP <version>\n".
 inline constexpr std::string_view kModelSignature = "SegmentLibMLP ";
 
+// A file format whose body is this network's layout: the header line to expect,
+// and the diagnostics for a file that does not match it. The ED backend stores
+// identically shaped parameters — EDLA trains this same network with a
+// different learning rule (design.md 11) — so it reuses this whole loader
+// behind its own signature. The messages travel with the format because
+// Error::message is a non-owning view of a static string, so the loader cannot
+// build one from the signature it was handed.
+struct FormatId {
+    std::string_view signature;
+    std::string_view version;
+    std::string_view wrong_signature;
+    std::string_view wrong_version;
+    std::string_view malformed;
+};
+
+inline constexpr FormatId kMlpFormat{
+    kModelSignature,
+    "1",
+    "not a SegmentLibMLP model",
+    "unsupported SegmentLibMLP version",
+    "malformed SegmentLibMLP model",
+};
+
 namespace detail {
 
 inline std::vector<std::int16_t> read_i16_tensor(bytes::BinaryReader& in,
@@ -74,28 +97,43 @@ class Model {
 public:
     [[nodiscard]] static Expected<Model, Error> load_from_bytes(
         Span<const std::byte> data, TablePrecision precision = TablePrecision::Int16) {
-        try {
-            bytes::BinaryReader in(data);
-            const std::string header = in.read_line();
-            // Not starts_with: that is C++20, and this library targets C++17.
-            if (header.compare(0, kModelSignature.size(), kModelSignature) != 0) {
-                return Unexpected(Error{ErrorCode::UnsupportedModelFormat,
-                                        "not a SegmentLibMLP model"});
-            }
-            if (header.substr(kModelSignature.size()) != "1") {
-                return Unexpected(Error{ErrorCode::UnsupportedModelFormat,
-                                        "unsupported SegmentLibMLP version"});
-            }
-            return Model(parse(in, precision));
-        } catch (const bytes::ParseError&) {
-            return Unexpected(
-                Error{ErrorCode::MalformedModel, "malformed SegmentLibMLP model"});
-        }
+        return load_format(data, kMlpFormat, precision);
     }
 
     [[nodiscard]] static Expected<Model, Error> load(
         const std::filesystem::path& path,
         TablePrecision precision = TablePrecision::Int16) {
+        return load_format(path, kMlpFormat, precision);
+    }
+
+    // Loads a body in this network's layout from behind `format`'s header
+    // line. The ED backend calls these with its own FormatId: the two formats
+    // differ in their signature alone, so sharing the parser is what keeps
+    // their numeric behaviour identical by construction rather than by
+    // maintenance.
+    [[nodiscard]] static Expected<Model, Error> load_format(
+        Span<const std::byte> data, const FormatId& format, TablePrecision precision) {
+        try {
+            bytes::BinaryReader in(data);
+            const std::string header = in.read_line();
+            // Not starts_with: that is C++20, and this library targets C++17.
+            if (header.compare(0, format.signature.size(), format.signature) != 0) {
+                return Unexpected(
+                    Error{ErrorCode::UnsupportedModelFormat, format.wrong_signature});
+            }
+            if (header.substr(format.signature.size()) != format.version) {
+                return Unexpected(
+                    Error{ErrorCode::UnsupportedModelFormat, format.wrong_version});
+            }
+            return Model(parse(in, precision));
+        } catch (const bytes::ParseError&) {
+            return Unexpected(Error{ErrorCode::MalformedModel, format.malformed});
+        }
+    }
+
+    [[nodiscard]] static Expected<Model, Error> load_format(
+        const std::filesystem::path& path, const FormatId& format,
+        TablePrecision precision) {
         std::ifstream in(path, std::ios::binary);
         if (!in) {
             return Unexpected(Error{ErrorCode::IoError, "cannot open model file"});
@@ -105,7 +143,7 @@ public:
         if (in.bad()) {
             return Unexpected(Error{ErrorCode::IoError, "cannot read model file"});
         }
-        return load_from_bytes(as_bytes(Span<const char>(data)), precision);
+        return load_format(as_bytes(Span<const char>(data)), format, precision);
     }
 
     [[nodiscard]] TablePrecision table_precision() const noexcept {

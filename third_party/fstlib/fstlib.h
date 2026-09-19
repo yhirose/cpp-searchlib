@@ -7,6 +7,9 @@
 
 #pragma once
 
+#define CPPFSTLIB_VERSION "0.1.0"
+#define CPPFSTLIB_VERSION_NUM "0x000100"
+
 #include <algorithm>
 #include <any>
 #include <array>
@@ -977,12 +980,13 @@ inline std::pair<Result, size_t> build_fst(const Input &input, Writer &writer,
                       });
           }
 
+          size_t rank = 0;
           for (auto input_index : sorted_indexes) {
             const auto word = input[input_index];
-            if (!feeder(word, static_cast<uint32_t>(input_index),
-                        input_index)) {
+            if (!feeder(word, static_cast<uint32_t>(rank), input_index)) {
               break;
             }
+            rank++;
           }
         }
       },
@@ -1195,6 +1199,8 @@ struct FstHeader {
     remaining -= size;
 
     if (flags.data.hub_table) {
+      // A writer only sets the flag with at least one hub.
+      if (hub_count == 0) { return false; }
       if (remaining < hub_count * sizeof(uint32_t)) { return false; }
       hub_table = p - (hub_count * sizeof(uint32_t) - 1);
     }
@@ -1221,6 +1227,134 @@ struct FstHeader {
   }
 };
 
+//-----------------------------------------------------------------------------
+// xxh64 - XXH64 (https://github.com/Cyan4973/xxHash) with seed 0
+//-----------------------------------------------------------------------------
+
+inline uint64_t xxh64(const char *data, size_t len) {
+  constexpr uint64_t P1 = 11400714785074694791ULL;
+  constexpr uint64_t P2 = 14029467366897019727ULL;
+  constexpr uint64_t P3 = 1609587929392839161ULL;
+  constexpr uint64_t P4 = 9650029242287828579ULL;
+  constexpr uint64_t P5 = 2870177450012600261ULL;
+
+  auto rotl = [](uint64_t x, int r) { return (x << r) | (x >> (64 - r)); };
+  auto read64 = [](const char *p) {
+    uint64_t v;
+    memcpy(&v, p, sizeof(v));
+    return v;
+  };
+  auto round = [&](uint64_t acc, uint64_t input) {
+    return rotl(acc + input * P2, 31) * P1;
+  };
+  auto merge = [&](uint64_t acc, uint64_t val) {
+    return (acc ^ round(0, val)) * P1 + P4;
+  };
+
+  auto p = data;
+  auto end = data + len;
+  uint64_t h;
+
+  if (len >= 32) {
+    auto v1 = P1 + P2;
+    auto v2 = P2;
+    uint64_t v3 = 0;
+    auto v4 = 0 - P1;
+    auto limit = end - 32;
+    do {
+      v1 = round(v1, read64(p));
+      v2 = round(v2, read64(p + 8));
+      v3 = round(v3, read64(p + 16));
+      v4 = round(v4, read64(p + 24));
+      p += 32;
+    } while (p <= limit);
+    h = rotl(v1, 1) + rotl(v2, 7) + rotl(v3, 12) + rotl(v4, 18);
+    h = merge(h, v1);
+    h = merge(h, v2);
+    h = merge(h, v3);
+    h = merge(h, v4);
+  } else {
+    h = P5;
+  }
+
+  h += len;
+
+  while (p + 8 <= end) {
+    h = rotl(h ^ round(0, read64(p)), 27) * P1 + P4;
+    p += 8;
+  }
+  if (p + 4 <= end) {
+    uint32_t v;
+    memcpy(&v, p, sizeof(v));
+    h = rotl(h ^ (v * P1), 23) * P2 + P3;
+    p += 4;
+  }
+  while (p < end) {
+    h = rotl(h ^ (static_cast<uint8_t>(*p) * P5), 11) * P1;
+    p++;
+  }
+
+  h ^= h >> 33;
+  h *= P2;
+  h ^= h >> 29;
+  h *= P3;
+  h ^= h >> 32;
+  return h;
+}
+
+//-----------------------------------------------------------------------------
+// FstTrailer
+//
+//   [body][body size: 8][body xxh64: 8][version: 4][magic: 4]
+//
+// 'body' is the records followed by the header. A truncated byte code loses
+// the trailer, and a byte code of another format version doesn't match the
+// version, so both are rejected before any address in them is followed.
+// The hash is only checked by verify(), since it reads the whole body.
+//-----------------------------------------------------------------------------
+
+struct FstTrailer {
+  static constexpr size_t kByteSize = 24;
+  static constexpr uint32_t kVersion = 1;
+
+  // Versions of this library without the trailer read the last byte as the
+  // header flags. 0x07 is an output type that they reject, and that a header
+  // never has.
+  static constexpr char kMagic[4] = {'F', 'S', 'T', 0x07};
+
+  uint64_t body_size = 0;
+  uint64_t body_hash = 0;
+  uint32_t version = kVersion;
+
+  bool read(const char *byte_code, size_t byte_code_size) {
+    if (byte_code_size < kByteSize) { return false; }
+
+    auto p = byte_code + (byte_code_size - kByteSize);
+    memcpy(&body_size, p, sizeof(body_size));
+    memcpy(&body_hash, p + 8, sizeof(body_hash));
+    memcpy(&version, p + 16, sizeof(version));
+
+    if (memcmp(p + 20, kMagic, sizeof(kMagic)) != 0) { return false; }
+    if (version != kVersion) { return false; }
+    return body_size == byte_code_size - kByteSize;
+  }
+
+  void write(std::ostream &os) const {
+    os.write(reinterpret_cast<const char *>(&body_size), sizeof(body_size));
+    os.write(reinterpret_cast<const char *>(&body_hash), sizeof(body_hash));
+    os.write(reinterpret_cast<const char *>(&version), sizeof(version));
+    os.write(kMagic, sizeof(kMagic));
+  }
+};
+
+// Reads the trailer and the header without touching the records, so that
+// opening a byte code is O(1). The matchers open one on every construction.
+inline bool read_header(const char *byte_code, size_t byte_code_size,
+                        FstHeader &header, FstTrailer &trailer) {
+  if (!trailer.read(byte_code, byte_code_size)) { return false; }
+  return header.read(byte_code, static_cast<size_t>(trailer.body_size));
+}
+
 template <typename output_t, bool need_state_output> class FstWriter {
 public:
   // With 'single_pass' (which requires building with 'keep_all_states'),
@@ -1231,7 +1365,8 @@ public:
   template <typename Input>
   FstWriter(std::ostream &os, bool need_output, bool dump, bool verbose,
             const Input &input, bool single_pass = false)
-      : os_(os), need_output_(need_output), dump_(dump), verbose_(verbose),
+      : out_(os), os_(dump ? os : static_cast<std::ostream &>(body_)),
+        need_output_(need_output), dump_(dump), verbose_(verbose),
         single_pass_(single_pass && !dump) {
 
     initialize_char_index_table(input);
@@ -1266,14 +1401,25 @@ public:
     FstHeader header(output_type, need_state_output, start_byte_adress,
                      char_index_table_, hub_ids_.size());
 
-    if (!dump_) { header.write(os_); }
+    if (!dump_) {
+      header.write(os_);
+
+      auto body = body_.str();
+
+      FstTrailer trailer;
+      trailer.body_size = body.size();
+      trailer.body_hash = xxh64(body.data(), body.size());
+
+      out_.write(body.data(), body.size());
+      trailer.write(out_);
+    }
 
     if (verbose_) {
       const size_t char_index_size  = FstOpe::char_index_size(need_output_, need_state_output);
       const size_t hub_table_size =
           hub_ids_.empty() ? 0
                            : (hub_ids_.size() + 1) * sizeof(uint32_t);
-      const size_t total_size = address_ + hub_table_size + char_index_size + sizeof(uint32_t) + sizeof(uint8_t);
+      const size_t total_size = address_ + hub_table_size + char_index_size + sizeof(uint32_t) + sizeof(uint8_t) + FstTrailer::kByteSize;
       const auto unique_char_count =
           std::count_if(std::begin(char_count_), std::end(char_count_),
                         [](auto count) { return count > 0; });
@@ -1628,6 +1774,10 @@ private:
     return id < hub_rank_by_id_.size() ? hub_rank_by_id_[id] : -1;
   }
 
+  // The byte code is kept in 'body_' until the end, where its hashes go to
+  // the trailer. A dump goes straight to 'out_'.
+  std::ostringstream body_;
+  std::ostream &out_;
   std::ostream &os_;
   size_t need_output_ = true;
   size_t dump_ = true;
@@ -1775,12 +1925,36 @@ inline std::pair<Result, size_t> dot(const Input &input, std::ostream &os,
 inline OutputType get_output_type(const char *byte_code,
                                   size_t byte_code_size) {
   FstHeader header;
-  if (!header.read(byte_code, byte_code_size)) { return OutputType::invalid; }
+  FstTrailer trailer;
+  if (!read_header(byte_code, byte_code_size, header, trailer)) {
+    return OutputType::invalid;
+  }
   return static_cast<OutputType>(header.flags.data.output_type);
 }
 
 template <typename T> OutputType get_output_type(const T &byte_code) {
   return get_output_type(byte_code.data(), byte_code.size());
+}
+
+//-----------------------------------------------------------------------------
+// verify
+//
+// 'map' and 'set' only check the trailer and the header when they open a byte
+// code. This also checks the records, which reads the whole byte code.
+//-----------------------------------------------------------------------------
+
+inline bool verify(const char *byte_code, size_t byte_code_size) {
+  FstHeader header;
+  FstTrailer trailer;
+  if (!read_header(byte_code, byte_code_size, header, trailer)) {
+    return false;
+  }
+  return xxh64(byte_code, static_cast<size_t>(trailer.body_size)) ==
+         trailer.body_hash;
+}
+
+template <typename T> bool verify(const T &byte_code) {
+  return verify(byte_code.data(), byte_code.size());
 }
 
 //-----------------------------------------------------------------------------
@@ -1943,7 +2117,8 @@ public:
   matcher(const char *byte_code, size_t byte_code_size)
       : byte_code_(byte_code), byte_code_size_(byte_code_size) {
 
-    if (!header_.read(byte_code, byte_code_size)) { return; }
+    FstTrailer trailer;
+    if (!read_header(byte_code, byte_code_size, header_, trailer)) { return; }
 
     if (static_cast<OutputType>(header_.flags.data.output_type) !=
         OutputTraits<output_t>::type()) {

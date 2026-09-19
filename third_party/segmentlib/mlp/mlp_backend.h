@@ -33,6 +33,35 @@ inline Scratch& scratch() {
 
 }  // namespace detail
 
+// Segments `text` with this network: encode, score every boundary, cut where
+// the score is positive. A free function because the ED backend scores with the
+// same network — EDLA only changes how its weights were learned — so it runs
+// this code rather than a copy that could drift from it.
+[[nodiscard]] inline Expected<Segments, Error> tokenize_with(const Model& model,
+                                                             std::string_view text) {
+    detail::Scratch& s = detail::scratch();
+    if (auto encoded = model.vocab().encode_into(text, s.enc); !encoded) {
+        return Unexpected(encoded.error());
+    }
+    Segments segments;
+    if (text.empty()) {
+        return segments;
+    }
+    score_boundaries_into(model, s.enc, s.ws, s.scores);
+    std::size_t start = 0;
+    for (std::size_t i = 0; i < s.scores.size(); ++i) {
+        if (s.scores[i] > 0) {
+            // Boundary i sits after EGC i: the byte offset where EGC i+1
+            // starts in the original input.
+            const std::size_t cut = s.enc.offsets[i + 1];
+            segments.emplace_back(start, cut);
+            start = cut;
+        }
+    }
+    segments.emplace_back(start, text.size());
+    return segments;
+}
+
 // The MLP segmentation backend: same shape as
 // kytea::KyteaBackend. Word segmentation only.
 class MlpBackend {
@@ -40,27 +69,7 @@ public:
     explicit MlpBackend(Model model) noexcept : model_(std::move(model)) {}
 
     [[nodiscard]] Expected<Segments, Error> tokenize(std::string_view text) const {
-        detail::Scratch& s = detail::scratch();
-        if (auto encoded = model_.vocab().encode_into(text, s.enc); !encoded) {
-            return Unexpected(encoded.error());
-        }
-        Segments segments;
-        if (text.empty()) {
-            return segments;
-        }
-        score_boundaries_into(model_, s.enc, s.ws, s.scores);
-        std::size_t start = 0;
-        for (std::size_t i = 0; i < s.scores.size(); ++i) {
-            if (s.scores[i] > 0) {
-                // Boundary i sits after EGC i: the byte offset where EGC i+1
-                // starts in the original input.
-                const std::size_t cut = s.enc.offsets[i + 1];
-                segments.emplace_back(start, cut);
-                start = cut;
-            }
-        }
-        segments.emplace_back(start, text.size());
-        return segments;
+        return tokenize_with(model_, text);
     }
 
     [[nodiscard]] const Model& model() const noexcept { return model_; }

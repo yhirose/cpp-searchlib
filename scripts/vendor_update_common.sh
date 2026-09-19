@@ -9,7 +9,8 @@ current_revision() {
 }
 
 # latest_head_sha <owner/repo> -- the tip commit SHA of the repo's default
-# branch. For upstreams that publish no tags, this is what "latest" means.
+# branch. For upstreams that publish no tags (unicodelib), this is what
+# "latest" means.
 latest_head_sha() {
     curl -fsSL "https://api.github.com/repos/$1/commits/HEAD" \
         | python3 -c 'import json, sys; print(json.load(sys.stdin)["sha"])'
