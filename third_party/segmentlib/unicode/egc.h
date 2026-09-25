@@ -12,11 +12,11 @@
 namespace segmentlib::unicode {
 
 // Version of the Unicode data the generated grapheme-break property table was
-// built from, encoded as major*100 + minor (16.0 -> 1600). UAX #29 rules and
+// built from, encoded as major*100 + minor (18.0 -> 1800). UAX #29 rules and
 // property assignments can change between Unicode versions, so model files
 // record the version they were trained with (design.ja.md 4.7 field 4b) and
 // the loader warns when it differs from this segmenter's tables.
-inline constexpr std::uint16_t kEgcUnicodeVersion = 1600;
+inline constexpr std::uint16_t kEgcUnicodeVersion = 1800;
 
 // UAX #29 Grapheme_Cluster_Break property values (exactly the set the
 // extended-grapheme-cluster rules consume). Values must match the packed
@@ -132,9 +132,8 @@ public:
             is_break = false;  // GB9a: keep spacing marks attached
         } else if (prev_ == GraphemeBreak::Prepend) {
             is_break = false;  // GB9b: keep prepend characters attached
-        } else if (gb9c_ == Gb9cState::ConsonantLinker &&
-                   props.incb == IndicConjunctBreak::Consonant) {
-            is_break = false;  // GB9c: Indic conjunct (consonant linker x consonant)
+        } else if (gb9c_linker_ && props.incb == IndicConjunctBreak::Consonant) {
+            is_break = false;  // GB9c: Indic conjunct (linker x consonant)
         } else if (gb11_ == Gb11State::PictographicZwj && props.extended_pictographic) {
             is_break = false;  // GB11: emoji ZWJ sequence
         } else if (prev_ == GraphemeBreak::RegionalIndicator &&
@@ -158,15 +157,12 @@ public:
             gb11_ = Gb11State::None;
         }
 
-        // GB9c tracks Consonant [Extend|Linker]* with at least one Linker.
-        if (props.incb == IndicConjunctBreak::Consonant) {
-            gb9c_ = Gb9cState::Consonant;
-        } else if (gb9c_ != Gb9cState::None && props.incb == IndicConjunctBreak::Linker) {
-            gb9c_ = Gb9cState::ConsonantLinker;
-        } else if (gb9c_ != Gb9cState::None && props.incb == IndicConjunctBreak::Extend) {
-            // sequence stays open in its current state
-        } else {
-            gb9c_ = Gb9cState::None;
+        // GB9c tracks Linker Extend*. Since Unicode 18.0 the sequence no
+        // longer has to start with a Consonant.
+        if (props.incb == IndicConjunctBreak::Linker) {
+            gb9c_linker_ = true;
+        } else if (props.incb != IndicConjunctBreak::Extend) {
+            gb9c_linker_ = false;
         }
 
         ri_run_ = cur == GraphemeBreak::RegionalIndicator ? ri_run_ + 1 : 0;
@@ -183,13 +179,12 @@ public:
 private:
     // GB11: have we seen Extended_Pictographic Extend* (then ZWJ)?
     enum class Gb11State : std::uint8_t { None, Pictographic, PictographicZwj };
-    // GB9c: have we seen InCB=Consonant [InCB=Extend|Linker]* (with a Linker)?
-    enum class Gb9cState : std::uint8_t { None, Consonant, ConsonantLinker };
 
     bool at_start_ = true;
     GraphemeBreak prev_ = GraphemeBreak::Other;
     Gb11State gb11_ = Gb11State::None;
-    Gb9cState gb9c_ = Gb9cState::None;
+    // GB9c: have we seen InCB=Linker InCB=Extend*?
+    bool gb9c_linker_ = false;
     // Length of the run of Regional_Indicator codepoints ending at the
     // previous position; GB12/13 join RI codepoints pairwise, so only the
     // parity matters, but the count is kept for clarity (it cannot overflow

@@ -5,8 +5,8 @@
 // comparison. Kept here because types.h is the dependency-free header every
 // other segmentlib header includes. Releases bump these together with the
 // VERSION in CMakeLists.txt's project() -- see docs/RELEASING.md.
-#define SEGMENTLIB_VERSION "0.2.0"
-#define SEGMENTLIB_VERSION_NUM "0x000200"
+#define SEGMENTLIB_VERSION "0.3.0"
+#define SEGMENTLIB_VERSION_NUM "0x000300"
 
 #include <cstddef>
 #include <string>
