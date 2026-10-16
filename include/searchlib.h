@@ -22,6 +22,7 @@
 #define CPPSEARCHLIB_VERSION_NUM "0x000100"
 
 #include <algorithm>
+#include <any>
 #include <array>
 #include <cassert>
 #include <cmath>
@@ -43,6 +44,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -404,6 +406,10 @@ public:
   virtual size_t term_count(const std::u32string &str,
                             size_t ordinal) const = 0;
 
+  // The number of live documents carrying the term: a tombstoned document
+  // still sits in the term's postings until the index is rebuilt, but it is
+  // not counted here, so df never exceeds document_count() -- which BM25's
+  // idf relies on to stay a real number.
   virtual size_t df(const std::u32string &str) const = 0;
   virtual double tf(const std::u32string &str, size_t ordinal) const = 0;
 
@@ -3232,6 +3238,35 @@ inline size_t find_postings_index_for_ordinal(const IPostings &p,
   return p.size();
 }
 
+// How many of the documents in `p` are not in `removed`: a term's df once
+// tombstones are discounted. Whichever side is smaller drives the count --
+// a binary search into the postings per removed ordinal, or one set lookup
+// per posting -- so an index with a handful of updates pays next to nothing
+// on a long list, and one rewritten wholesale pays at most a pass over it.
+inline size_t
+live_document_frequency(const IPostings &p,
+                        const std::unordered_set<size_t> &removed) {
+  auto n = p.size();
+  if (removed.empty()) {
+    return n;
+  }
+  size_t dead = 0;
+  if (removed.size() < n) {
+    for (auto ordinal : removed) {
+      if (find_postings_index_for_ordinal(p, ordinal) < n) {
+        dead++;
+      }
+    }
+  } else {
+    for (size_t i = 0; i < n; i++) {
+      if (removed.find(p.document_ordinal(i)) != removed.end()) {
+        dead++;
+      }
+    }
+  }
+  return n - dead;
+}
+
 // True if `term` matches the glob `pattern` (`*` = zero or more codepoints,
 // every other codepoint literal). Standard two-pointer greedy matcher with
 // backtracking to the most recent `*`: linear in practice, quadratic only on
@@ -3604,7 +3639,7 @@ public:
   }
 
   size_t df(const std::u32string &str) const override {
-    return postings(str)->size();
+    return live_document_frequency(*postings(str), removed_ordinals_);
   }
 
   double tf(const std::u32string &str, size_t ordinal) const override {
@@ -3893,7 +3928,9 @@ inline size_t estimate_matches(const IInvertedIndex &inverted_index,
   constexpr auto unknown = std::numeric_limits<size_t>::max();
   switch (expr.operation) {
   case Operation::Term:
-    return inverted_index.df(expr.term_str);
+    // The postings' own size, tombstones included, rather than df: ranking
+    // operands does not need df's exactness, and df pays to discount them.
+    return inverted_index.postings(expr.term_str)->size();
   case Operation::And:
   case Operation::Adjacent:
   case Operation::Near:
@@ -4985,88 +5022,118 @@ perform_fuzzy_operation(const IInvertedIndex &inverted_index,
       inverted_index, expand_fuzzy(inverted_index, expr), scope_index, filter);
 }
 
+// One operand's current hit, as Near and SameScope weigh them.
+struct ProximityHit {
+  size_t position;
+  size_t length;
+  size_t slot;
+};
+
+// Scratch Near and SameScope reuse across candidate documents, the same way
+// the And path reuses its buffers: the walk runs once per document where all
+// cursors align, and these would otherwise be allocated every time.
+struct ProximityScratch {
+  std::vector<size_t> search_hit_cursors;
+  std::vector<ProximityHit> group;
+  std::vector<std::pair<size_t /*position*/, size_t /*length*/>> hits;
+};
+
+// The hit walk Near and SameScope share, for one document every operand
+// carries. It looks at one hit per operand at a time, in position order, and
+// asks `accept` whether that group qualifies: if so every hit in it is kept
+// and every operand moves on, otherwise only the earliest one does, since
+// it is the one furthest from the rest. The kept hits are written out in
+// ascending position order with duplicates dropped -- two operands can
+// share a hit (`a ~ a`, `apple ~ app*`), and groups do not come out in
+// position order -- which is the order every IPostings reader assumes.
+template <typename Accept>
+inline bool collect_proximity_hits(
+    const std::vector<std::shared_ptr<IPostings>> &postings_list,
+    const std::vector<size_t> &cursors, ProximityScratch &scratch,
+    std::vector<size_t> &term_positions, std::vector<size_t> &term_lengths,
+    Accept accept) {
+  auto &search_hit_cursors = scratch.search_hit_cursors;
+  auto &group = scratch.group;
+  auto &hits = scratch.hits;
+  auto slot_count = postings_list.size();
+  search_hit_cursors.assign(slot_count, 0);
+  hits.clear();
+
+  // Moves a slot to its next hit; true once it has none left.
+  auto exhausted = [&](size_t slot) {
+    return ++search_hit_cursors[slot] ==
+           postings_list[slot]->search_hit_count(cursors[slot]);
+  };
+
+  for (;;) {
+    group.clear();
+    for (size_t slot = 0; slot < slot_count; slot++) {
+      const auto &p = *postings_list[slot];
+      auto index = cursors[slot];
+      auto hit_index = search_hit_cursors[slot];
+      group.push_back(ProximityHit{p.term_position(index, hit_index),
+                                   p.term_length(index, hit_index), slot});
+    }
+    std::sort(group.begin(), group.end(), [](const auto &a, const auto &b) {
+      return std::tie(a.position, a.slot) < std::tie(b.position, b.slot);
+    });
+
+    if (accept(group)) {
+      auto done = false;
+      for (const auto &hit : group) {
+        hits.emplace_back(hit.position, hit.length);
+        done = exhausted(hit.slot) || done;
+      }
+      if (done) {
+        break;
+      }
+    } else if (exhausted(group.front().slot)) {
+      break;
+    }
+  }
+
+  std::sort(hits.begin(), hits.end());
+  hits.erase(std::unique(hits.begin(), hits.end()), hits.end());
+  for (const auto &[position, length] : hits) {
+    term_positions.push_back(position);
+    term_lengths.push_back(length);
+  }
+  return !hits.empty();
+}
+
 inline std::shared_ptr<IPostings>
 perform_near_operation(const IInvertedIndex &inverted_index,
                        const Expression &expr, const IScopeIndex *scope_index,
                        const IPostings *filter) {
-  // Reused across candidate documents (assign() below), same as the And
-  // path's scratch buffers: the callback runs once per document where all
-  // cursors align, and this was its one remaining per-document allocation.
-  std::vector<size_t> search_hit_cursors;
+  ProximityScratch scratch;
+
+  // Not `near`: windows.h defines that name as a macro.
+  auto within_distance = [&](const std::vector<ProximityHit> &group) {
+    // The gap is measured from the furthest end reached so far, not just
+    // the previous hit's, and a hit starting inside that reach is no gap
+    // at all: a phrase operand can span past the start of the next one
+    // (`"a b c" ~ b`).
+    auto reach = group.front().position + group.front().length;
+    for (size_t i = 1; i < group.size(); i++) {
+      const auto &hit = group[i];
+      if (hit.position >= reach &&
+          hit.position + 1 - reach > expr.near_operation_distance) {
+        return false;
+      }
+      reach = std::max(reach, hit.position + hit.length);
+    }
+    return true;
+  };
 
   return intersect_postings(
       intersection_operands(inverted_index, expr.nodes, scope_index, filter)
           .postings,
       filter,
-      [&](const auto &positings_list, const auto &cursors, size_t /*ordinal*/,
+      [&](const auto &postings_list, const auto &cursors, size_t /*ordinal*/,
           auto &term_positions, auto &term_lengths) {
-        search_hit_cursors.assign(positings_list.size(), 0);
-
-        auto done = false;
-        while (!done) {
-          // TODO: performance improvement by reusing values as many as
-          // possible
-          std::map<size_t /*term_pos*/,
-                   std::pair<size_t /*slot*/, size_t /*term_length*/>>
-              slots_by_term_pos;
-          {
-            auto slot = 0;
-            for (const auto &p : positings_list) {
-              auto index = cursors[slot];
-              auto hit_index = search_hit_cursors[slot];
-              auto term_pos = p->term_position(index, hit_index);
-              auto term_length = p->term_length(index, hit_index);
-              slots_by_term_pos[term_pos] = std::pair(slot, term_length);
-              slot++;
-            }
-          }
-
-          // Not `near`: windows.h defines that name as a macro.
-          auto within_distance = true;
-          {
-            auto it = slots_by_term_pos.begin();
-            auto it_prev = it;
-            ++it;
-            while (it != slots_by_term_pos.end()) {
-              auto [prev_term_pos, prev_item] = *it_prev;
-              auto [prev_slot, prev_term_count] = prev_item;
-              auto [term_pos, item] = *it;
-              auto delta = term_pos - (prev_term_pos + prev_term_count - 1);
-              if (delta > expr.near_operation_distance) {
-                within_distance = false;
-                break;
-              }
-              it_prev = it;
-              ++it;
-            }
-          }
-
-          if (within_distance) {
-            // Skip all search hit cursors
-            for (auto [term_pos, item] : slots_by_term_pos) {
-              auto [slot, term_length] = item;
-              term_positions.push_back(term_pos);
-              term_lengths.push_back(term_length);
-              search_hit_cursors[slot]++;
-
-              if (search_hit_cursors[slot] ==
-                  positings_list[slot]->search_hit_count(cursors[slot])) {
-                done = true;
-              }
-            }
-          } else {
-            // Skip search hit cursor for the smallest slot
-            auto slot = slots_by_term_pos.begin()->second.first;
-            search_hit_cursors[slot]++;
-
-            if (search_hit_cursors[slot] ==
-                positings_list[slot]->search_hit_count(cursors[slot])) {
-              done = true;
-            }
-          }
-        }
-
-        return !term_positions.empty();
+        return collect_proximity_hits(postings_list, cursors, scratch,
+                                      term_positions, term_lengths,
+                                      within_distance);
       });
 }
 
@@ -5083,77 +5150,29 @@ inline std::shared_ptr<IPostings> perform_same_scope_operation(
     return std::make_shared<SearchResult>();
   }
 
-  // Reused across candidate documents; see perform_near_operation.
-  std::vector<size_t> search_hit_cursors;
+  ProximityScratch scratch;
 
   return intersect_postings(
       intersection_operands(inverted_index, expr.nodes, scope_index, filter)
           .postings,
       filter,
-      [&](const auto &positings_list, const auto &cursors, size_t ordinal,
+      [&](const auto &postings_list, const auto &cursors, size_t ordinal,
           auto &term_positions, auto &term_lengths) {
         if (!scope_index->has_scope(expr.scope_name, ordinal)) {
           return false;
         }
-
-        search_hit_cursors.assign(positings_list.size(), 0);
-
-        auto done = false;
-        while (!done) {
-          std::map<size_t /*term_pos*/,
-                   std::pair<size_t /*slot*/, size_t /*term_length*/>>
-              slots_by_term_pos;
-          {
-            auto slot = 0;
-            for (const auto &p : positings_list) {
-              auto index = cursors[slot];
-              auto hit_index = search_hit_cursors[slot];
-              auto term_pos = p->term_position(index, hit_index);
-              auto term_length = p->term_length(index, hit_index);
-              slots_by_term_pos[term_pos] = std::pair(slot, term_length);
-              slot++;
-            }
-          }
-
-          std::optional<size_t> reference_scope_id;
-          auto same_scope = true;
-          for (const auto &[term_pos, item] : slots_by_term_pos) {
-            auto sid =
-                scope_index->scope_id(expr.scope_name, ordinal, term_pos);
-            if (!reference_scope_id) {
-              reference_scope_id = sid;
-            } else if (*reference_scope_id != sid) {
-              same_scope = false;
-              break;
-            }
-          }
-
-          if (same_scope) {
-            for (const auto &[term_pos, item] : slots_by_term_pos) {
-              auto [slot, term_length] = item;
-              term_positions.push_back(term_pos);
-              term_lengths.push_back(term_length);
-              search_hit_cursors[slot]++;
-
-              if (search_hit_cursors[slot] ==
-                  positings_list[slot]->search_hit_count(cursors[slot])) {
-                done = true;
-              }
-            }
-          } else {
-            // Skip search hit cursor for the smallest slot, same tie-break as
-            // perform_near_operation.
-            auto slot = slots_by_term_pos.begin()->second.first;
-            search_hit_cursors[slot]++;
-
-            if (search_hit_cursors[slot] ==
-                positings_list[slot]->search_hit_count(cursors[slot])) {
-              done = true;
-            }
-          }
-        }
-
-        return !term_positions.empty();
+        auto same_scope = [&](const std::vector<ProximityHit> &group) {
+          auto scope_id = [&](const ProximityHit &hit) {
+            return scope_index->scope_id(expr.scope_name, ordinal,
+                                         hit.position);
+          };
+          auto reference = scope_id(group.front());
+          return std::all_of(
+              group.begin() + 1, group.end(),
+              [&](const auto &hit) { return scope_id(hit) == reference; });
+        };
+        return collect_proximity_hits(postings_list, cursors, scratch,
+                                      term_positions, term_lengths, same_scope);
       });
 }
 
@@ -5318,11 +5337,15 @@ inline Expression as_fuzzy(Expression expr, size_t max_edits) {
   });
 }
 
-// Shared grammar for both parse_query overloads; only TERM handling (how a
-// raw query token becomes an Expression) differs between them.
-inline std::optional<Expression> parse_query_impl(
-    const std::function<Expression(std::string_view)> &term_handler,
-    std::string_view query) {
+// How a raw query token becomes an Expression: the one thing the parse_query
+// overloads do differently.
+using TermHandler = std::function<Expression(std::string_view)>;
+
+// Shared grammar for both parse_query overloads, with its actions. The term
+// handler reaches TERM and FUZZY through parse's user-data argument (a
+// `const TermHandler *`) rather than a capture, so the parser can be built
+// once and shared; see query_parser.
+inline peg::parser make_query_parser() {
   // FUZZY has to precede TERM (PEG picks the first alternative that matches,
   // and TERM alone would consume `apple` out of `apple~2` and leave `~2` to be
   // read as a NEAR operator -- which is exactly how `apple~2` used to parse).
@@ -5335,7 +5358,7 @@ inline std::optional<Expression> parse_query_impl(
   // That lookahead has to sit inside the `<...>`: outside it, %whitespace is
   // skipped first and it would test the start of the *next* token instead,
   // which breaks `apple~2 banana`.
-  static peg::parser parser(R"(
+  peg::parser parser(R"(
     ROOT        <- OR?
     OR          <- AND ('|' AND)*
     AND         <- NOT+
@@ -5345,18 +5368,18 @@ inline std::optional<Expression> parse_query_impl(
     PHRASE      <- '"' TERM+ '"'
     FUZZY       <- < (![-"|~() \t\r\n] .) (!["|~() \t\r\n] .)* '~' [0-9]+ !(!["|~() \t\r\n] .) >
     TERM        <- < (![-"|~() \t\r\n] .) (!["|~() \t\r\n] .)* >
-    %whitespace <- [ \t]*
+    %whitespace <- [ \t\r\n]*
   )");
 
   parser["ROOT"] =
-      [&](const peg::SemanticValues &vs) -> std::optional<Expression> {
+      [](const peg::SemanticValues &vs) -> std::optional<Expression> {
     if (!vs.empty()) {
       return std::any_cast<Expression>(vs[0]);
     }
     return std::nullopt;
   };
 
-  auto list_handler = [&](Operation operation) {
+  auto list_handler = [](Operation operation) {
     return [=](const peg::SemanticValues &vs) {
       if (vs.size() == 1) {
         return std::any_cast<Expression>(vs[0]);
@@ -5369,7 +5392,7 @@ inline std::optional<Expression> parse_query_impl(
   parser["AND"] = list_handler(Operation::And);
   parser["NEAR"] = list_handler(Operation::Near);
 
-  parser["PHRASE"] = [=](const peg::SemanticValues &vs) {
+  parser["PHRASE"] = [](const peg::SemanticValues &vs) {
     // Flatten implicit phrases made from a single token (e.g. `well-known`).
     std::vector<Expression> nodes;
     for (const auto &v : vs) {
@@ -5395,8 +5418,12 @@ inline std::optional<Expression> parse_query_impl(
     return std::any_cast<Expression>(vs[0]);
   };
 
-  parser["TERM"] = [&](const peg::SemanticValues &vs) {
-    return term_handler(vs.token());
+  auto term_handler = [](std::any &dt) -> const TermHandler & {
+    return *std::any_cast<const TermHandler *>(dt);
+  };
+
+  parser["TERM"] = [=](const peg::SemanticValues &vs, std::any &dt) {
+    return term_handler(dt)(vs.token());
   };
 
   // The `~N` is stripped here rather than inside term_handler because, unlike
@@ -5404,10 +5431,10 @@ inline std::optional<Expression> parse_query_impl(
   // sees a token containing one. The literal part still goes through
   // term_handler, so a fuzzy term is tokenized and filtered exactly like a
   // plain one.
-  parser["FUZZY"] = [&](const peg::SemanticValues &vs) {
+  parser["FUZZY"] = [=](const peg::SemanticValues &vs, std::any &dt) {
     auto token = vs.token();
     auto tilde = token.rfind('~');
-    return as_fuzzy(term_handler(token.substr(0, tilde)),
+    return as_fuzzy(term_handler(dt)(token.substr(0, tilde)),
                     parse_max_edits(token.substr(tilde + 1)));
   };
 
@@ -5415,8 +5442,23 @@ inline std::optional<Expression> parse_query_impl(
   //   std::cerr << line << ":" << col << ": " << msg << "\n";
   // };
 
+  return parser;
+}
+
+// Built once and shared by every call. peg::parser::parse is const and keeps
+// its per-parse state in a Context of its own, so concurrent parses are safe
+// as long as nothing reassigns an action -- which the parser used to do on
+// every call, racing any other thread mid-parse.
+inline const peg::parser &query_parser() {
+  static const peg::parser parser = make_query_parser();
+  return parser;
+}
+
+inline std::optional<Expression>
+parse_query_impl(const TermHandler &term_handler, std::string_view query) {
+  std::any dt = &term_handler;
   std::optional<Expression> expr;
-  if (!parser.parse(query, expr)) {
+  if (!query_parser().parse(query, dt, expr)) {
     return std::nullopt;
   }
 
@@ -5838,7 +5880,7 @@ inline size_t InMemoryInvertedIndexBase::term_count(const std::u32string &str,
 }
 
 inline size_t InMemoryInvertedIndexBase::df(const std::u32string &str) const {
-  return postings(str)->size();
+  return detail::live_document_frequency(*postings(str), removed_ordinals_);
 }
 
 inline double InMemoryInvertedIndexBase::tf(const std::u32string &str,
@@ -6515,7 +6557,10 @@ inline BM25Scorer::BM25Scorer(const IInvertedIndex &invidx,
   detail::enumerate_terms(invidx, expr, [&](const auto &term) {
     auto postings = invidx.postings(term);
     auto size = postings->size();
-    auto n = static_cast<double>(size);
+    // df, not the postings' size: the postings still list tombstoned
+    // documents, which N leaves out, and n > N would make idf the log of a
+    // negative number -- NaN.
+    auto n = static_cast<double>(invidx.df(term));
     auto block_reads = postings->prefers_block_reads();
     windowed_ = windowed_ || block_reads;
     terms_.push_back(TermState{std::move(postings),

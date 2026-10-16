@@ -2,7 +2,9 @@
 #include <searchlib.h>
 
 #include <atomic>
+#include <cmath>
 #include <filesystem>
+#include <map>
 #include <sstream>
 #include <thread>
 
@@ -1660,9 +1662,9 @@ TEST(ThreadSafetyTest, ConcurrentReadersAndWriter) {
   constexpr int kWriterIterations = 300;
   std::atomic<bool> writer_done{false};
 
-  // Parse once and share the read-only Expression across threads. Query parsing
-  // (peglib) is not itself thread-safe and is orthogonal to index locking; the
-  // realistic pattern is to parse before searching.
+  // Parse once and share the read-only Expression across threads. Query
+  // parsing is orthogonal to index locking; the realistic pattern is to
+  // parse before searching.
   auto expr = parse_query(normalizer, "document");
   ASSERT_TRUE(expr.has_value());
 
@@ -2837,4 +2839,213 @@ TEST(KeyTableTest, IntegerKeysRoundTripDenseOrNot) {
       }
     }
   }
+}
+
+//-----------------------------------------------------------------------------
+// Regressions
+//-----------------------------------------------------------------------------
+
+static std::vector<size_t> hit_positions(const IPostings &postings,
+                                         size_t index) {
+  std::vector<size_t> positions;
+  for (size_t hit = 0; hit < postings.search_hit_count(index); hit++) {
+    positions.push_back(postings.term_position(index, hit));
+  }
+  return positions;
+}
+
+// An update tombstones the old copy, which stays in the term's postings, so
+// df must discount it: counting it made df exceed the live document count
+// and BM25's idf the log of a negative number -- NaN for every score.
+TEST(BM25Test, UpdatesDoNotSkewScores) {
+  auto build = [](size_t updates) {
+    InMemoryInvertedIndex<TextRange> invidx;
+    InMemoryIndexer indexer(invidx, normalizer);
+    indexer.index_document(0, UTF8PlainTextTokenizer("apple banana"));
+    indexer.index_document(1, UTF8PlainTextTokenizer("cherry"));
+    indexer.index_document(2, UTF8PlainTextTokenizer("cherry date"));
+    for (size_t i = 0; i < updates; i++) {
+      indexer.index_document(0, UTF8PlainTextTokenizer("apple banana"));
+    }
+    return invidx;
+  };
+  auto fresh = build(0);
+  auto updated = build(3);
+
+  ASSERT_EQ(4, updated.postings(U"apple")->size());
+  EXPECT_EQ(1, updated.df(U"apple"));
+  EXPECT_EQ(fresh.document_count(), updated.document_count());
+
+  std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+  updated.save(ss, {}, IndexFormat::Compressed);
+  auto compressed = load_compressed_index(ss);
+  EXPECT_EQ(1, compressed->df(U"apple"));
+
+  auto expr = *parse_query(normalizer, "apple | cherry");
+
+  // Every scorer, keyed by document key, must agree with the index that
+  // never saw the updates.
+  auto scores = [&](const auto &invidx) {
+    std::map<size_t, std::vector<double>> by_key;
+    auto result = perform_search(invidx, expr);
+    BM25Scorer scorer(invidx, expr);
+    for (size_t i = 0; i < result->size(); i++) {
+      auto key = invidx.document_key(result->document_ordinal(i));
+      by_key[key] = {scorer(*result, i), bm25_score(invidx, expr, *result, i),
+                     tf_idf_score(invidx, expr, *result, i)};
+    }
+    auto ranked = bm25_top_k(invidx, expr, 10);
+    for (const auto &hit : ranked.hits) {
+      auto key =
+          invidx.document_key(ranked.postings->document_ordinal(hit.index));
+      by_key[key].push_back(hit.score);
+    }
+    return by_key;
+  };
+
+  auto expected = scores(fresh);
+  ASSERT_EQ(3, expected.size());
+  for (const auto &actual : {scores(updated), scores(*compressed)}) {
+    ASSERT_EQ(expected.size(), actual.size());
+    for (const auto &[key, values] : expected) {
+      ASSERT_EQ(values.size(), actual.at(key).size());
+      for (size_t i = 0; i < values.size(); i++) {
+        EXPECT_FALSE(std::isnan(actual.at(key)[i])) << key << " " << i;
+        EXPECT_AP(values[i], actual.at(key)[i]);
+      }
+    }
+  }
+}
+
+// The parser is shared by every call; each call's own term filter has to
+// reach the terms it parses, however many threads are parsing at once.
+TEST(QueryTest, ConcurrentParsesKeepTheirOwnNormalizer) {
+  auto parse_many = [](Normalizer normalizer, std::u32string expected) {
+    for (int i = 0; i < 2000; i++) {
+      auto expr = parse_query(normalizer, "Apple");
+      if (!expr || expr->term_str != expected) {
+        return false;
+      }
+    }
+    return true;
+  };
+
+  bool lower_ok = false;
+  bool upper_ok = false;
+  std::thread lower([&] {
+    lower_ok = parse_many(
+        [](const auto &str) { return unicode::to_lowercase(str); }, U"apple");
+  });
+  std::thread upper([&] {
+    upper_ok = parse_many(
+        [](const auto &str) { return unicode::to_uppercase(str); }, U"APPLE");
+  });
+  lower.join();
+  upper.join();
+
+  EXPECT_TRUE(lower_ok);
+  EXPECT_TRUE(upper_ok);
+}
+
+TEST(QueryTest, LineBreaksSeparateTerms) {
+  const auto &invidx = sample_index();
+  auto expected = perform_search(invidx, *parse_query(normalizer, "is first"));
+  ASSERT_EQ(1, expected->size());
+
+  for (auto query : {"is\nfirst", "is\r\nfirst", "\n is first \r\n"}) {
+    auto expr = parse_query(normalizer, query);
+    ASSERT_TRUE(expr) << query;
+    EXPECT_EQ(Operation::And, expr->operation);
+    auto postings = perform_search(invidx, *expr);
+    ASSERT_EQ(1, postings->size());
+    EXPECT_EQ(expected->document_ordinal(0), postings->document_ordinal(0));
+  }
+
+  auto expr = parse_query(normalizer, "first\n|\nsecond");
+  ASSERT_TRUE(expr);
+  EXPECT_EQ(Operation::Or, expr->operation);
+}
+
+// Each accepted group of hits is one per operand, and a later group can
+// start before an earlier one ends; the result still has to read in
+// ascending position order, which is_term_position's binary search and the
+// k-way merge of an enclosing Or rely on.
+TEST(NearTest, HitsComeOutInPositionOrder) {
+  InMemoryInvertedIndex<TextRange> invidx;
+  InMemoryIndexer indexer(invidx, normalizer);
+  indexer.index_document(0, UTF8PlainTextTokenizer("z a a z z b b"));
+  indexer.index_document(1, UTF8PlainTextTokenizer("c"));
+
+  auto postings = perform_search(invidx, *parse_query(normalizer, "a ~ b"));
+  ASSERT_EQ(1, postings->size());
+  EXPECT_EQ((std::vector<size_t>{1, 2, 5, 6}), hit_positions(*postings, 0));
+  for (auto position : {1, 2, 5, 6}) {
+    EXPECT_TRUE(postings->is_term_position(0, position)) << position;
+  }
+
+  auto merged = perform_search(invidx, *parse_query(normalizer, "(a ~ b) | c"));
+  ASSERT_EQ(2, merged->size());
+  EXPECT_EQ((std::vector<size_t>{1, 2, 5, 6}), hit_positions(*merged, 0));
+}
+
+// Two operands on the same hit used to collide in a map keyed by position,
+// so one of them was neither recorded nor advanced.
+TEST(NearTest, OperandsSharingAPositionCountOnce) {
+  InMemoryInvertedIndex<TextRange> invidx;
+  InMemoryIndexer indexer(invidx, normalizer);
+  indexer.index_document(0, UTF8PlainTextTokenizer("a x a"));
+  indexer.index_document(1, UTF8PlainTextTokenizer("apple pie apple"));
+
+  auto same = perform_search(invidx, *parse_query(normalizer, "a ~ a"));
+  ASSERT_EQ(1, same->size());
+  EXPECT_EQ((std::vector<size_t>{0, 2}), hit_positions(*same, 0));
+
+  auto prefix =
+      perform_search(invidx, *parse_query(normalizer, "apple ~ app*"));
+  ASSERT_EQ(1, prefix->size());
+  EXPECT_EQ((std::vector<size_t>{0, 2}), hit_positions(*prefix, 0));
+}
+
+// A phrase reaching past the start of the next operand is no gap at all;
+// the distance used to underflow there and reject the document.
+TEST(NearTest, OverlappingOperandsAreWithinDistance) {
+  InMemoryInvertedIndex<TextRange> invidx;
+  InMemoryIndexer indexer(invidx, normalizer);
+  indexer.index_document(0, UTF8PlainTextTokenizer("a b c"));
+
+  for (auto query : {R"("a b c" ~ b)", R"("a b c" ~ "b c")"}) {
+    auto postings = perform_search(invidx, *parse_query(normalizer, query));
+    ASSERT_EQ(1, postings->size()) << query;
+    EXPECT_EQ(0, postings->term_position(0, 0)) << query;
+    EXPECT_EQ(3, postings->term_length(0, 0)) << query;
+  }
+
+  // The gap after an overlap is measured from the furthest end reached:
+  // "a b c" ends at 2, so x at 2 + 5 is one past a distance of 4.
+  indexer.index_document(1, UTF8PlainTextTokenizer("a b c d e f g x"));
+  indexer.index_document(2, UTF8PlainTextTokenizer("a b c d e f x"));
+  auto far =
+      perform_search(invidx, *parse_query(normalizer, R"("a b c" ~ b ~ x)"));
+  ASSERT_EQ(1, far->size());
+  EXPECT_EQ(2, invidx.document_key(far->document_ordinal(0)));
+}
+
+TEST(SameScopeTest, HitsComeOutInPositionOrder) {
+  InMemoryInvertedIndex<TextRange> invidx;
+  InMemoryIndexer indexer(invidx, normalizer);
+  indexer.index_document(0, UTF8PlainTextTokenizer("z a a z z b b"));
+  invidx.set_scope_ids("paragraph", 0, {0, 0, 0, 0, 0, 0, 0});
+  indexer.index_document(1, UTF8PlainTextTokenizer("a x a"));
+  invidx.set_scope_ids("paragraph", 1, {0, 0, 1});
+
+  auto postings = perform_search(
+      invidx, same_scope_expr("paragraph", {U"a", U"b"}), &invidx);
+  ASSERT_EQ(1, postings->size());
+  EXPECT_EQ((std::vector<size_t>{1, 2, 5, 6}), hit_positions(*postings, 0));
+
+  auto same = perform_search(invidx, same_scope_expr("paragraph", {U"a", U"a"}),
+                             &invidx);
+  ASSERT_EQ(2, same->size());
+  EXPECT_EQ((std::vector<size_t>{1, 2}), hit_positions(*same, 0));
+  EXPECT_EQ((std::vector<size_t>{0, 2}), hit_positions(*same, 1));
 }
