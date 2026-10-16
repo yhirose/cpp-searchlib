@@ -3248,8 +3248,21 @@ TEST(RemoveDocumentTest, DfTracksLiveDocuments) {
   b.remove_document(2);
   EXPECT_EQ(0, b.df(U"banana"));
   EXPECT_EQ(1, a.df(U"banana"));
+}
 
-  // What a load rebuilds must agree, and keep counting afterwards.
+// What a load rebuilds must agree with the index that was saved, and keep
+// counting once documents are removed from it.
+TEST(RemoveDocumentTest, DfSurvivesSaveAndLoad) {
+  InMemoryInvertedIndex<TextRange> a;
+  InMemoryIndexer indexer(a, normalizer);
+  indexer.index_document(0, UTF8PlainTextTokenizer("apple apple banana"));
+  indexer.index_document(1, UTF8PlainTextTokenizer("apple cherry"));
+  indexer.index_document(2, UTF8PlainTextTokenizer("banana"));
+  a.remove_document(0);
+  indexer.index_document(1, UTF8PlainTextTokenizer("cherry date"));
+
+  const std::u32string terms[] = {U"apple", U"banana", U"cherry", U"date",
+                                  U"missing"};
   for (auto format : {IndexFormat::Plain, IndexFormat::Compressed}) {
     std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
     a.save(ss, {}, format);
@@ -3258,7 +3271,7 @@ TEST(RemoveDocumentTest, DfTracksLiveDocuments) {
     InMemoryInvertedIndex<TextRange> loaded;
     std::stringstream in(bytes, std::ios::in | std::ios::binary);
     loaded.load(in);
-    for (auto term : {U"apple", U"banana", U"cherry", U"date", U"missing"}) {
+    for (const auto &term : terms) {
       EXPECT_EQ(a.df(term), loaded.df(term)) << u8(term);
     }
     loaded.remove_document(2);
@@ -3270,7 +3283,7 @@ TEST(RemoveDocumentTest, DfTracksLiveDocuments) {
     if (format == IndexFormat::Compressed) {
       std::stringstream again(bytes, std::ios::in | std::ios::binary);
       auto read_only = load_compressed_index(again);
-      for (auto term : {U"apple", U"banana", U"cherry", U"date", U"missing"}) {
+      for (const auto &term : terms) {
         EXPECT_EQ(a.df(term), read_only->df(term)) << u8(term);
       }
     }
