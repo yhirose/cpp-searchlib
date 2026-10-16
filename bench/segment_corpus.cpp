@@ -24,16 +24,14 @@
 //     gives a document count that does, and matches what a reader would
 //     actually want found.
 //
-//   segment_corpus --in aozora.tsv --out segmented.tsv \
-//                  --splitter test/models/ja-ud-gsd.mod --chunk 300
+// One command, wrapped here (no trailing backslashes: in a // comment they
+// would splice the next line into it):
 //
-// Not built by CMake: it is a one-off corpus tool, not part of the library
-// or its tests. Build it beside the bench target when you need it:
+//   build/bench/searchlib-segment-corpus --in aozora.tsv
+//     --out segmented.tsv --splitter test/models/ja-ud-gsd.mod --chunk 300
 //
-//   clang++ -O2 -DNDEBUG -std=c++17 -I include -isystem third_party \
-//     -isystem third_party/fstlib -isystem third_party/peglib \
-//     -isystem third_party/unicodelib \
-//     bench/segment_corpus.cpp -o /tmp/segment_corpus
+// Built with the bench by CMake, so that it compiles, warning-clean, on every
+// CI run rather than only on the day a corpus is rebuilt.
 
 #include <searchlib.h>
 #include <searchlib_segment.h>
@@ -58,8 +56,9 @@ static std::vector<std::string> split_tsv(const std::string &in) {
 static void usage() {
   std::fprintf(
       stderr,
-      "usage: segment_corpus --in PATH --out PATH --splitter MODEL_PATH\n"
-      "                      [--text-field N] [--chunk N]\n");
+      "usage: searchlib-segment-corpus --in PATH --out PATH "
+      "--splitter MODEL_PATH\n"
+      "                                [--text-field N] [--chunk N]\n");
 }
 
 static int run(int argc, char **argv) {
