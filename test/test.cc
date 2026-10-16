@@ -3116,12 +3116,12 @@ TEST(RemoveDocumentTest, TextRangesOutOfOrderAreRejected) {
 
 TEST(RemoveDocumentTest, TombstoningAnUnknownOrdinalChangesNothing) {
   InMemoryInvertedIndexBase base;
-  base.set_document_term_count(base.push_document(), 3);
 
+  // The ordinal joined the removed set before the lookup that rejects it, so
+  // the live count (documents minus removed) wrapped around.
   EXPECT_THROW(base.tombstone(5), std::out_of_range);
-  EXPECT_EQ(1, base.document_count());
+  EXPECT_EQ(0, base.document_count());
   EXPECT_FALSE(base.has_removed_documents());
-  EXPECT_EQ(3.0, base.average_document_term_count());
 }
 
 // A removed ordinal past the documents a file holds would make the live

@@ -296,14 +296,6 @@ public:
   virtual size_t document_ordinal(size_t index) const = 0;
   virtual size_t search_hit_count(size_t index) const = 0;
 
-  // document_ordinal(index), (index+1), ... written into `out`, at most
-  // `count` of them; returns how many (fewer than asked only at the end of
-  // the list). The point is one virtual call per block rather than per
-  // document: an implementation whose values are cheap to decode in order but
-  // expensive to address individually -- Elias-Fano, where addressing one
-  // value is a select -- overrides this and pays its setup once. The default
-  // is the per-element loop, so an implementation that has nothing to gain
-  // (a vector) can ignore it.
   // Whether reading a block is actually cheaper per value than addressing
   // values one at a time. Only an implementation that has to work to reach a
   // single value says yes -- Elias-Fano, where addressing one is a select.
@@ -312,6 +304,14 @@ public:
   // (measured: a window over vector-backed postings makes an AND 22% slower).
   virtual bool prefers_block_reads() const { return false; }
 
+  // document_ordinal(index), (index+1), ... written into `out`, at most
+  // `count` of them; returns how many (fewer than asked only at the end of
+  // the list). The point is one virtual call per block rather than per
+  // document: an implementation whose values are cheap to decode in order but
+  // expensive to address individually -- Elias-Fano, where addressing one
+  // value is a select -- overrides this and pays its setup once. The default
+  // is the per-element loop, so an implementation that has nothing to gain
+  // (a vector) can ignore it.
   virtual size_t read_ordinals(size_t index, size_t *out,
                                size_t count) const {
     auto n = size();
@@ -1372,6 +1372,33 @@ enum class IndexFormat : uint32_t {
 
 namespace detail {
 
+// The file header both readers open with: the magic, then the format_type and
+// schema_version, which must be a pair this version wrote. Says which format
+// follows.
+inline IndexFormat read_index_header(std::istream &is) {
+  char magic[sizeof(kIndexMagic)];
+  is.read(magic, sizeof(magic));
+  if (!is || std::memcmp(magic, kIndexMagic, sizeof(magic)) != 0) {
+    throw std::runtime_error("searchlib: not a valid index file (bad magic)");
+  }
+  auto format_type = read_scalar<uint32_t>(is);
+  IndexFormat format;
+  uint32_t expected_schema_version;
+  if (format_type == kFormatTypePlain) {
+    format = IndexFormat::Plain;
+    expected_schema_version = kSchemaVersionPlain;
+  } else if (format_type == kFormatTypeCompressed) {
+    format = IndexFormat::Compressed;
+    expected_schema_version = kSchemaVersionCompressed;
+  } else {
+    throw std::runtime_error("searchlib: unsupported index format_type");
+  }
+  if (read_scalar<uint32_t>(is) != expected_schema_version) {
+    throw std::runtime_error("searchlib: unsupported index schema_version");
+  }
+  return format;
+}
+
 // Structural Elias-Fano compression of the text-range section, available
 // when T is the built-in TextRange (whose token positions are monotone per
 // document). Other T fall back to the generic fixed-width section even in
@@ -1652,6 +1679,18 @@ public:
     std::vector<size_t> positions_;  // every position, concatenated
   };
 
+  // How many documents the index has been handed, removed ones included: the
+  // ordinals run 0 to this, which is what a file's per-document sections
+  // (keys, text ranges) are counted against.
+  size_t ordinal_count() const { return documents_.size(); }
+
+private:
+  // The indexers are the only writers: what they add is kept in step across
+  // the members below (term ids, df, the terms of each document), which is
+  // an invariant no outside code could be trusted to hold.
+  template <typename, typename> friend class InMemoryInvertedIndex;
+  template <typename, typename> friend class InMemoryIndexer;
+
   struct Document {
     size_t term_count;
   };
@@ -1887,30 +1926,10 @@ public:
   void load(std::istream &is,
             const TextRangeDeserializer &deserialize_value = {},
             const KeyDeserializer &deserialize_key = {}) {
-    char magic[sizeof(detail::kIndexMagic)];
-    is.read(magic, sizeof(magic));
-    if (!is || std::memcmp(magic, detail::kIndexMagic, sizeof(magic)) != 0) {
-      throw std::runtime_error("searchlib: not a valid index file (bad magic)");
-    }
-    auto format_type = detail::read_scalar<uint32_t>(is);
-    IndexFormat format;
-    uint32_t expected_schema_version;
-    if (format_type == detail::kFormatTypePlain) {
-      format = IndexFormat::Plain;
-      expected_schema_version = detail::kSchemaVersionPlain;
-    } else if (format_type == detail::kFormatTypeCompressed) {
-      format = IndexFormat::Compressed;
-      expected_schema_version = detail::kSchemaVersionCompressed;
-    } else {
-      throw std::runtime_error("searchlib: unsupported index format_type");
-    }
-    auto schema_version = detail::read_scalar<uint32_t>(is);
-    if (schema_version != expected_schema_version) {
-      throw std::runtime_error("searchlib: unsupported index schema_version");
-    }
+    auto format = detail::read_index_header(is);
 
     base_.load(is, format);
-    keys_.load(is, base_.documents_.size(), deserialize_key);
+    keys_.load(is, base_.ordinal_count(), deserialize_key);
 
     text_range_list_.clear();
     if (format == IndexFormat::Compressed) {
@@ -3385,6 +3404,25 @@ void for_each_word(std::string_view text, const Delegation *delegation,
 // docs/postings_compression_design.ja.md section 6.2.
 inline constexpr size_t kCompressedPostingsThreshold = 16;
 
+// The scope section (see InMemoryInvertedIndexBase::save): a count of scope
+// names, each with the documents that have scope data under it. Calls
+// keep(name, ordinal, sequence) for each; a reader that has no use for the
+// data passes a callback that drops it, which keeps the sections after it
+// aligned.
+template <typename Keep> void read_scope_section(std::istream &is, Keep keep) {
+  auto scope_name_count = read_scalar<uint64_t>(is);
+  for (uint64_t i = 0; i < scope_name_count; i++) {
+    auto name = read_bytes(is);
+    auto doc_count = read_scalar<uint64_t>(is);
+    for (uint64_t j = 0; j < doc_count; j++) {
+      auto ordinal = static_cast<size_t>(read_scalar<uint64_t>(is));
+      EliasFano ef;
+      ef.load(is);
+      keep(name, ordinal, std::move(ef));
+    }
+  }
+}
+
 // Definition of the type declared opaque up in the interface. One Elias-Fano
 // sequence per (scope_name, ordinal), each mapping term_pos -> scope ordinal
 // via EliasFano::access.
@@ -3679,18 +3717,10 @@ class CompressedInvertedIndex
     : public IInvertedIndexWithTextRange<TextRange, Key> {
 public:
   void load(std::istream &is) {
-    char magic[sizeof(kIndexMagic)];
-    is.read(magic, sizeof(magic));
-    if (!is || std::memcmp(magic, kIndexMagic, sizeof(magic)) != 0) {
-      throw std::runtime_error("searchlib: not a valid index file (bad magic)");
-    }
-    if (read_scalar<uint32_t>(is) != kFormatTypeCompressed) {
+    if (read_index_header(is) != IndexFormat::Compressed) {
       throw std::runtime_error(
           "searchlib: the compressed backend requires a Compressed-format "
           "index file");
-    }
-    if (read_scalar<uint32_t>(is) != kSchemaVersionCompressed) {
-      throw std::runtime_error("searchlib: unsupported index schema_version");
     }
 
     // Section order mirrors InMemoryInvertedIndexBase::load, then the key
@@ -3747,17 +3777,7 @@ public:
     // discard, since IScopeIndex is not exposed by this read-only backend
     // yet (v1 limitation, see docs/missing_features.ja.md 3.4.1). Skipping
     // it explicitly keeps the following sections aligned.
-    auto scope_name_count = read_scalar<uint64_t>(is);
-    for (uint64_t i = 0; i < scope_name_count; i++) {
-      read_bytes(is); // name
-
-      auto doc_count = read_scalar<uint64_t>(is);
-      for (uint64_t j = 0; j < doc_count; j++) {
-        read_scalar<uint64_t>(is); // ordinal
-        EliasFano discarded;
-        discarded.load(is);
-      }
-    }
+    read_scope_section(is, [](const std::string &, size_t, EliasFano &&) {});
 
     keys_.load(is, term_counts_.size());
 
@@ -3941,10 +3961,6 @@ private:
   EFTextRanges text_ranges_;
   double average_document_term_count_ = 0.0;
 };
-
-//-----------------------------------------------------------------------------
-// Search evaluation
-//-----------------------------------------------------------------------------
 
 //-----------------------------------------------------------------------------
 
@@ -6422,22 +6438,13 @@ inline void InMemoryInvertedIndexBase::load(std::istream &is,
   rebuild_document_terms_();
 
   scope_data_.reset();
-  auto scope_name_count = detail::read_scalar<uint64_t>(is);
-  if (scope_name_count > 0) {
-    scope_data_ = std::make_shared<detail::ScopeIndexData>();
-    for (uint64_t i = 0; i < scope_name_count; i++) {
-      auto name = detail::read_bytes(is);
-
-      auto &by_document = scope_data_->by_name[name];
-      auto doc_count = detail::read_scalar<uint64_t>(is);
-      for (uint64_t j = 0; j < doc_count; j++) {
-        auto ordinal = static_cast<size_t>(detail::read_scalar<uint64_t>(is));
-        detail::EliasFano ef;
-        ef.load(is);
-        by_document.insert_or_assign(ordinal, std::move(ef));
-      }
-    }
-  }
+  detail::read_scope_section(
+      is, [&](const std::string &name, size_t ordinal, detail::EliasFano &&ef) {
+        if (!scope_data_) {
+          scope_data_ = std::make_shared<detail::ScopeIndexData>();
+        }
+        scope_data_->by_name[name].insert_or_assign(ordinal, std::move(ef));
+      });
 }
 
 //-----------------------------------------------------------------------------
