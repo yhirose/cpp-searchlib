@@ -188,10 +188,40 @@ inline void write_u32string(std::ostream &os, const std::u32string &s) {
   }
 }
 
+// A count read from a stream is a claim, not yet a fact, and a corrupt file
+// can claim 2^60 of anything. Readers therefore never size an allocation
+// from one: they reserve at most this much up front, which is plenty for a
+// real file's usual counts, and let the container grow as the data actually
+// arrives -- so a lie runs into the end of the stream, which is a
+// runtime_error like every other truncation, long before it runs into
+// bad_alloc or length_error.
+inline constexpr uint64_t kMaxPreallocation = uint64_t(1) << 16;
+
+inline size_t reserve_hint(uint64_t count) {
+  return static_cast<size_t>(std::min(count, kMaxPreallocation));
+}
+
+// `n` bytes off the stream, grown a chunk at a time for the reason above.
+inline std::string read_exact(std::istream &is, uint64_t n) {
+  std::string bytes;
+  bytes.reserve(reserve_hint(n));
+  std::array<char, 4096> chunk;
+  while (n > 0) {
+    auto take = static_cast<size_t>(std::min<uint64_t>(n, chunk.size()));
+    is.read(chunk.data(), static_cast<std::streamsize>(take));
+    if (!is) {
+      throw std::runtime_error("searchlib: unexpected end of index stream");
+    }
+    bytes.append(chunk.data(), take);
+    n -= take;
+  }
+  return bytes;
+}
+
 inline std::u32string read_u32string(std::istream &is) {
   auto n = read_scalar<uint64_t>(is);
   std::u32string s;
-  s.reserve(static_cast<size_t>(n));
+  s.reserve(reserve_hint(n));
   for (uint64_t i = 0; i < n; i++) {
     s.push_back(static_cast<char32_t>(read_scalar<uint32_t>(is)));
   }
@@ -205,15 +235,7 @@ inline void write_bytes(std::ostream &os, std::string_view bytes) {
 }
 
 inline std::string read_bytes(std::istream &is) {
-  auto n = static_cast<size_t>(read_scalar<uint64_t>(is));
-  std::string bytes(n, '\0');
-  if (n > 0) {
-    is.read(bytes.data(), static_cast<std::streamsize>(n));
-    if (!is) {
-      throw std::runtime_error("searchlib: unexpected end of index stream");
-    }
-  }
-  return bytes;
+  return read_exact(is, read_scalar<uint64_t>(is));
 }
 
 // The removed ordinals as a bit per document, for the load-time passes that
@@ -238,8 +260,7 @@ inline void read_removed_ordinals(std::istream &is, size_t document_count,
                                   std::unordered_set<size_t> &removed) {
   removed.clear();
   auto removed_count = read_scalar<uint64_t>(is);
-  removed.reserve(
-      static_cast<size_t>(std::min<uint64_t>(removed_count, document_count)));
+  removed.reserve(std::min(reserve_hint(removed_count), document_count));
   for (uint64_t i = 0; i < removed_count; i++) {
     auto ordinal = read_scalar<uint64_t>(is);
     if (ordinal >= document_count) {
@@ -1440,19 +1461,28 @@ public:
     }
   }
 
-  void load(std::istream &is, const Deserializer &deserialize_key = {}) {
+  // `expected_count` is how many documents the file holds: the section has
+  // one key per document, and a count that says otherwise is refused before
+  // anything is sized from it (a dense section would otherwise make up that
+  // many keys out of nothing).
+  void load(std::istream &is, size_t expected_count,
+            const Deserializer &deserialize_key = {}) {
     clear();
-    auto count = static_cast<size_t>(detail::read_scalar<uint64_t>(is));
-    keys_.reserve(count);
+    auto count = detail::read_scalar<uint64_t>(is);
+    if (count != expected_count) {
+      throw std::runtime_error(
+          "searchlib: the key section disagrees with the documents section");
+    }
+    keys_.reserve(expected_count);
     if constexpr (std::is_integral_v<Key>) {
       if (detail::read_scalar<uint32_t>(is)) {
-        for (size_t i = 0; i < count; i++) {
+        for (size_t i = 0; i < expected_count; i++) {
           push(static_cast<Key>(i), i);
         }
         return;
       }
     }
-    for (size_t i = 0; i < count; i++) {
+    for (size_t i = 0; i < expected_count; i++) {
       push(load_key_(is, deserialize_key), i);
     }
   }
@@ -1880,11 +1910,7 @@ public:
     }
 
     base_.load(is, format);
-    keys_.load(is, deserialize_key);
-    if (keys_.size() != base_.documents_.size()) {
-      throw std::runtime_error(
-          "searchlib: the key section disagrees with the documents section");
-    }
+    keys_.load(is, base_.documents_.size(), deserialize_key);
 
     text_range_list_.clear();
     if (format == IndexFormat::Compressed) {
@@ -1960,7 +1986,7 @@ private:
       auto ordinal = static_cast<size_t>(detail::read_scalar<uint64_t>(is));
       auto value_count = detail::read_scalar<uint64_t>(is);
       std::vector<T> values;
-      values.reserve(static_cast<size_t>(value_count));
+      values.reserve(detail::reserve_hint(value_count));
       for (uint64_t j = 0; j < value_count; j++) {
         values.push_back(load_value_(is, deserialize_value));
       }
@@ -2290,16 +2316,7 @@ public:
     fields_.clear();
     auto count = detail::read_scalar<uint64_t>(is);
     for (uint64_t i = 0; i < count; i++) {
-      auto name_length =
-          static_cast<size_t>(detail::read_scalar<uint64_t>(is));
-      std::string name(name_length, '\0');
-      if (name_length > 0) {
-        is.read(name.data(), static_cast<std::streamsize>(name_length));
-        if (!is) {
-          throw std::runtime_error(
-              "searchlib: unexpected end of multi-field index stream");
-        }
-      }
+      auto name = detail::read_bytes(is);
       InMemoryInvertedIndex<T, Key> index;
       index.load(is, deserialize_value);
       fields_[std::move(name)] = std::move(index);
@@ -2464,11 +2481,14 @@ public:
   }
 
   void load(std::istream &is) {
-    bit_count_ = static_cast<size_t>(read_scalar<uint64_t>(is));
-    words_.assign((bit_count_ + 63) / 64, 0);
-    for (auto &word : words_) {
-      word = read_scalar<uint64_t>(is);
+    auto bit_count = read_scalar<uint64_t>(is);
+    auto word_count = bit_count / 64 + (bit_count % 64 != 0);
+    words_.clear();
+    words_.reserve(reserve_hint(word_count));
+    for (uint64_t i = 0; i < word_count; i++) {
+      words_.push_back(read_scalar<uint64_t>(is));
     }
+    bit_count_ = static_cast<size_t>(bit_count);
     build();
   }
 
@@ -3092,11 +3112,20 @@ public:
   // readers that only look terms up keep this object instead and never
   // materialize the vocabulary.
   std::vector<std::u32string> terms(size_t term_count) const {
-    std::vector<std::u32string> result(term_count);
     if (term_count == 0) {
-      return result;
+      return {};
     }
     if (!map_) {
+      throw std::runtime_error("searchlib: corrupt term dictionary FST");
+    }
+
+    // What the FST holds is gathered first, so that nothing is sized from
+    // term_count -- a count out of the file -- until the FST agrees with it.
+    std::vector<std::pair<uint32_t, std::u32string>> found;
+    map_->enumerate([&](const std::string &key, const uint32_t &ordinal) {
+      found.emplace_back(ordinal, u32(key));
+    });
+    if (found.size() != term_count) {
       throw std::runtime_error("searchlib: corrupt term dictionary FST");
     }
 
@@ -3104,20 +3133,15 @@ public:
     // than appending. Every ordinal has to be claimed exactly once: a
     // duplicate would overwrite one term and leave another slot empty, which
     // would silently attach a record to the wrong term.
+    std::vector<std::u32string> result(term_count);
     std::vector<bool> claimed(term_count, false);
-    size_t seen = 0;
-    map_->enumerate([&](const std::string &key, const uint32_t &ordinal) {
+    for (auto &[ordinal, str] : found) {
       if (ordinal >= term_count || claimed[ordinal]) {
         throw std::runtime_error("searchlib: corrupt term dictionary FST");
       }
       claimed[ordinal] = true;
-      result[ordinal] = u32(key);
-      seen++;
-    });
-    if (seen != term_count) {
-      throw std::runtime_error("searchlib: corrupt term dictionary FST");
+      result[ordinal] = std::move(str);
     }
-
     return result;
   }
 
@@ -3398,6 +3422,10 @@ inline size_t live_document_frequency(const IPostings &p,
   for (size_t i = 0; i < n;) {
     auto read = p.read_ordinals(i, block.data(), block.size());
     for (size_t j = 0; j < read; j++) {
+      if (block[j] >= removed.size()) {
+        throw std::runtime_error(
+            "searchlib: postings name a document the index does not have");
+      }
       dead += removed[block[j]];
     }
     i += read;
@@ -3665,7 +3693,7 @@ public:
     // InMemoryInvertedIndex<TextRange, Key>::load. Document records are in
     // ordinal order, so the vector indexes by ordinal directly.
     auto document_count = read_scalar<uint64_t>(is);
-    term_counts_.reserve(static_cast<size_t>(document_count));
+    term_counts_.reserve(reserve_hint(document_count));
     for (uint64_t i = 0; i < document_count; i++) {
       term_counts_.push_back(static_cast<size_t>(read_varint(is)));
     }
@@ -3678,9 +3706,9 @@ public:
     auto term_count = static_cast<size_t>(read_scalar<uint64_t>(is));
     term_dictionary_.load(is);
 
-    terms_.resize(term_count);
+    terms_.reserve(reserve_hint(term_count));
     for (size_t i = 0; i < term_count; i++) {
-      auto &term = terms_[i];
+      auto &term = terms_.emplace_back();
       term.term_count = static_cast<size_t>(read_varint(is));
       if (read_scalar<uint8_t>(is)) {
         auto postings = std::make_shared<EFPostings>();
@@ -3716,9 +3744,7 @@ public:
     // it explicitly keeps the following sections aligned.
     auto scope_name_count = read_scalar<uint64_t>(is);
     for (uint64_t i = 0; i < scope_name_count; i++) {
-      auto name_size = static_cast<size_t>(read_scalar<uint64_t>(is));
-      std::string name(name_size, '\0');
-      is.read(name.data(), static_cast<std::streamsize>(name_size));
+      read_bytes(is); // name
 
       auto doc_count = read_scalar<uint64_t>(is);
       for (uint64_t j = 0; j < doc_count; j++) {
@@ -3728,11 +3754,7 @@ public:
       }
     }
 
-    keys_.load(is);
-    if (keys_.size() != term_counts_.size()) {
-      throw std::runtime_error(
-          "searchlib: the key section disagrees with the documents section");
-    }
+    keys_.load(is, term_counts_.size());
 
     if (read_scalar<uint32_t>(is) != 1) {
       throw std::runtime_error(
@@ -5725,8 +5747,8 @@ inline void InMemoryInvertedIndexBase::Postings::load(std::istream &is) {
   document_ordinals_.clear();
   offsets_.assign(1, 0);
   positions_.clear();
-  document_ordinals_.reserve(static_cast<size_t>(entry_count));
-  offsets_.reserve(static_cast<size_t>(entry_count) + 1);
+  document_ordinals_.reserve(detail::reserve_hint(entry_count));
+  offsets_.reserve(detail::reserve_hint(entry_count) + 1);
   for (uint64_t i = 0; i < entry_count; i++) {
     document_ordinals_.push_back(
         static_cast<size_t>(detail::read_scalar<uint64_t>(is)));
@@ -5760,8 +5782,8 @@ inline void InMemoryInvertedIndexBase::Postings::load_varint(std::istream &is) {
   document_ordinals_.clear();
   offsets_.assign(1, 0);
   positions_.clear();
-  document_ordinals_.reserve(static_cast<size_t>(entry_count));
-  offsets_.reserve(static_cast<size_t>(entry_count) + 1);
+  document_ordinals_.reserve(detail::reserve_hint(entry_count));
+  offsets_.reserve(detail::reserve_hint(entry_count) + 1);
   size_t previous_ordinal = 0;
   for (uint64_t i = 0; i < entry_count; i++) {
     previous_ordinal += static_cast<size_t>(detail::read_varint(is));
@@ -6305,6 +6327,10 @@ inline void InMemoryInvertedIndexBase::rebuild_document_terms_() {
   auto for_each_live_entry = [&](const Term &term, auto fn) {
     for (size_t i = 0; i < term.postings.size(); i++) {
       auto ordinal = term.postings.document_ordinal(i);
+      if (ordinal >= removed.size()) {
+        throw std::runtime_error(
+            "searchlib: postings name a document the index does not have");
+      }
       if (!removed[ordinal]) {
         fn(ordinal);
       }
@@ -6341,7 +6367,7 @@ inline void InMemoryInvertedIndexBase::load(std::istream &is,
   auto compressed_format = format == IndexFormat::Compressed;
   documents_.clear();
   auto document_count = detail::read_scalar<uint64_t>(is);
-  documents_.reserve(static_cast<size_t>(document_count));
+  documents_.reserve(detail::reserve_hint(document_count));
   for (uint64_t i = 0; i < document_count; i++) {
     documents_.push_back(Document{static_cast<size_t>(
         compressed_format ? detail::read_varint(is)
@@ -6352,7 +6378,7 @@ inline void InMemoryInvertedIndexBase::load(std::istream &is,
 
   term_dictionary_.clear();
   auto term_count = detail::read_scalar<uint64_t>(is);
-  term_dictionary_.reserve(static_cast<size_t>(term_count));
+  term_dictionary_.reserve(detail::reserve_hint(term_count));
 
   // In the Compressed format the term strings live in one FST ahead of the
   // per-term records; recover them up front so the loop below can stay
@@ -6395,9 +6421,7 @@ inline void InMemoryInvertedIndexBase::load(std::istream &is,
   if (scope_name_count > 0) {
     scope_data_ = std::make_shared<detail::ScopeIndexData>();
     for (uint64_t i = 0; i < scope_name_count; i++) {
-      auto name_size = static_cast<size_t>(detail::read_scalar<uint64_t>(is));
-      std::string name(name_size, '\0');
-      is.read(name.data(), static_cast<std::streamsize>(name_size));
+      auto name = detail::read_bytes(is);
 
       auto &by_document = scope_data_->by_name[name];
       auto doc_count = detail::read_scalar<uint64_t>(is);

@@ -3309,3 +3309,133 @@ TEST(RemoveDocumentTest, FailedReindexLeavesDfUnchanged) {
   EXPECT_EQ(0, invidx.df(U"apple"));
   EXPECT_EQ(1, invidx.df(U"fresh"));
 }
+
+//-----------------------------------------------------------------------------
+// Corrupt input
+//-----------------------------------------------------------------------------
+
+// A length read out of a file is a claim, not a fact. These are refused as a
+// truncated stream is -- a runtime_error -- rather than sized into an
+// allocation (bad_alloc, or length_error from a size past max_size).
+TEST(CorruptIndexTest, ClaimedLengthsAreRefusedNotAllocated) {
+  auto stream = [](uint64_t claimed) {
+    std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+    detail::write_scalar<uint64_t>(ss, claimed);
+    ss.write("abc", 3);
+    return ss;
+  };
+  for (uint64_t claimed :
+       {uint64_t(1) << 40, uint64_t(1) << 62, ~uint64_t(0)}) {
+    {
+      auto ss = stream(claimed);
+      EXPECT_THROW(detail::read_bytes(ss), std::runtime_error) << claimed;
+    }
+    {
+      auto ss = stream(claimed);
+      EXPECT_THROW(detail::read_u32string(ss), std::runtime_error) << claimed;
+    }
+    {
+      auto ss = stream(claimed);
+      detail::BitVector bits;
+      EXPECT_THROW(bits.load(ss), std::runtime_error) << claimed;
+    }
+  }
+
+  // Short, honest values still read back.
+  std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+  detail::write_bytes(ss, "hello");
+  detail::write_u32string(ss, U"東京");
+  EXPECT_EQ("hello", detail::read_bytes(ss));
+  EXPECT_EQ(U"東京", detail::read_u32string(ss));
+}
+
+// Overwrite every 8 bytes of a saved index in turn with a huge count and
+// load it: whatever the field was, the load either goes through or says so
+// with a runtime_error. In particular it never tries to allocate what the
+// count claims. (Plain format: the Compressed one carries an FST whose
+// bytes are not validated by the vendored fstlib.)
+TEST(CorruptIndexTest, HugeCountAnywhereOnlyEverThrowsRuntimeError) {
+  auto invidx = sample_index();
+  invidx.remove_document(1);
+  invidx.set_scope_ids("paragraph", 0,
+                       {0, 0, 1, 1, 1}); // "This is the first document."
+  std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+  invidx.save(ss);
+  const std::string good = ss.str();
+
+  const uint64_t huge = uint64_t(1) << 62;
+  size_t refused = 0;
+  for (size_t at = 0; at + sizeof(huge) <= good.size(); at++) {
+    auto bytes = good;
+    std::memcpy(&bytes[at], &huge, sizeof(huge));
+    std::stringstream in(bytes, std::ios::in | std::ios::binary);
+    InMemoryInvertedIndex<TextRange> loaded;
+    try {
+      loaded.load(in);
+    } catch (const std::runtime_error &) {
+      refused++;
+    } catch (const std::exception &e) {
+      ADD_FAILURE() << "offset " << at << ": " << typeid(e).name() << ": "
+                    << e.what();
+    }
+  }
+  // Counts are scattered through the file; plenty of the windows hit one.
+  EXPECT_GT(refused, 20u);
+}
+
+// A key section is one key per document; the file's own count of them must
+// say so before anything is sized from it.
+TEST(CorruptIndexTest, KeySectionCountMustMatchTheDocuments) {
+  for (auto format : {IndexFormat::Plain, IndexFormat::Compressed}) {
+    auto invidx = sample_index();
+    std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+    invidx.save(ss, {}, format);
+    auto bytes = ss.str();
+
+    // The dense key section opens with its count, then a flag of 1; find it
+    // as the last "count, 1" pair before the text ranges by looking for the
+    // document count where the section starts.
+    uint64_t count = sample_documents.size();
+    uint32_t dense = 1;
+    std::string pattern(sizeof(count) + sizeof(dense), '\0');
+    std::memcpy(&pattern[0], &count, sizeof(count));
+    std::memcpy(&pattern[sizeof(count)], &dense, sizeof(dense));
+    auto at = bytes.rfind(pattern);
+    ASSERT_NE(std::string::npos, at);
+
+    uint64_t lie = uint64_t(1) << 40;
+    std::memcpy(&bytes[at], &lie, sizeof(lie));
+    std::stringstream in(bytes, std::ios::in | std::ios::binary);
+    InMemoryInvertedIndex<TextRange> loaded;
+    EXPECT_THROW(loaded.load(in), std::runtime_error);
+    if (format == IndexFormat::Compressed) {
+      std::stringstream again(bytes, std::ios::in | std::ios::binary);
+      EXPECT_THROW(load_compressed_index(again), std::runtime_error);
+    }
+  }
+}
+
+// The df bookkeeping indexes by the ordinals in the postings, so a postings
+// list naming a document the index does not have is refused at load.
+TEST(CorruptIndexTest, PostingsNamingAnUnknownDocumentAreRefused) {
+  InMemoryInvertedIndex<TextRange> invidx;
+  InMemoryIndexer indexer(invidx, normalizer);
+  indexer.index_document(0, UTF8PlainTextTokenizer("apple"));
+  std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+  invidx.save(ss);
+  auto bytes = ss.str();
+
+  // The only posting's ordinal is 0 and no other field in a one-document
+  // index holds a 0 followed by the 1 position count and position 0, so
+  // look for ordinal 0, count 1, position 0 as three uint64s.
+  uint64_t entry[3] = {0, 1, 0};
+  auto at = bytes.find(
+      std::string(reinterpret_cast<const char *>(entry), sizeof(entry)));
+  ASSERT_NE(std::string::npos, at);
+  uint64_t past_the_end = 50;
+  std::memcpy(&bytes[at], &past_the_end, sizeof(past_the_end));
+
+  std::stringstream in(bytes, std::ios::in | std::ios::binary);
+  InMemoryInvertedIndex<TextRange> loaded;
+  EXPECT_THROW(loaded.load(in), std::runtime_error);
+}
