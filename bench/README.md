@@ -22,9 +22,12 @@ measures the two segmenters as much as the two engines, and the hit counts
 never line up.
 
 So the corpus is segmented **once**, by cpp-searchlib, into space-separated
-terms, and both engines index that with a whitespace tokenizer. Reading the
-result back through `UTF8PlainTextTokenizer` reproduces the term count
-exactly, which is the check that the round trip loses nothing. Tokenization
+terms, and both engines index that with a whitespace tokenizer. Splitting the
+result on whitespace gives back exactly the terms written -- `segment_corpus`
+stops with an error on a term that has whitespace inside it, the one way that
+could fail. Reading it back through `UTF8PlainTextTokenizer` does not: that
+tokenizer cuts Han text into single characters, so `東京 タワー に 行っ た`
+(five terms) comes back as seven. Tokenization
 cost is then measured separately rather than folded into either engine's
 build time.
 

@@ -39,7 +39,9 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <fstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -88,6 +90,32 @@ long long resident_mib() {
 #else
   return 0;
 #endif
+}
+
+// The value of a counting option, or a message naming the option and exit
+// status 1. std::stoul alone would end the process on "abc" with an uncaught
+// std::invalid_argument that does not say which option was wrong, read "12x"
+// as 12, and wrap "-1" round to the largest size_t. `min` is there for the
+// options where zero is not a smaller run but no run at all: best_of over
+// zero runs never times anything and reports DBL_MAX as the best time.
+size_t parse_count(const std::string &value, const char *what, size_t min) {
+  auto ok = !value.empty() &&
+            value.find_first_not_of("0123456789") == std::string::npos;
+  unsigned long long n = 0;
+  if (ok) {
+    try {
+      n = std::stoull(value);
+    } catch (const std::out_of_range &) {
+      ok = false;
+    }
+  }
+  if (!ok || n < min) {
+    std::fprintf(stderr,
+                 "bench: %s takes an integer of at least %zu, got '%s'\n", what,
+                 min, value.c_str());
+    std::exit(1);
+  }
+  return static_cast<size_t>(n);
 }
 
 size_t file_size(const std::string &path) {
@@ -187,7 +215,7 @@ constexpr size_t kNaiveScoreHitLimit = 100000;
 
 } // namespace
 
-int main(int argc, char **argv) {
+static int run(int argc, char **argv) {
   std::string corpus_path = "../../test/t_kjv.tsv";
   std::string queries_path;
   std::string splitter_path;
@@ -208,13 +236,16 @@ int main(int argc, char **argv) {
   for (int i = 1; i < argc; i++) {
     std::string arg = argv[i];
     if (arg == "--repeat") {
-      repeat = std::stoul(need_value(++i, "--repeat"));
+      // At least 1: read_corpus would treat 0 as 1, which is not what the
+      // option says.
+      repeat = parse_count(need_value(++i, "--repeat"), "--repeat", 1);
     } else if (arg == "--runs") {
-      runs = std::stoul(need_value(++i, "--runs"));
+      runs = parse_count(need_value(++i, "--runs"), "--runs", 1);
     } else if (arg == "--corpus") {
       corpus_path = need_value(++i, "--corpus");
     } else if (arg == "--text-field") {
-      text_field = std::stoul(need_value(++i, "--text-field"));
+      text_field =
+          parse_count(need_value(++i, "--text-field"), "--text-field", 0);
     } else if (arg == "--queries") {
       queries_path = need_value(++i, "--queries");
     } else if (arg == "--splitter") {
@@ -410,4 +441,17 @@ int main(int argc, char **argv) {
   }
 
   return 0;
+}
+
+// The library reports a model it cannot load, or an index file it cannot
+// write or read back, by throwing. Left uncaught that is a bare "terminate
+// called" (or an abort dialog on Windows); caught here it is one line saying
+// what failed, and an exit status a script can test.
+int main(int argc, char **argv) {
+  try {
+    return run(argc, argv);
+  } catch (const std::exception &e) {
+    std::fprintf(stderr, "bench: %s\n", e.what());
+    return 1;
+  }
 }

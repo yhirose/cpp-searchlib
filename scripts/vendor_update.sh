@@ -10,7 +10,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ALL=(fstlib unicodelib peglib segmentlib)
 
 if [[ $# -gt 1 ]]; then
-    echo "usage: $0 [${ALL[*]// /|}]" >&2
+    # "${ALL[*]}" joins with the first character of IFS; a pattern
+    # substitution like ${ALL[*]// /|} would instead run inside each element
+    # (none of which has a space), leaving the names space-separated.
+    usage_names="$(IFS='|'; echo "${ALL[*]}")"
+    echo "usage: $0 [${usage_names}]" >&2
     exit 1
 fi
 

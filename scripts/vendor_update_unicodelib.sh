@@ -12,6 +12,10 @@ VENDOR_DIR="${SCRIPT_DIR}/../third_party/unicodelib"
 REPO="yhirose/cpp-unicodelib"
 
 REV="$(latest_head_sha "${REPO}")"
+if [[ -z "${REV}" ]]; then
+    echo "error: could not resolve the tip commit of ${REPO}" >&2
+    exit 1
+fi
 CURRENT_REV="$(current_revision "${VENDOR_DIR}")"
 
 if [[ "${REV}" == "${CURRENT_REV}" ]]; then
