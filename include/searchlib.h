@@ -1675,6 +1675,15 @@ public:
     void load_compressed(std::istream &is);
 
   private:
+    // What add_term_position guarantees and every reader of a postings list
+    // relies on -- each entry has a position, ordinals strictly ascend, and
+    // so do the positions within an entry -- checked on what a load has just
+    // decoded. A file can say otherwise; the compressed encoding assumes it
+    // (an entry without positions, or positions out of order, would be saved
+    // as a different list than was loaded), and a binary search over a list
+    // that is not sorted answers wrongly.
+    void check_loaded_() const;
+
     // Ordinals ascending (by construction, see add_term_position), so that
     // document_ordinal(index) is O(1) and lookups by ordinal can
     // binary-search; each document's term positions are the slice
@@ -1933,30 +1942,39 @@ public:
     }
   }
 
+  // All or nothing: everything is read into locals and replaces what this
+  // index holds only once the whole stream has loaded, so one that fails
+  // part-way (truncated, corrupt) leaves the index as it was.
   void load(std::istream &is,
             const TextRangeDeserializer &deserialize_value = {},
             const KeyDeserializer &deserialize_key = {}) {
     auto format = detail::read_index_header(is);
 
-    base_.load(is, format);
-    keys_.load(is, base_.documents_.size(), deserialize_key);
+    InMemoryInvertedIndexBase base;
+    base.load(is, format);
+    KeyTable<Key> keys;
+    keys.load(is, base.documents_.size(), deserialize_key);
 
-    text_range_list_.clear();
+    TextRangeList<T> text_ranges;
     if (format == IndexFormat::Compressed) {
       auto structural = detail::read_scalar<uint32_t>(is);
       if (structural) {
         if constexpr (std::is_same_v<T, TextRange>) {
-          detail::load_text_ranges_compressed(is, text_range_list_);
+          detail::load_text_ranges_compressed(is, text_ranges);
         } else {
           throw std::runtime_error(
               "searchlib: index text-range section requires TextRange");
         }
       } else {
-        load_text_ranges_(is, deserialize_value);
+        load_text_ranges_(is, deserialize_value, text_ranges);
       }
     } else {
-      load_text_ranges_(is, deserialize_value);
+      load_text_ranges_(is, deserialize_value, text_ranges);
     }
+
+    base_ = std::move(base);
+    keys_ = std::move(keys);
+    text_range_list_ = std::move(text_ranges);
   }
 
   void save(const std::string &path,
@@ -2008,8 +2026,9 @@ private:
     }
   }
 
-  void load_text_ranges_(std::istream &is,
-                         const TextRangeDeserializer &deserialize_value) {
+  static void load_text_ranges_(std::istream &is,
+                                const TextRangeDeserializer &deserialize_value,
+                                TextRangeList<T> &text_ranges) {
     auto document_count = detail::read_scalar<uint64_t>(is);
     for (uint64_t i = 0; i < document_count; i++) {
       auto ordinal = static_cast<size_t>(detail::read_scalar<uint64_t>(is));
@@ -2019,7 +2038,7 @@ private:
       for (uint64_t j = 0; j < value_count; j++) {
         values.push_back(load_value_(is, deserialize_value));
       }
-      text_range_list_[ordinal] = std::move(values);
+      text_ranges[ordinal] = std::move(values);
     }
   }
 
@@ -5975,6 +5994,7 @@ inline void InMemoryInvertedIndexBase::Postings::load(std::istream &is) {
     }
     offsets_.push_back(positions_.size());
   }
+  check_loaded_();
 }
 
 inline void
@@ -6013,6 +6033,7 @@ inline void InMemoryInvertedIndexBase::Postings::load_varint(std::istream &is) {
     }
     offsets_.push_back(positions_.size());
   }
+  check_loaded_();
 }
 
 inline void InMemoryInvertedIndexBase::Postings::save_compressed(
@@ -6045,7 +6066,9 @@ inline void InMemoryInvertedIndexBase::Postings::save_compressed(
     for (auto j = offsets_[i]; j < offsets_[i + 1]; j++) {
       monotonized_positions.push_back(base + positions_[j]);
     }
-    base = monotonized_positions.back() + 1;
+    if (!monotonized_positions.empty()) {
+      base = monotonized_positions.back() + 1;
+    }
   }
 
   // A universe of last + 1 on a non-empty sequence, and 1 on an empty one:
@@ -6105,6 +6128,23 @@ InMemoryInvertedIndexBase::Postings::load_compressed(std::istream &is) {
     document_ordinals_.push_back(static_cast<size_t>(ordinals.access(i)));
     offsets_.push_back(positions_.size());
     begin = end;
+  }
+  check_loaded_();
+}
+
+inline void InMemoryInvertedIndexBase::Postings::check_loaded_() const {
+  for (size_t i = 0; i < document_ordinals_.size(); i++) {
+    auto first = offsets_[i];
+    auto last = offsets_[i + 1];
+    auto ascending = first < last && (i == 0 || document_ordinals_[i - 1] <
+                                                    document_ordinals_[i]);
+    for (auto j = first + 1; ascending && j < last; j++) {
+      ascending = positions_[j - 1] < positions_[j];
+    }
+    if (!ascending) {
+      throw std::runtime_error(
+          "searchlib: postings are empty or out of order in index stream");
+    }
   }
 }
 
@@ -7060,6 +7100,12 @@ inline double BM25Scorer::operator()(const IPostings &postings,
       return *terms_[t].postings;
     });
   }
+  // The window is keyed by the result's address, which is enough because only
+  // a result that prefers block reads buffers anything, and the only such
+  // results are the Elias-Fano postings a Term query hands back: the index
+  // owns them for as long as this scorer is valid, at one address with one
+  // content. A transient IPostings that prefers block reads would need a
+  // scorer per result.
   if (result_ != &postings) {
     result_ = &postings;
     result_window_ = PostingsWindow(&postings);
@@ -7480,13 +7526,14 @@ parse_query(TextSplitter splitter, TermFilter filter, std::string_view query) {
       close_position();
 
       if (!split_any) {
-        // No letter sequence in the token (e.g. digits only); such a term can
-        // never exist in the index. Run it through the filter as-is so a
-        // configured chain (e.g. lowercasing) still applies, but an empty
-        // result still matches nothing.
+        // The splitter found no word in the token (only punctuation, say),
+        // so no index built with it has this string as a term. Run it through
+        // the filter as-is so a configured chain (e.g. lowercasing) still
+        // applies; a filter that drops it leaves the empty term, which
+        // matches nothing, as when it drops every piece below.
         auto emitted = run_filter(u32(token));
         if (emitted.empty()) {
-          return Expression{Operation::Term, u32(token)};
+          return Expression{Operation::Term, std::u32string()};
         }
         return to_expression(std::move(emitted));
       }

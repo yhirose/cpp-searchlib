@@ -858,6 +858,35 @@ TEST(TF_IDF_Test, TF_IDF) {
   }
 }
 
+// One scorer scoring one result after another, the first freed before the
+// second is built (which can put it at the same address): on the compressed
+// backend, where the scorer reads in blocks, every score is the one
+// bm25_score gives.
+TEST(BM25Test, AScorerScoresSuccessiveResultsOnTheCompressedBackend) {
+  InMemoryInvertedIndex<TextRange> invidx;
+  InMemoryIndexer indexer(invidx, normalizer);
+  for (int i = 0; i < 100; i++) {
+    indexer.index_document(i, UTF8PlainTextTokenizer(std::string("common ") +
+                                                     (i % 2 ? "odd" : "even") +
+                                                     " filler words"));
+  }
+  std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+  invidx.save(ss, {}, IndexFormat::Compressed);
+  auto compressed = load_compressed_index(ss);
+
+  auto expr = *parse_query(normalizer, "even | odd | common");
+  BM25Scorer scorer(*compressed, expr);
+  for (auto query : {"common even", "common odd", "common even"}) {
+    auto result = perform_search(*compressed, *parse_query(normalizer, query));
+    ASSERT_EQ(50, result->size()) << query;
+    for (size_t i = 0; i < result->size(); i++) {
+      EXPECT_DOUBLE_EQ(bm25_score(*compressed, expr, *result, i),
+                       scorer(*result, i))
+          << query << " hit " << i;
+    }
+  }
+}
+
 TEST(TopKTest, ReturnsHighestScoresDescending) {
   const std::vector<std::string> documents = {
       "apple apple apple",
@@ -1133,6 +1162,53 @@ TEST(PersistenceTest, FileRoundTrip) {
 
   EXPECT_EQ(invidx.document_count(), loaded.document_count());
   EXPECT_EQ(invidx.term_count(U"the"), loaded.term_count(U"the"));
+}
+
+// A load that fails -- the stream ends early, or says something impossible --
+// leaves the index it was called on as it was, in either format: nothing of
+// the half-read file is kept and nothing of the old index is lost.
+TEST(PersistenceTest, FailedLoadLeavesTheIndexAsItWas) {
+  for (auto format : {IndexFormat::Plain, IndexFormat::Compressed}) {
+    auto source = sample_index();
+    std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+    source.save(ss, {}, format);
+    const std::string bytes = ss.str();
+
+    // Not a sample document: the index being loaded into has to be told apart
+    // from the one in the file.
+    InMemoryInvertedIndex<TextRange> index;
+    InMemoryIndexer indexer(index, normalizer);
+    indexer.index_document(100, UTF8PlainTextTokenizer("kept document here"));
+    indexer.index_document(101, UTF8PlainTextTokenizer("another kept one"));
+    index.remove_document(101);
+    index.set_scope_ids("paragraph", 100, {0, 0, 1}); // "kept document here"
+
+    size_t tried = 0;
+    for (size_t length = 0; length < bytes.size(); length += 23) {
+      std::stringstream in(bytes.substr(0, length),
+                           std::ios::in | std::ios::binary);
+      EXPECT_THROW(index.load(in), std::runtime_error) << length;
+      tried++;
+
+      ASSERT_EQ(1, index.document_count()) << length;
+      EXPECT_TRUE(index.is_document_removed(1)) << length;
+      EXPECT_EQ(1, index.df(U"kept")) << length;
+      EXPECT_EQ(0, index.df(U"first")) << length;
+      EXPECT_TRUE(index.has_scope("paragraph", 0)) << length;
+      EXPECT_EQ(100, index.document_key(0)) << length;
+      auto postings = perform_search(index, *parse_query(normalizer, "kept"));
+      ASSERT_EQ(1, postings->size()) << length;
+      EXPECT_EQ(0u, index.text_range(*postings, 0, 0).position) << length;
+    }
+    EXPECT_GT(tried, 10u);
+
+    // And the whole file still loads, replacing it.
+    std::stringstream whole(bytes, std::ios::in | std::ios::binary);
+    index.load(whole);
+    EXPECT_EQ(source.document_count(), index.document_count());
+    EXPECT_EQ(source.df(U"first"), index.df(U"first"));
+    EXPECT_EQ(0, index.df(U"kept"));
+  }
 }
 
 TEST(PersistenceTest, RejectsInvalidData) {
@@ -1917,6 +1993,32 @@ TEST(PrefixSearchTest, DroppedTokenDoesNotBecomeMatchAll) {
   EXPECT_EQ(Operation::Term, expr->operation);
   EXPECT_TRUE(expr->term_str.empty());
   EXPECT_EQ(0, perform_search(invidx, *expr)->size());
+}
+
+// A token the splitter finds no word in (only punctuation) is run through
+// the filter as it is; one the filter then drops is the empty term, like a
+// token whose every piece it drops, rather than the unfiltered text.
+TEST(QueryTest, ATokenWithNoWordThatTheFilterDropsIsTheEmptyTerm) {
+  TermFilter drop_everything = [](const std::u32string &, auto) {};
+  TermFilter keep = [](const std::u32string &str, auto emit) { emit(str); };
+
+  for (auto token : {"...", "!!", "@#$"}) {
+    auto dropped = parse_query(drop_everything, token);
+    ASSERT_TRUE(dropped) << token;
+    EXPECT_EQ(Operation::Term, dropped->operation) << token;
+    EXPECT_TRUE(dropped->term_str.empty()) << token;
+
+    // Kept, it stays what was typed.
+    auto kept = parse_query(keep, token);
+    ASSERT_TRUE(kept) << token;
+    EXPECT_EQ(Operation::Term, kept->operation) << token;
+    EXPECT_EQ(u32(token), kept->term_str) << token;
+  }
+
+  // The same for a word the splitter does find.
+  auto dropped = parse_query(drop_everything, "apple");
+  ASSERT_TRUE(dropped);
+  EXPECT_TRUE(dropped->term_str.empty());
 }
 
 TEST(PrefixSearchTest, ExpandPrefixesRewritesToAnEquivalentOr) {
@@ -3615,4 +3717,110 @@ TEST(CorruptIndexTest, PostingsNamingAnUnknownDocumentAreRefused) {
   std::stringstream in(bytes, std::ios::in | std::ios::binary);
   InMemoryInvertedIndex<TextRange> loaded;
   EXPECT_THROW(loaded.load(in), std::runtime_error);
+}
+
+// A postings list a file describes can be anything. The invariants the rest
+// of the library leans on -- every entry has a position, ordinals strictly
+// ascend, so do the positions within an entry -- are checked on load. An
+// entry without positions used to reach save_compressed and read past an
+// empty vector, and a list out of order was saved as a different one.
+TEST(CorruptIndexTest, PostingsOutOfOrderOrEmptyAreRefusedByEveryFormat) {
+  using Postings = InMemoryInvertedIndexBase::Postings;
+  using Entries = std::vector<std::pair<uint64_t, std::vector<uint64_t>>>;
+
+  auto plain = [](const Entries &entries) {
+    std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+    detail::write_scalar<uint64_t>(ss, entries.size());
+    for (const auto &[ordinal, positions] : entries) {
+      detail::write_scalar<uint64_t>(ss, ordinal);
+      detail::write_scalar<uint64_t>(ss, positions.size());
+      for (auto position : positions) {
+        detail::write_scalar<uint64_t>(ss, position);
+      }
+    }
+    return ss;
+  };
+  auto varint = [](const Entries &entries) {
+    std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+    detail::write_varint(ss, entries.size());
+    uint64_t previous_ordinal = 0;
+    for (const auto &[ordinal, positions] : entries) {
+      detail::write_varint(ss, ordinal - previous_ordinal);
+      previous_ordinal = ordinal;
+      detail::write_varint(ss, positions.size());
+      uint64_t previous_position = 0;
+      for (auto position : positions) {
+        detail::write_varint(ss, position - previous_position);
+        previous_position = position;
+      }
+    }
+    return ss;
+  };
+
+  struct Case {
+    const char *what;
+    Entries entries;
+  };
+  for (const auto &c : std::vector<Case>{
+           {"an entry with no positions", {{3, {}}}},
+           {"no positions in the second entry", {{3, {1}}, {5, {}}}},
+           {"ordinals descending", {{5, {1}}, {3, {1}}}},
+           {"the same ordinal twice", {{3, {1}}, {3, {2}}}},
+           {"positions descending", {{3, {9, 4}}}},
+           {"the same position twice", {{3, {4, 4}}}},
+       }) {
+    {
+      auto ss = plain(c.entries);
+      Postings postings;
+      EXPECT_THROW(postings.load(ss), std::runtime_error) << c.what;
+    }
+    // The varint form writes a descent as a difference that wraps around, and
+    // reads back as the smaller value it started from.
+    {
+      auto ss = varint(c.entries);
+      Postings postings;
+      EXPECT_THROW(postings.load_varint(ss), std::runtime_error) << c.what;
+    }
+  }
+
+  // Well-formed lists are untouched, in all three encodings.
+  Entries good = {{2, {0, 3}}, {7, {5}}, {9, {1, 2, 8}}};
+  Postings original;
+  {
+    auto ss = plain(good);
+    original.load(ss);
+  }
+  for (auto format : {0, 1, 2}) {
+    std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+    Postings loaded;
+    if (format == 0) {
+      original.save(ss);
+      loaded.load(ss);
+    } else if (format == 1) {
+      original.save_varint(ss);
+      loaded.load_varint(ss);
+    } else {
+      original.save_compressed(ss);
+      loaded.load_compressed(ss);
+    }
+    ASSERT_EQ(good.size(), loaded.size()) << format;
+    for (size_t i = 0; i < good.size(); i++) {
+      EXPECT_EQ(good[i].first, loaded.document_ordinal(i)) << format;
+      ASSERT_EQ(good[i].second.size(), loaded.search_hit_count(i)) << format;
+      for (size_t h = 0; h < good[i].second.size(); h++) {
+        EXPECT_EQ(good[i].second[h], loaded.term_position(i, h)) << format;
+      }
+    }
+  }
+
+  // A compressed list whose ordinals repeat (Elias-Fano allows duplicates).
+  {
+    std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+    detail::EliasFano({3, 3}, 4).save(ss); // ordinals
+    detail::EliasFano({1, 2}, 3).save(ss); // end offsets
+    detail::EliasFano({0, 1}, 2).save(ss); // bases
+    detail::EliasFano({0, 1}, 2).save(ss); // monotonized positions
+    Postings postings;
+    EXPECT_THROW(postings.load_compressed(ss), std::runtime_error);
+  }
 }
