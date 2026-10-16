@@ -13,13 +13,10 @@
 //   - Another engine can then index exactly the same term sequence with a
 //     whitespace tokenizer. Without this, a comparison against an engine
 //     that segments Japanese with a different model measures the two
-//     segmenters as much as the two search engines. The round trip is
-//     lossless only for a reader that splits on whitespace and nowhere else,
-//     and only while no term has whitespace inside it -- so that is checked
-//     below, and a term that would come back as two stops the run. It is not
-//     lossless through UTF8PlainTextTokenizer: that one cuts Han text into
-//     single characters, so `東京 タワー に 行っ た` (five terms) reads back
-//     as seven.
+//     segmenters as much as the two search engines. Only a whitespace
+//     tokenizer reads back the same terms (UTF8PlainTextTokenizer does not,
+//     see bench/README.md), and only while no term contains whitespace,
+//     which is checked below.
 //   - With --chunk N each work is cut into N-term documents (the id becomes
 //     "id:piece"; without --chunk the id is written as it came). Aozora Bunko
 //     is a few thousand book-length works, and picking the top 10 out of a few
@@ -41,14 +38,15 @@
 #include <searchlib.h>
 #include <searchlib_segment.h>
 
+#include <algorithm>
 #include <cstdio>
-#include <cstdlib>
 #include <exception>
 #include <fstream>
 #include <sstream>
-#include <stdexcept>
 #include <string>
 #include <vector>
+
+#include "bench_options.h"
 using namespace searchlib;
 
 static std::vector<std::string> split_tsv(const std::string &in) {
@@ -64,65 +62,29 @@ static void usage() {
       "                      [--text-field N] [--chunk N]\n");
 }
 
-static std::string need_value(int argc, char **argv, int i, const char *what) {
-  if (i >= argc) {
-    std::fprintf(stderr, "segment_corpus: %s needs a value\n", what);
-    std::exit(1);
-  }
-  return argv[i];
-}
-
-// The value of a counting option, or a message naming the option and exit
-// status 1 -- std::stoul alone throws on "abc", reads "12x" as 12 and wraps
-// "-1" round to the largest size_t.
-static size_t parse_count(const std::string &value, const char *what) {
-  auto ok = !value.empty() &&
-            value.find_first_not_of("0123456789") == std::string::npos;
-  unsigned long long n = 0;
-  if (ok) {
-    try {
-      n = std::stoull(value);
-    } catch (const std::out_of_range &) {
-      ok = false;
-    }
-  }
-  if (!ok) {
-    std::fprintf(stderr,
-                 "segment_corpus: %s takes a non-negative integer, got '%s'\n",
-                 what, value.c_str());
-    std::exit(1);
-  }
-  return static_cast<size_t>(n);
-}
-
-// Whether a whitespace tokenizer reading the output would cut `term` in two
-// (or a tab or newline in it would break the TSV line).
-static bool has_white_space(const std::u32string &term) {
-  for (auto cp : term) {
-    if (unicode::is_white_space(cp)) {
-      return true;
-    }
-  }
-  return false;
-}
-
 static int run(int argc, char **argv) {
   std::string in_path, out_path, model;
   size_t text_field = 3, chunk = 0;
+  auto need_value = [&](int i, const char *what) {
+    return bench_options::need_value(argc, argv, i, "segment_corpus", what);
+  };
+  auto need_count = [&](int i, const char *what) {
+    return bench_options::parse_count(need_value(i, what), "segment_corpus",
+                                      what);
+  };
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
-    if (a == "--in")
-      in_path = need_value(argc, argv, ++i, "--in");
-    else if (a == "--out")
-      out_path = need_value(argc, argv, ++i, "--out");
-    else if (a == "--splitter")
-      model = need_value(argc, argv, ++i, "--splitter");
-    else if (a == "--text-field")
-      text_field =
-          parse_count(need_value(argc, argv, ++i, a.c_str()), "--text-field");
-    else if (a == "--chunk")
-      chunk = parse_count(need_value(argc, argv, ++i, a.c_str()), "--chunk");
-    else {
+    if (a == "--in") {
+      in_path = need_value(++i, "--in");
+    } else if (a == "--out") {
+      out_path = need_value(++i, "--out");
+    } else if (a == "--splitter") {
+      model = need_value(++i, "--splitter");
+    } else if (a == "--text-field") {
+      text_field = need_count(++i, "--text-field");
+    } else if (a == "--chunk") {
+      chunk = need_count(++i, "--chunk");
+    } else {
       usage();
       return 1;
     }
@@ -154,7 +116,11 @@ static int run(int argc, char **argv) {
     bool split_term = false;
     SplitterTokenizer tk(splitter, f[text_field]);
     tk(nullptr, [&](const std::u32string &s, size_t, TextRange) {
-      split_term = split_term || has_white_space(s);
+      // A whitespace tokenizer reading the output would cut such a term in
+      // two (and a tab or newline would break the TSV line).
+      split_term |= std::any_of(s.begin(), s.end(), [](char32_t cp) {
+        return unicode::is_white_space(cp);
+      });
       terms.push_back(searchlib::u8(s));
     });
     if (split_term) {
@@ -200,8 +166,8 @@ static int run(int argc, char **argv) {
   return 0;
 }
 
-// load_segmenting_splitter throws for a model it cannot load; caught here so
-// that is one line saying so, not a bare "terminate called".
+// load_segmenting_splitter throws for a model it cannot load; reported here
+// in one line instead of a bare "terminate called".
 int main(int argc, char **argv) {
   try {
     return run(argc, argv);

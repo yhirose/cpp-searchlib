@@ -41,11 +41,11 @@
 #include <cstring>
 #include <exception>
 #include <fstream>
-#include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "../test/test_utils.h"
+#include "bench_options.h"
 #include <unicodelib.h>
 
 #if defined(__APPLE__)
@@ -90,32 +90,6 @@ long long resident_mib() {
 #else
   return 0;
 #endif
-}
-
-// The value of a counting option, or a message naming the option and exit
-// status 1. std::stoul alone would end the process on "abc" with an uncaught
-// std::invalid_argument that does not say which option was wrong, read "12x"
-// as 12, and wrap "-1" round to the largest size_t. `min` is there for the
-// options where zero is not a smaller run but no run at all: best_of over
-// zero runs never times anything and reports DBL_MAX as the best time.
-size_t parse_count(const std::string &value, const char *what, size_t min) {
-  auto ok = !value.empty() &&
-            value.find_first_not_of("0123456789") == std::string::npos;
-  unsigned long long n = 0;
-  if (ok) {
-    try {
-      n = std::stoull(value);
-    } catch (const std::out_of_range &) {
-      ok = false;
-    }
-  }
-  if (!ok || n < min) {
-    std::fprintf(stderr,
-                 "bench: %s takes an integer of at least %zu, got '%s'\n", what,
-                 min, value.c_str());
-    std::exit(1);
-  }
-  return static_cast<size_t>(n);
 }
 
 size_t file_size(const std::string &path) {
@@ -226,26 +200,24 @@ static int run(int argc, char **argv) {
   auto text_ranges = TextRangeStorage::Store;
 
   auto need_value = [&](int i, const char *what) {
-    if (i >= argc) {
-      std::fprintf(stderr, "bench: %s needs a value\n", what);
-      std::exit(1);
-    }
-    return std::string(argv[i]);
+    return bench_options::need_value(argc, argv, i, "bench", what);
+  };
+  // --runs 0 would time nothing (best_of reports DBL_MAX), and read_corpus
+  // reads --repeat 0 as 1.
+  auto need_count = [&](int i, const char *what, size_t min) {
+    return bench_options::parse_count(need_value(i, what), "bench", what, min);
   };
 
   for (int i = 1; i < argc; i++) {
     std::string arg = argv[i];
     if (arg == "--repeat") {
-      // At least 1: read_corpus would treat 0 as 1, which is not what the
-      // option says.
-      repeat = parse_count(need_value(++i, "--repeat"), "--repeat", 1);
+      repeat = need_count(++i, "--repeat", 1);
     } else if (arg == "--runs") {
-      runs = parse_count(need_value(++i, "--runs"), "--runs", 1);
+      runs = need_count(++i, "--runs", 1);
     } else if (arg == "--corpus") {
       corpus_path = need_value(++i, "--corpus");
     } else if (arg == "--text-field") {
-      text_field =
-          parse_count(need_value(++i, "--text-field"), "--text-field", 0);
+      text_field = need_count(++i, "--text-field", 0);
     } else if (arg == "--queries") {
       queries_path = need_value(++i, "--queries");
     } else if (arg == "--splitter") {
@@ -443,10 +415,8 @@ static int run(int argc, char **argv) {
   return 0;
 }
 
-// The library reports a model it cannot load, or an index file it cannot
-// write or read back, by throwing. Left uncaught that is a bare "terminate
-// called" (or an abort dialog on Windows); caught here it is one line saying
-// what failed, and an exit status a script can test.
+// The library throws for a model or an index file it cannot load or write;
+// reported here in one line instead of a bare "terminate called".
 int main(int argc, char **argv) {
   try {
     return run(argc, argv);

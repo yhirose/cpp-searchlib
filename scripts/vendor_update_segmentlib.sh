@@ -38,20 +38,15 @@ trap 'rm -rf "${WORK_DIR}"' EXIT
 
 curl -fsSL "https://github.com/${REPO}/archive/refs/tags/${TAG}.tar.gz" | tar -xz -C "${WORK_DIR}"
 
-# Everything the update installs is assembled and checked under ${STAGE}
-# first, and the vendored copies are only replaced once all of it is there.
-# Checking as it went used to leave a half-update behind: the header tree
-# already swapped in, then a model-count check failing before the README (the
-# file current_revision reads) was written, so the next run could not even
-# tell which revision it was looking at.
+# Everything is checked before the vendored copies are touched, so a tag that
+# fails a check leaves them as they were (README.md included, which is what
+# the next run reads the current revision from).
 extracted_dirs=("${WORK_DIR}"/*/)
 if [[ ${#extracted_dirs[@]} -ne 1 || ! -d "${extracted_dirs[0]}" ]]; then
     echo "error: expected exactly one extracted directory under ${WORK_DIR}, found ${#extracted_dirs[@]}" >&2
     exit 1
 fi
 EXTRACTED="${extracted_dirs[0]}"
-STAGE="${WORK_DIR}/stage"
-mkdir "${STAGE}"
 
 # The headers. segmenter.h is the one include/searchlib_segment.h includes,
 # so a tag that moved or renamed it fails here rather than at the next build.
@@ -59,17 +54,12 @@ if [[ ! -f "${EXTRACTED}include/segmentlib/segmenter.h" ]]; then
     echo "error: ${TAG} has no include/segmentlib/segmenter.h; upstream's layout changed" >&2
     exit 1
 fi
-cp -R "${EXTRACTED}include/segmentlib" "${STAGE}/segmentlib"
 
 # The bundled MLP reference model, plus its own NOTICE (CC BY-SA 4.0, unlike
 # this repository's MIT code -- see test/models/NOTICE). Requiring exactly one
 # .mod file means a future tag that ships a second model fails loudly here
 # instead of `find -exec` silently picking whichever one it visits last.
 MODEL_DIR="${EXTRACTED}models/mlp"
-if [[ ! -d "${MODEL_DIR}" ]]; then
-    echo "error: ${TAG} has no models/mlp directory" >&2
-    exit 1
-fi
 mod_files=()
 while IFS= read -r -d '' f; do mod_files+=("$f"); done \
     < <(find "${MODEL_DIR}" -maxdepth 1 -name '*.mod' -print0)
@@ -84,8 +74,6 @@ if [[ ! -f "${MODEL_DIR}/NOTICE" ]]; then
     echo "error: ${TAG} ships no ${MODEL_DIR}/NOTICE for its model" >&2
     exit 1
 fi
-cp "${mod_files[0]}" "${STAGE}/ja-ud-gsd.mod"
-cp "${MODEL_DIR}/NOTICE" "${STAGE}/NOTICE"
 
 {
     echo "# cpp-segmentlib (vendored)"
@@ -148,13 +136,13 @@ every consumer sees fstlib now. Segmentation was verified against this
 project's revision before the copy was dropped, and `SegmentTest` is what
 keeps it verified.
 BODY
-} > "${STAGE}/segmentlib/README.md"
+} > "${EXTRACTED}include/segmentlib/README.md"
 
-# Everything is in hand; replace the vendored copies together.
+# Every check has passed; replace the vendored copies together.
 rm -rf "${ROOT_DIR}/third_party/segmentlib"
-cp -R "${STAGE}/segmentlib" "${ROOT_DIR}/third_party/segmentlib"
-cp "${STAGE}/ja-ud-gsd.mod" "${ROOT_DIR}/test/models/ja-ud-gsd.mod"
-cp "${STAGE}/NOTICE" "${ROOT_DIR}/test/models/NOTICE"
+cp -R "${EXTRACTED}include/segmentlib" "${ROOT_DIR}/third_party/segmentlib"
+cp "${mod_files[0]}" "${ROOT_DIR}/test/models/ja-ud-gsd.mod"
+cp "${MODEL_DIR}/NOTICE" "${ROOT_DIR}/test/models/NOTICE"
 
 echo "Done. Segmentation output can change with a model or algorithm update --" \
      "rebuild, run \`just test\`, and check SegmentTest output before committing."

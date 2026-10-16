@@ -2,27 +2,18 @@
 # Shared helpers for scripts/vendor_update_*.sh. Sourced, never executed
 # directly -- it has no shebang-driven behavior of its own.
 #
-# The callers run under `set -euo pipefail`, where a grep that matches
-# nothing ends the whole script on the spot, with no message at all. So the
-# lookups below swallow a no-match with `|| true` and leave the decision to
-# an explicit check that says what was missing: an empty answer from
-# latest_semver_tag / latest_head_sha is reported by the caller, and
-# current_revision reports its own.
+# The callers run under `set -euo pipefail`, where a grep matching nothing
+# would end them with no message; so a lookup that finds nothing answers
+# empty instead, and the empty answer is reported with what was missing.
 
 # current_revision <vendor_dir> -- the Revision: value already recorded in
-# <vendor_dir>/README.md. Fails, with a message, when there is no README or
-# no Revision: line in it: comparing against an empty revision would make
-# every run look like an update, and say "Updating :  -> vX.Y.Z".
+# <vendor_dir>/README.md. Fails, with a message, when there is none: an empty
+# revision would make every run look like an update.
 current_revision() {
-    local readme="$1/README.md"
-    if [[ ! -f "${readme}" ]]; then
-        echo "error: ${readme} does not exist, so the vendored revision is unknown" >&2
-        return 1
-    fi
     local rev
-    rev="$(grep '^Revision:' "${readme}" | awk '{print $2}' || true)"
+    rev="$(awk '/^Revision:/ { print $2; exit }' "$1/README.md" 2>/dev/null || true)"
     if [[ -z "${rev}" ]]; then
-        echo "error: no 'Revision:' line in ${readme}" >&2
+        echo "error: no 'Revision:' line in $1/README.md (or no such file)" >&2
         return 1
     fi
     echo "${rev}"
