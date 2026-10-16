@@ -17,7 +17,9 @@
 #
 # This script:
 #   1. Reads the current version from include/searchlib.h
-#   2. Checks that the working directory is clean
+#   2. Fetches the remote's tags (so "not tagged yet" means not tagged
+#      anywhere, not just in this clone) and checks that the working
+#      directory is clean
 #   3. Verifies CI status of the latest commit
 #   4. Determines the version to release:
 #        - if the current version has no vX.Y.Z tag yet, it is released
@@ -27,7 +29,7 @@
 #          release tag → minor bump (e.g., 0.1.0 → 0.2.0); unchanged → patch
 #          bump (e.g., 0.1.0 → 0.1.1); --minor / --major override either way
 #   5. Updates include/searchlib.h
-#   6. Commits, tags (vX.Y.Z), and pushes
+#   6. Commits, tags (vX.Y.Z), and pushes the branch and the tag together
 
 set -euo pipefail
 
@@ -61,11 +63,23 @@ done
 
 # --- Step 1: Read current version from searchlib.h ---
 CURRENT_VERSION=$(sed -n 's/^#define CPPSEARCHLIB_VERSION "\([^"]*\)"/\1/p' "$VERSION_HEADER")
+# An empty or odd version (the sed above stopped matching) would otherwise
+# become a tag named "v" further down.
+if ! [[ "$CURRENT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "Error: could not read a MAJOR.MINOR.PATCH CPPSEARCHLIB_VERSION from $VERSION_HEADER (got '$CURRENT_VERSION')"
+  exit 1
+fi
 IFS='.' read -r V_MAJOR V_MINOR V_PATCH <<< "$CURRENT_VERSION"
 
 echo "==> Current version: $CURRENT_VERSION"
 
-# --- Step 2: Check working directory is clean ---
+# --- Step 2: Fetch tags, check working directory is clean ---
+# The tag check in step 4 must see the remote's tags: in a clone that never
+# fetched them, a version already released looks untagged, and would be tagged
+# again on the wrong commit.
+echo "==> Fetching tags..."
+git fetch --tags --quiet origin
+
 if [ -n "$(git status --porcelain)" ]; then
   echo "Error: working directory is not clean"
   exit 1
@@ -138,6 +152,11 @@ index_format() {
 
 if ! git rev-parse -q --verify "refs/tags/v$CURRENT_VERSION" >/dev/null; then
   # The version in the header has never been tagged: release it as-is.
+  if [ "$FORCE_MAJOR" -eq 1 ] || [ "$FORCE_MINOR" -eq 1 ]; then
+    echo "Error: v$CURRENT_VERSION has not been tagged, so it is what gets released;"
+    echo "       --minor/--major bump a version that already has been."
+    exit 1
+  fi
   NEW_VERSION="$CURRENT_VERSION"
   echo ""
   echo "==> v$CURRENT_VERSION is not tagged yet → releasing the current version as-is"
@@ -219,7 +238,10 @@ else
 
   echo ""
   echo "==> Pushing..."
-  git push && git push --tags
+  # The branch and the tag go together or not at all: a rejected branch must
+  # not leave the tag on the remote, and `--tags` would also push any other
+  # tag lying around locally.
+  git push --atomic origin HEAD "refs/tags/v$NEW_VERSION"
 
   echo ""
   echo "==> Released v$NEW_VERSION"

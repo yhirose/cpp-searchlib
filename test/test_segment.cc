@@ -134,6 +134,41 @@ TEST(SegmentTest, TokenPositionsAndRangesAreConsistent) {
   }
 }
 
+// ZWJ and ZWNJ are neither letters nor marks, so a run of Japanese stops
+// before them -- inside the grapheme cluster they extend. The splitter drops
+// a span that does not end on a cluster boundary, words and all, so 東京 used
+// to vanish from 東京<ZWJ>タワー. The run now runs on to the boundary, and
+// the last word's range takes the extender in while its term does not.
+TEST(SegmentTest, ARunEndingInsideAGraphemeClusterIsNotDropped) {
+  for (std::string joiner : {"\xE2\x80\x8D", "\xE2\x80\x8C"}) { // ZWJ, ZWNJ
+    {
+      std::string text = "東京" + joiner + "タワーに行った";
+      auto tokens = tokenize(segmenting_splitter(), text);
+      EXPECT_EQ(
+          (std::vector<std::string>{"東京", "タワー", "に", "行っ", "た"}),
+          terms(tokens));
+      ASSERT_FALSE(tokens.empty());
+      // 東京 is 6 bytes and the joiner 3: its range ends after the cluster.
+      EXPECT_EQ(0u, tokens[0].range.position);
+      EXPECT_EQ(9u, tokens[0].range.length);
+    }
+    {
+      std::string text = "東京タワー" + joiner + "に行った";
+      EXPECT_EQ(
+          (std::vector<std::string>{"東京", "タワー", "に", "行っ", "た"}),
+          terms(tokenize(segmenting_splitter(), text)));
+    }
+    {
+      // At the very end of the text, and alone after a non-Japanese word.
+      EXPECT_EQ((std::vector<std::string>{"東京"}),
+                terms(tokenize(segmenting_splitter(), "東京" + joiner)));
+      EXPECT_EQ(
+          (std::vector<std::string>{"hello", "東京"}),
+          terms(tokenize(segmenting_splitter(), "hello 東京" + joiner + " ")));
+    }
+  }
+}
+
 TEST(SegmentTest, NonCJKTextIsUnchangedFromTheDefaultSplitter) {
   // The regression wall around every existing English index: because only
   // runs of Han/Hiragana/Katakana reach the model, everything else must come
