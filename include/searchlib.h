@@ -1743,6 +1743,8 @@ private:
   // Rebuilds what df() rests on from the loaded postings.
   void rebuild_document_terms_();
 
+  detail::ScopeIndexData &own_scope_data_();
+
   std::vector<Document> documents_; // indexed by ordinal
   std::unordered_map<std::u32string /*str*/, Term> term_dictionary_;
   std::unordered_set<size_t /*ordinal*/> removed_ordinals_;
@@ -4577,9 +4579,9 @@ find_from_cursor(P &postings, size_t size, bool block_reads, size_t &cursor,
 //   - A one-row memo, because a document's hits are always read together: a
 //     term_position(index, 0..n) run costs one merge rather than n.
 //
-// Only term_position/term_length need that merge at all; size, ordinal,
-// search_hit_count and is_term_position are answered from the operands
-// directly.
+// Only the hits need that merge -- term_position, term_length and, since a
+// hit two operands share is one, search_hit_count; size, ordinal and
+// is_term_position are answered from the operands directly.
 //
 // Unlike SearchResult, this aliases its operands rather than owning a
 // snapshot of them, so it stays valid only as long as the index does -- the
@@ -4608,9 +4610,22 @@ public:
   }
 
   // The merged row's length, not the sum of the operands' counts: a hit two
-  // operands share (`apple | apple`, `apple | app*`) is one hit. The merge is
-  // memoized, and whoever asks for the count goes on to read the hits.
+  // operands share (`apple | apple`, `apple | app*`) is one hit. Only two
+  // operands can share one, so a document that one operand alone carries --
+  // most of an Or's -- is that operand's count and needs no merge. Otherwise
+  // the merge is memoized, and whoever asks for the count goes on to read the
+  // hits.
   size_t search_hit_count(size_t index) const override {
+    locate_row(index);
+    size_t carriers = 0;
+    size_t count = 0;
+    for (const auto &row : row_slots_) {
+      carriers += row.hit_count > 0;
+      count += row.hit_count;
+    }
+    if (carriers <= 1) {
+      return count;
+    }
     merge_row(index);
     return row_positions_.size();
   }
@@ -5271,30 +5286,59 @@ perform_fuzzy_operation(const IInvertedIndex &inverted_index,
       inverted_index, expand_fuzzy(inverted_index, expr), scope_index, filter);
 }
 
-// One operand's current hit, as Near and SameScope weigh them.
+// One operand's hit, as Near and SameScope weigh them.
 struct ProximityHit {
   size_t position;
   size_t length;
   size_t slot;
+  size_t end() const { return position + length; }
 };
 
 // Scratch Near and SameScope reuse across candidate documents, the same way
 // the And path reuses its buffers: the walk runs once per document where all
 // cursors align, and these would otherwise be allocated every time.
 struct ProximityScratch {
+  // collect_proximity_hits
   std::vector<size_t> search_hit_cursors;
   std::vector<ProximityHit> group;
-  std::vector<std::pair<size_t /*position*/, size_t /*length*/>> hits;
+  // Both: the (position, length) of every hit kept.
+  std::vector<std::pair<size_t, size_t>> hits;
+  // collect_near_chains
+  std::vector<ProximityHit> all_hits;
+  std::vector<size_t> reach;
+  std::vector<int64_t> need;
 };
 
-// The hit walk Near and SameScope share, for one document every operand
-// carries. It looks at one hit per operand at a time, in position order, and
-// asks `accept` whether that group qualifies: if so every hit in it is kept
-// and every operand moves on, otherwise only the earliest one does, since
-// it is the one furthest from the rest. The kept hits are written out in
-// ascending position order with duplicates dropped -- two operands can
-// share a hit (`a ~ a`, `apple ~ app*`), and groups do not come out in
-// position order -- which is the order every IPostings reader assumes.
+// The kept hits of one document, written out the way every IPostings reader
+// assumes: ascending by position, an identical (position, length) once. Two
+// operands can share a hit (`a ~ a`, `apple ~ app*`), and the groups a walk
+// finds do not come out in position order.
+inline bool emit_unique_hits(std::vector<std::pair<size_t, size_t>> &hits,
+                             std::vector<size_t> &term_positions,
+                             std::vector<size_t> &term_lengths) {
+  // Usually in order already.
+  if (!std::is_sorted(hits.begin(), hits.end())) {
+    std::sort(hits.begin(), hits.end());
+  }
+  hits.erase(std::unique(hits.begin(), hits.end()), hits.end());
+  for (const auto &[position, length] : hits) {
+    term_positions.push_back(position);
+    term_lengths.push_back(length);
+  }
+  return !hits.empty();
+}
+
+// The hit walk SameScope shares with Near over two operands, for one document
+// every operand carries. It looks at one hit per operand at a time, in
+// position order, and asks `accept` whether that group qualifies: if so every
+// hit in it is kept and every operand moves on, otherwise only the earliest
+// one does.
+//
+// That is exact when a failing group can only be repaired by moving past its
+// earliest hit: for SameScope, where scope ids never decrease along the text,
+// and for Near over two operands, where the test is the pair's gap and so the
+// group's span. It is not for Near over more (see collect_near_chains), which
+// uses it only past kMaxChainOperands, and then it can miss groups.
 template <typename Accept>
 inline bool collect_proximity_hits(
     const std::vector<std::shared_ptr<IPostings>> &postings_list,
@@ -5341,17 +5385,7 @@ inline bool collect_proximity_hits(
     }
   }
 
-  // Usually in order already: groups only interleave when operands' hits
-  // cluster unevenly.
-  if (!std::is_sorted(hits.begin(), hits.end())) {
-    std::sort(hits.begin(), hits.end());
-  }
-  hits.erase(std::unique(hits.begin(), hits.end()), hits.end());
-  for (const auto &[position, length] : hits) {
-    term_positions.push_back(position);
-    term_lengths.push_back(length);
-  }
-  return !hits.empty();
+  return emit_unique_hits(hits, term_positions, term_lengths);
 }
 
 // Near over three or more operands.
@@ -5383,20 +5417,15 @@ inline constexpr size_t kMaxChainOperands = 6;
 inline bool collect_near_chains(
     const std::vector<std::shared_ptr<IPostings>> &postings_list,
     const std::vector<size_t> &cursors, size_t distance,
-    std::vector<size_t> &term_positions, std::vector<size_t> &term_lengths) {
-  struct ChainHit {
-    size_t position;
-    size_t length;
-    size_t slot;
-    size_t end() const { return position + length; }
-  };
-
-  std::vector<ChainHit> hits;
+    ProximityScratch &scratch, std::vector<size_t> &term_positions,
+    std::vector<size_t> &term_lengths) {
+  auto &hits = scratch.all_hits;
+  hits.clear();
   for (size_t slot = 0; slot < postings_list.size(); slot++) {
     const auto &p = *postings_list[slot];
     for (size_t h = 0; h < p.search_hit_count(cursors[slot]); h++) {
-      hits.push_back(ChainHit{p.term_position(cursors[slot], h),
-                              p.term_length(cursors[slot], h), slot});
+      hits.push_back(ProximityHit{p.term_position(cursors[slot], h),
+                                  p.term_length(cursors[slot], h), slot});
     }
   }
   std::sort(hits.begin(), hits.end(), [](const auto &a, const auto &b) {
@@ -5407,37 +5436,16 @@ inline bool collect_near_chains(
   const size_t masks = size_t(1) << postings_list.size();
   const size_t full = masks - 1;
 
-  // Whether there is a group at all: best[operands] is the furthest reach of
-  // a group made of those, 0 for none. A hit only reads sets without its
-  // operand and only writes sets with it, so one array serves in place.
-  std::vector<size_t> best(masks, 0);
-  for (const auto &hit : hits) {
-    const size_t bit = size_t(1) << hit.slot;
-    for (size_t mask = 0; mask < masks; mask++) {
-      if (mask & bit) {
-        continue;
-      }
-      if (mask == 0) {
-        best[bit] = std::max(best[bit], hit.end());
-      } else if (best[mask] != 0 && hit.position < best[mask] + distance) {
-        best[mask | bit] =
-            std::max(best[mask | bit], std::max(best[mask], hit.end()));
-      }
-    }
-  }
-  if (best[full] == 0) {
-    return false;
-  }
-
-  // Which hits are on one. need[i][operands] is the least reach a group of
-  // `operands` must already have for the hits from i on to finish it:
-  // kAny if none, kNever if they cannot. Skipping hit i leaves the row as it
-  // was; taking it needs the start to be close enough, and the larger reach
-  // it brings to be enough for what follows.
+  // need[i][operands] is the least reach a group of `operands` must already
+  // have for the hits from i on to finish it: kAny if none, kNever if they
+  // cannot. Skipping hit i leaves the row as it was; taking it needs its start
+  // to be close enough, and the larger reach it brings to be enough for what
+  // follows. Whether there is a group at all is need[0][no operands].
   constexpr auto kAny = std::numeric_limits<int64_t>::min();
   constexpr auto kNever = std::numeric_limits<int64_t>::max();
   const size_t n = hits.size();
-  std::vector<int64_t> need((n + 1) * masks, kNever);
+  auto &need = scratch.need;
+  need.assign((n + 1) * masks, kNever);
   need[n * masks + full] = kAny;
   for (size_t i = n; i-- > 0;) {
     const auto &hit = hits[i];
@@ -5462,9 +5470,18 @@ inline bool collect_near_chains(
       row[mask] = std::min(row[mask], take);
     }
   }
+  if (need[0] == kNever) {
+    return false;
+  }
 
-  std::fill(best.begin(), best.end(), 0);
-  std::vector<std::pair<size_t, size_t>> used;
+  // Which hits are on one: the furthest reach of a group of each set of
+  // operands (0 for none), read as the hits go by in order. A hit only reads
+  // sets without its operand and only writes sets with it, so one array
+  // serves in place.
+  auto &reach = scratch.reach;
+  reach.assign(masks, 0);
+  auto &used = scratch.hits;
+  used.clear();
   for (size_t i = 0; i < n; i++) {
     const auto &hit = hits[i];
     const size_t bit = size_t(1) << hit.slot;
@@ -5474,16 +5491,16 @@ inline bool collect_near_chains(
       if ((mask & bit) || after[mask | bit] == kNever) {
         continue;
       }
-      size_t reach;
+      size_t joined;
       if (mask == 0) {
-        reach = hit.end();
-      } else if (best[mask] != 0 && hit.position < best[mask] + distance) {
-        reach = std::max(best[mask], hit.end());
+        joined = hit.end();
+      } else if (reach[mask] != 0 && hit.position < reach[mask] + distance) {
+        joined = std::max(reach[mask], hit.end());
       } else {
         continue;
       }
-      if (static_cast<int64_t>(reach) >= after[mask | bit]) {
-        best[mask | bit] = std::max(best[mask | bit], reach);
+      if (static_cast<int64_t>(joined) >= after[mask | bit]) {
+        reach[mask | bit] = std::max(reach[mask | bit], joined);
         on_a_group = true;
       }
     }
@@ -5492,13 +5509,7 @@ inline bool collect_near_chains(
     }
   }
 
-  std::sort(used.begin(), used.end());
-  used.erase(std::unique(used.begin(), used.end()), used.end());
-  for (const auto &[position, length] : used) {
-    term_positions.push_back(position);
-    term_lengths.push_back(length);
-  }
-  return !used.empty();
+  return emit_unique_hits(used, term_positions, term_lengths);
 }
 
 inline std::shared_ptr<IPostings>
@@ -5513,14 +5524,14 @@ perform_near_operation(const IInvertedIndex &inverted_index,
     // the previous hit's, and a hit starting inside that reach is no gap
     // at all: a phrase operand can span past the start of the next one
     // (`"a b c" ~ b`).
-    auto reach = group.front().position + group.front().length;
+    auto reach = group.front().end();
     for (size_t i = 1; i < group.size(); i++) {
       const auto &hit = group[i];
       if (hit.position >= reach &&
           hit.position + 1 - reach > expr.near_operation_distance) {
         return false;
       }
-      reach = std::max(reach, hit.position + hit.length);
+      reach = std::max(reach, hit.end());
     }
     return true;
   };
@@ -5531,10 +5542,12 @@ perform_near_operation(const IInvertedIndex &inverted_index,
       filter,
       [&](const auto &postings_list, const auto &cursors, size_t /*ordinal*/,
           auto &term_positions, auto &term_lengths) {
+        // The hit walk is exact for two operands; three or more need the
+        // search (see collect_near_chains), up to the cap on its cost.
         if (postings_list.size() >= 3 &&
             postings_list.size() <= kMaxChainOperands) {
           return collect_near_chains(postings_list, cursors,
-                                     expr.near_operation_distance,
+                                     expr.near_operation_distance, scratch,
                                      term_positions, term_lengths);
         }
         return collect_proximity_hits(postings_list, cursors, scratch,
@@ -6429,18 +6442,22 @@ inline void InMemoryInvertedIndexBase::set_scope_ids(
         "searchlib: scope_ids must be monotonically non-decreasing");
   }
 
-  if (!scope_data_) {
-    scope_data_ = std::make_shared<detail::ScopeIndexData>();
-  } else if (scope_data_.use_count() > 1) {
-    // A copy of this index holds the same data: write to our own.
-    scope_data_ = std::make_shared<detail::ScopeIndexData>(*scope_data_);
-  }
-
   auto universe =
       scope_ids.empty() ? uint64_t(1) : uint64_t(scope_ids.back()) + 1;
   std::vector<uint64_t> values(scope_ids.begin(), scope_ids.end());
-  scope_data_->by_name[scope_name].insert_or_assign(
+  own_scope_data_().by_name[scope_name].insert_or_assign(
       ordinal, detail::EliasFano(values, universe));
+}
+
+// The scope data to write to: made if there is none, and copied if a copy of
+// this index holds it too, so a write reaches only the index it was made on.
+inline detail::ScopeIndexData &InMemoryInvertedIndexBase::own_scope_data_() {
+  if (!scope_data_) {
+    scope_data_ = std::make_shared<detail::ScopeIndexData>();
+  } else if (scope_data_.use_count() > 1) {
+    scope_data_ = std::make_shared<detail::ScopeIndexData>(*scope_data_);
+  }
+  return *scope_data_;
 }
 
 inline bool InMemoryInvertedIndexBase::has_scope(const std::string &scope_name,
@@ -6673,13 +6690,10 @@ inline void InMemoryInvertedIndexBase::load(std::istream &is,
   rebuild_document_terms_();
 
   scope_data_.reset();
-  detail::read_scope_section(
-      is, [&](const std::string &name, size_t ordinal, detail::EliasFano &&ef) {
-        if (!scope_data_) {
-          scope_data_ = std::make_shared<detail::ScopeIndexData>();
-        }
-        scope_data_->by_name[name].insert_or_assign(ordinal, std::move(ef));
-      });
+  detail::read_scope_section(is, [&](const std::string &name, size_t ordinal,
+                                     detail::EliasFano &&ef) {
+    own_scope_data_().by_name[name].insert_or_assign(ordinal, std::move(ef));
+  });
 }
 
 //-----------------------------------------------------------------------------

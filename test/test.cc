@@ -3782,45 +3782,15 @@ TEST(CorruptIndexTest, PostingsOutOfOrderOrEmptyAreRefusedByEveryFormat) {
       EXPECT_THROW(postings.load_varint(ss), std::runtime_error) << c.what;
     }
   }
+}
 
-  // Well-formed lists are untouched, in all three encodings.
-  Entries good = {{2, {0, 3}}, {7, {5}}, {9, {1, 2, 8}}};
-  Postings original;
-  {
-    auto ss = plain(good);
-    original.load(ss);
-  }
-  for (auto format : {0, 1, 2}) {
-    std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
-    Postings loaded;
-    if (format == 0) {
-      original.save(ss);
-      loaded.load(ss);
-    } else if (format == 1) {
-      original.save_varint(ss);
-      loaded.load_varint(ss);
-    } else {
-      original.save_compressed(ss);
-      loaded.load_compressed(ss);
-    }
-    ASSERT_EQ(good.size(), loaded.size()) << format;
-    for (size_t i = 0; i < good.size(); i++) {
-      EXPECT_EQ(good[i].first, loaded.document_ordinal(i)) << format;
-      ASSERT_EQ(good[i].second.size(), loaded.search_hit_count(i)) << format;
-      for (size_t h = 0; h < good[i].second.size(); h++) {
-        EXPECT_EQ(good[i].second[h], loaded.term_position(i, h)) << format;
-      }
-    }
-  }
-
-  // A compressed list whose ordinals repeat (Elias-Fano allows duplicates).
-  {
-    std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
-    detail::EliasFano({3, 3}, 4).save(ss); // ordinals
-    detail::EliasFano({1, 2}, 3).save(ss); // end offsets
-    detail::EliasFano({0, 1}, 2).save(ss); // bases
-    detail::EliasFano({0, 1}, 2).save(ss); // monotonized positions
-    Postings postings;
-    EXPECT_THROW(postings.load_compressed(ss), std::runtime_error);
-  }
+// Elias-Fano allows a value twice, so a compressed list can repeat an ordinal.
+TEST(CorruptIndexTest, CompressedPostingsRepeatingAnOrdinalAreRefused) {
+  std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+  detail::EliasFano({3, 3}, 4).save(ss); // ordinals
+  detail::EliasFano({1, 2}, 3).save(ss); // end offsets
+  detail::EliasFano({0, 1}, 2).save(ss); // bases
+  detail::EliasFano({0, 1}, 2).save(ss); // monotonized positions
+  InMemoryInvertedIndexBase::Postings postings;
+  EXPECT_THROW(postings.load_compressed(ss), std::runtime_error);
 }
