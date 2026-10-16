@@ -6,6 +6,8 @@
 #include <cstring>
 #include <filesystem>
 #include <map>
+#include <random>
+#include <set>
 #include <sstream>
 #include <thread>
 
@@ -1409,6 +1411,25 @@ TEST(SameScopeTest, ComposesInsideAnd) {
 
   ASSERT_EQ(1, postings->size());
   EXPECT_EQ(0, postings->document_ordinal(0));
+}
+
+// A copy of an index owns its scope data: registering scopes on either one
+// afterwards must not show up on the other.
+TEST(SameScopeTest, ACopyHasItsOwnScopeData) {
+  auto a = same_scope_index();
+  auto b = a;
+
+  b.set_scope_ids("paragraph", 2, {0, 0}); // "gamma delta", none before
+  EXPECT_TRUE(b.has_scope("paragraph", 2));
+  EXPECT_FALSE(a.has_scope("paragraph", 2));
+
+  a.set_scope_ids("section", 0, {0, 0, 0, 0});
+  EXPECT_TRUE(a.has_scope("section", 0));
+  EXPECT_FALSE(b.has_scope("section", 0));
+
+  // What was there before the copy is in both.
+  EXPECT_TRUE(a.has_scope("paragraph", 0));
+  EXPECT_TRUE(b.has_scope("paragraph", 0));
 }
 
 TEST(SameScopeTest, SetScopeIdsRejectsSizeMismatch) {
@@ -2987,6 +3008,162 @@ TEST(NearTest, HitsComeOutInPositionOrder) {
   auto merged = perform_search(invidx, *parse_query(normalizer, "(a ~ b) | c"));
   ASSERT_EQ(2, merged->size());
   EXPECT_EQ((std::vector<size_t>{1, 2, 5, 6}), hit_positions(*merged, 0));
+}
+
+// With three or more operands the test is that the chosen hits, in order,
+// each start within the distance of the furthest end so far, and setting the
+// earliest hit aside when a group fails (right for two operands) loses
+// groups: c@1 a@4 b@9 fails on the gap before b, but a@5 closes it, and the
+// earliest hit c@1 belongs to the group that results.
+TEST(NearTest, ThreeOperandsFindAGroupTheEarliestHitIsPartOf) {
+  InMemoryInvertedIndex<TextRange> invidx;
+  InMemoryIndexer indexer(invidx, normalizer);
+  indexer.index_document(0, UTF8PlainTextTokenizer("c c x x a a x x a b"));
+
+  auto postings = perform_search(invidx, *parse_query(normalizer, "a ~ b ~ c"));
+  ASSERT_EQ(1, postings->size());
+  // c@1 a@5 b@9, and nothing else is on a group.
+  EXPECT_EQ((std::vector<size_t>{1, 5, 9}), hit_positions(*postings, 0));
+}
+
+// The reach of a group is its furthest end, not the end of the hit before:
+// after the phrase and the word inside it, d is 4 past the phrase's end.
+TEST(NearTest, ThreeOperandsMeasureFromTheFurthestEnd) {
+  InMemoryInvertedIndex<TextRange> invidx;
+  InMemoryIndexer indexer(invidx, normalizer);
+  indexer.index_document(0, UTF8PlainTextTokenizer("a b c x x x d"));
+  indexer.index_document(1, UTF8PlainTextTokenizer("a b c x x x x d"));
+
+  auto postings =
+      perform_search(invidx, *parse_query(normalizer, R"("a b c" ~ b ~ d)"));
+  ASSERT_EQ(1, postings->size());
+  EXPECT_EQ(0, postings->document_ordinal(0));
+  EXPECT_EQ((std::vector<size_t>{0, 1, 6}), hit_positions(*postings, 0));
+  EXPECT_EQ(3, postings->term_length(0, 0));
+}
+
+// Against every choice of one hit per operand, on random documents: the
+// documents that match, and the hits that are on some matching group.
+TEST(NearTest, ChainsAgreeWithABruteForce) {
+  struct Query {
+    const char *text;
+    std::vector<int> operands; // indexes into the vocabulary
+  };
+  const std::vector<Query> queries = {
+      {"a ~ b ~ c", {0, 1, 2}},
+      {"a ~ b ~ c ~ d", {0, 1, 2, 3}},
+      {"a ~ a ~ b", {0, 0, 1}},
+      {"c ~ a ~ b ~ a", {2, 0, 1, 0}},
+  };
+  const char *vocabulary[] = {"a", "b", "c", "d", "x"};
+  constexpr int kDistance = 4; // DEFAULT_NEAR_SIZE
+
+  std::mt19937 rng(11);
+  for (int round = 0; round < 1500; round++) {
+    std::string text;
+    std::vector<std::vector<int>> positions(5);
+    int length = 1 + rng() % 18;
+    for (int i = 0; i < length; i++) {
+      int word = rng() % 5;
+      text += std::string(i ? " " : "") + vocabulary[word];
+      positions[word].push_back(i);
+    }
+    InMemoryInvertedIndex<TextRange> invidx;
+    InMemoryIndexer indexer(invidx, normalizer);
+    indexer.index_document(0, UTF8PlainTextTokenizer(text));
+
+    for (const auto &query : queries) {
+      std::set<size_t> expected;
+      std::vector<size_t> choice(query.operands.size(), 0);
+      bool possible = true;
+      for (int operand : query.operands) {
+        possible = possible && !positions[operand].empty();
+      }
+      while (possible) {
+        std::vector<int> chosen;
+        for (size_t j = 0; j < choice.size(); j++) {
+          chosen.push_back(positions[query.operands[j]][choice[j]]);
+        }
+        auto sorted = chosen;
+        std::sort(sorted.begin(), sorted.end());
+        bool group = true;
+        for (size_t i = 1; i < sorted.size(); i++) {
+          group = group && sorted[i] - sorted[i - 1] <= kDistance;
+        }
+        if (group) {
+          expected.insert(chosen.begin(), chosen.end());
+        }
+        size_t j = 0;
+        for (; j < choice.size(); j++) {
+          if (++choice[j] < positions[query.operands[j]].size()) {
+            break;
+          }
+          choice[j] = 0;
+        }
+        possible = j < choice.size();
+      }
+
+      auto postings =
+          perform_search(invidx, *parse_query(normalizer, query.text));
+      std::set<size_t> actual;
+      if (postings->size() == 1) {
+        auto hits = hit_positions(*postings, 0);
+        actual.insert(hits.begin(), hits.end());
+      }
+      EXPECT_EQ(expected, actual) << query.text << " on '" << text << "'";
+      EXPECT_EQ(expected.empty() ? 0u : 1u, postings->size())
+          << query.text << " on '" << text << "'";
+    }
+  }
+}
+
+// The hits of an Or or an And are the union of its operands' hits as a set:
+// a position two operands share is one hit, not two. It used to come out
+// once per operand, doubling the count and the highlights.
+TEST(OrTest, AHitTwoOperandsShareIsOneHit) {
+  InMemoryInvertedIndex<TextRange> invidx;
+  InMemoryIndexer indexer(invidx, normalizer);
+  indexer.index_document(0, UTF8PlainTextTokenizer("apple x apple pie"));
+  indexer.index_document(1, UTF8PlainTextTokenizer("pie"));
+
+  const std::vector<std::pair<const char *, std::vector<size_t>>> cases = {
+      {"apple", {0, 2}},
+      {"apple | apple", {0, 2}},
+      {"apple apple", {0, 2}},
+      {"apple | app*", {0, 2}},
+      {"(apple | pie) | apple", {0, 2, 3}},
+  };
+  for (const auto &[query, expected] : cases) {
+    auto postings = perform_search(invidx, *parse_query(normalizer, query));
+    ASSERT_LE(1u, postings->size()) << query;
+    ASSERT_EQ(0, postings->document_ordinal(0)) << query;
+    EXPECT_EQ(expected.size(), postings->search_hit_count(0)) << query;
+    EXPECT_EQ(expected, hit_positions(*postings, 0)) << query;
+    EXPECT_TRUE(postings->is_term_position(0, 2)) << query;
+  }
+}
+
+// Two hits at one position are two when they differ in length (a phrase and
+// the word it starts with), and one when they do not.
+TEST(OrTest, OnlyIdenticalHitsAreMerged) {
+  InMemoryInvertedIndex<TextRange> invidx;
+  InMemoryIndexer indexer(invidx, normalizer);
+  indexer.index_document(0, UTF8PlainTextTokenizer("a b c"));
+
+  auto both = perform_search(invidx, *parse_query(normalizer, R"("a b" | a)"));
+  ASSERT_EQ(1, both->size());
+  ASSERT_EQ(2, both->search_hit_count(0));
+  EXPECT_EQ(0, both->term_position(0, 0));
+  EXPECT_EQ(0, both->term_position(0, 1));
+  EXPECT_EQ(
+      std::set<size_t>({1, 2}),
+      std::set<size_t>({both->term_length(0, 0), both->term_length(0, 1)}));
+
+  auto same =
+      perform_search(invidx, *parse_query(normalizer, R"("a b" | "a b")"));
+  ASSERT_EQ(1, same->size());
+  EXPECT_EQ(1, same->search_hit_count(0));
+  EXPECT_EQ(2, same->term_length(0, 0));
 }
 
 // Two operands on the same hit used to collide in a map keyed by position,

@@ -2,6 +2,7 @@
 #include <searchlib.h>
 
 #include <chrono>
+#include <limits>
 
 #include "test_utils.h"
 
@@ -298,6 +299,45 @@ TEST(SplitterDelegationTest, ABadSpanIsDroppedAndTheWalkSkipsOneGraphemeCluster)
       asked.push_back(call.offset);
     }
     EXPECT_EQ(c.offsets_asked, asked) << c.what;
+  }
+}
+
+// `consumed` and the words' lengths come from a segmenter the caller does not
+// trust, and the sums made of them wrap around. A `consumed` that makes
+// offset + consumed land back on an earlier scalar used to hand the walk an
+// end before the span's start, and loop; it is a span past the end of the
+// text like any other, and dropped.
+TEST(SplitterDelegationTest, AConsumedThatWrapsAroundIsDropped) {
+  const size_t kMax = std::numeric_limits<size_t>::max();
+  // Where 東 (offset 2) would end up if offset + consumed wrapped: 0, 1, 2.
+  for (size_t consumed : {kMax, kMax - 1, kMax - 2, kMax - 3}) {
+    Scripted scripted;
+    scripted.answer = answer_with({{0, 3}}, consumed);
+    auto splitter = utf8_plain_text_splitter(scripted.segmenter(), kHan);
+
+    EXPECT_EQ((Strings{"ab", "x"}), terms(splitter, "ab東京 x")) << consumed;
+    // Each Han scalar is asked once and dropped; the walk moves on.
+    EXPECT_LE(scripted.calls.size(), 2u) << consumed;
+  }
+}
+
+TEST(SplitterDelegationTest, AWordWhoseEndWrapsAroundIsDropped) {
+  const size_t kMax = std::numeric_limits<size_t>::max();
+  // Starting at the 京 (byte 3), a length of kMax - 2 sums to 0 -- a scalar
+  // boundary, and below the span's end, so only the overflow gives it away.
+  for (size_t length : {kMax - 2, kMax - 5, kMax}) {
+    Scripted scripted;
+    scripted.answer = [=](std::string_view, size_t offset,
+                          const SplitEmit &emit) {
+      emit(U"東", TextRange{offset, 3});
+      emit(U"bogus", TextRange{offset + 3, length});
+      return size_t(6);
+    };
+    auto splitter = utf8_plain_text_splitter(scripted.segmenter(), kHan);
+
+    auto words = split(splitter, "東京");
+    EXPECT_EQ((Strings{"東"}), terms(words)) << length;
+    expect_ranges_exact("東京", words);
   }
 }
 

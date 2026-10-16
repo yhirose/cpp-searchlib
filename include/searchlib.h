@@ -1749,6 +1749,9 @@ private:
   // term", so without it a tombstone would have to ask every term.
   std::vector<size_t> document_term_offsets_{0}; // one more than documents_
   std::vector<uint32_t> document_term_ids_;
+  // Shared between copies of the index until one of them registers a scope,
+  // which gives that one a private copy first (see set_scope_ids): a copy is
+  // as cheap as it was, and a write reaches only the index it was made on.
   std::shared_ptr<detail::ScopeIndexData> scope_data_;
 
   // Sum of every live document's term_count, maintained on write so that
@@ -2324,29 +2327,38 @@ public:
     return names;
   }
 
+  // The serializers are InMemoryInvertedIndex::save's and load's, handed to
+  // every field: a Key that is not an integer or a string needs its own.
   void save(std::ostream &os,
-           const typename InMemoryInvertedIndex<T, Key>::TextRangeSerializer
-               &serialize_value = {},
-           IndexFormat format = IndexFormat::Plain) const {
+            const typename InMemoryInvertedIndex<T, Key>::TextRangeSerializer
+                &serialize_value = {},
+            IndexFormat format = IndexFormat::Plain,
+            const typename InMemoryInvertedIndex<T, Key>::KeySerializer
+                &serialize_key = {}) const {
     detail::write_scalar<uint64_t>(os, fields_.size());
     for (const auto &[name, index] : fields_) {
-      detail::write_scalar<uint64_t>(os, name.size());
-      os.write(name.data(), static_cast<std::streamsize>(name.size()));
-      index.save(os, serialize_value, format);
+      detail::write_bytes(os, name);
+      index.save(os, serialize_value, format, serialize_key);
     }
   }
 
+  // All or nothing: the fields are read aside and replace the current ones
+  // only once every one of them has loaded, so a stream that fails part-way
+  // leaves this index as it was.
   void load(std::istream &is,
-           const typename InMemoryInvertedIndex<T, Key>::TextRangeDeserializer
-               &deserialize_value = {}) {
-    fields_.clear();
+            const typename InMemoryInvertedIndex<T, Key>::TextRangeDeserializer
+                &deserialize_value = {},
+            const typename InMemoryInvertedIndex<T, Key>::KeyDeserializer
+                &deserialize_key = {}) {
+    std::map<std::string, InMemoryInvertedIndex<T, Key>> loaded;
     auto count = detail::read_scalar<uint64_t>(is);
     for (uint64_t i = 0; i < count; i++) {
       auto name = detail::read_bytes(is);
       InMemoryInvertedIndex<T, Key> index;
-      index.load(is, deserialize_value);
-      fields_[std::move(name)] = std::move(index);
+      index.load(is, deserialize_value, deserialize_key);
+      loaded[std::move(name)] = std::move(index);
     }
+    fields_ = std::move(loaded);
   }
 
 private:
@@ -3334,8 +3346,13 @@ size_t delegate_word(std::string_view text, WordScratch &scratch, size_t i,
         buffer.emplace_back(str, range);
       });
 
-  auto end = consumed == 0 ? std::string::npos
-                           : scratch.scalar_at(offset + consumed);
+  // Every sum below is of numbers a segmenter made up, so each is checked as a
+  // subtraction from a bound it must fit under: `offset + consumed` for a
+  // huge `consumed` wraps around to a scalar before the span's start, which
+  // would pass for a boundary and send the walk backwards.
+  auto end = consumed == 0 || consumed > text.size() - offset
+                 ? std::string::npos
+                 : scratch.scalar_at(offset + consumed);
   if (end == std::string::npos ||
       !unicode::is_grapheme_boundary(cps, n, end - i)) {
     return i + unicode::grapheme_length(cps, n);
@@ -3343,13 +3360,14 @@ size_t delegate_word(std::string_view text, WordScratch &scratch, size_t i,
 
   // Starts may repeat (a stack) and may not go back; the span's own start
   // is the first floor.
+  auto span_end = offset + consumed;
   auto last_start = offset;
   for (const auto &[str, range] : buffer) {
-    auto stop = range.position + range.length;
     if (range.length == 0 || range.position < last_start ||
-        stop > offset + consumed) {
+        range.position > span_end || range.length > span_end - range.position) {
       continue;
     }
+    auto stop = range.position + range.length;
     auto from = scratch.scalar_at(range.position);
     auto to = scratch.scalar_at(stop);
     if (from == std::string::npos || to == std::string::npos ||
@@ -4570,15 +4588,12 @@ public:
     return ordinals_[index];
   }
 
-  // The sum of the operands' counts, no merge needed: merging reorders the
-  // hits, it never adds or drops one.
+  // The merged row's length, not the sum of the operands' counts: a hit two
+  // operands share (`apple | apple`, `apple | app*`) is one hit. The merge is
+  // memoized, and whoever asks for the count goes on to read the hits.
   size_t search_hit_count(size_t index) const override {
-    locate_row(index);
-    size_t count = 0;
-    for (const auto &row : row_slots_) {
-      count += row.hit_count;
-    }
-    return count;
+    merge_row(index);
+    return row_positions_.size();
   }
 
   size_t term_position(size_t index, size_t search_hit_index) const override {
@@ -4591,8 +4606,8 @@ public:
     return row_lengths_[search_hit_index];
   }
 
-  // A merged row is the union of the operands' positions as a *set*, so
-  // membership is answerable operand by operand -- again without merging.
+  // A merged row is the union of the operands' hits as a *set*, so
+  // membership is answerable operand by operand, without merging.
   // Worth keeping off the memo path because Adjacent asks this once per
   // candidate position of its shortest operand.
   bool is_term_position(size_t index, size_t term_pos) const override {
@@ -4668,6 +4683,9 @@ private:
   // are already there. Ascending by position with ties going to the earlier
   // operand: the order the eager merge emitted, which the operations that
   // consume positions (and a materialized row's binary search) relied on.
+  // A hit is one position and one length: the same pair from a second
+  // operand is dropped, while a different length at the same position (a
+  // phrase beside the word it starts with) is a hit of its own.
   void merge_row(size_t index) const {
     if (cached_index_ == index) {
       return;
@@ -4709,8 +4727,16 @@ private:
         break;
       }
 
-      row_positions_.push_back(min_term_pos);
-      row_lengths_.push_back(min_term_length);
+      // The row is ascending, so what shares this position is at its tail.
+      auto seen = false;
+      for (auto k = row_positions_.size();
+           k > 0 && row_positions_[k - 1] == min_term_pos && !seen; k--) {
+        seen = row_lengths_[k - 1] == min_term_length;
+      }
+      if (!seen) {
+        row_positions_.push_back(min_term_pos);
+        row_lengths_.push_back(min_term_length);
+      }
       row_slots_[min_slot].hit_cursor++;
     }
 
@@ -5309,6 +5335,153 @@ inline bool collect_proximity_hits(
   return !hits.empty();
 }
 
+// Near over three or more operands.
+//
+// The walk above is exact for two operands because its test, the gap between
+// the pair, is the span of the group, and a span only grows as the walk moves
+// right: the earliest hit can be set aside once the group fails, since any
+// group it could join has a hit at least as far right and so a span at least
+// as wide. With more operands the test is that the chosen hits, in order,
+// each start within `distance` of the furthest end so far, and that does not
+// grow with the hits: swapping one operand's hit for a later one can close a
+// gap that the earliest hit was not the cause of (c@1 a@4 b@9 fails on the
+// gap before b, a@5 in place of a@4 does not). Setting the earliest aside
+// loses c@1 a@5 b@9.
+//
+// So this looks for a group as a search: hits in position order, each one
+// either skipped or added to a group that has no hit of its operand yet and
+// that it starts close enough to. What a group's future depends on is which
+// operands it has and how far its furthest end reaches, and a larger reach is
+// never worse, so one reach per set of operands is enough: 2^k of them, for
+// the k operands. That cost caps k (kMaxChainOperands); past it the walk
+// above stands in, with the misses it can have.
+//
+// The hits that come out are those on some complete group, not one group's
+// worth consumed greedily: every hit near enough to the rest to belong to a
+// match is a hit worth highlighting.
+inline constexpr size_t kMaxChainOperands = 6;
+
+inline bool collect_near_chains(
+    const std::vector<std::shared_ptr<IPostings>> &postings_list,
+    const std::vector<size_t> &cursors, size_t distance,
+    std::vector<size_t> &term_positions, std::vector<size_t> &term_lengths) {
+  struct ChainHit {
+    size_t position;
+    size_t length;
+    size_t slot;
+    size_t end() const { return position + length; }
+  };
+
+  std::vector<ChainHit> hits;
+  for (size_t slot = 0; slot < postings_list.size(); slot++) {
+    const auto &p = *postings_list[slot];
+    for (size_t h = 0; h < p.search_hit_count(cursors[slot]); h++) {
+      hits.push_back(ChainHit{p.term_position(cursors[slot], h),
+                              p.term_length(cursors[slot], h), slot});
+    }
+  }
+  std::sort(hits.begin(), hits.end(), [](const auto &a, const auto &b) {
+    return std::tie(a.position, a.slot, a.length) <
+           std::tie(b.position, b.slot, b.length);
+  });
+
+  const size_t masks = size_t(1) << postings_list.size();
+  const size_t full = masks - 1;
+
+  // Whether there is a group at all: best[operands] is the furthest reach of
+  // a group made of those, 0 for none. A hit only reads sets without its
+  // operand and only writes sets with it, so one array serves in place.
+  std::vector<size_t> best(masks, 0);
+  for (const auto &hit : hits) {
+    const size_t bit = size_t(1) << hit.slot;
+    for (size_t mask = 0; mask < masks; mask++) {
+      if (mask & bit) {
+        continue;
+      }
+      if (mask == 0) {
+        best[bit] = std::max(best[bit], hit.end());
+      } else if (best[mask] != 0 && hit.position < best[mask] + distance) {
+        best[mask | bit] =
+            std::max(best[mask | bit], std::max(best[mask], hit.end()));
+      }
+    }
+  }
+  if (best[full] == 0) {
+    return false;
+  }
+
+  // Which hits are on one. need[i][operands] is the least reach a group of
+  // `operands` must already have for the hits from i on to finish it:
+  // kAny if none, kNever if they cannot. Skipping hit i leaves the row as it
+  // was; taking it needs the start to be close enough, and the larger reach
+  // it brings to be enough for what follows.
+  constexpr auto kAny = std::numeric_limits<int64_t>::min();
+  constexpr auto kNever = std::numeric_limits<int64_t>::max();
+  const size_t n = hits.size();
+  std::vector<int64_t> need((n + 1) * masks, kNever);
+  need[n * masks + full] = kAny;
+  for (size_t i = n; i-- > 0;) {
+    const auto &hit = hits[i];
+    const size_t bit = size_t(1) << hit.slot;
+    auto *row = &need[i * masks];
+    const auto *next = row + masks;
+    std::copy(next, next + masks, row);
+    for (size_t mask = 0; mask < masks; mask++) {
+      if ((mask & bit) || next[mask | bit] == kNever) {
+        continue;
+      }
+      auto after = next[mask | bit];
+      auto end = static_cast<int64_t>(hit.end());
+      auto close_enough = static_cast<int64_t>(hit.position) -
+                          static_cast<int64_t>(distance) + 1;
+      int64_t take;
+      if (mask == 0) {
+        take = end >= after ? kAny : kNever;
+      } else {
+        take = end >= after ? close_enough : std::max(after, close_enough);
+      }
+      row[mask] = std::min(row[mask], take);
+    }
+  }
+
+  std::fill(best.begin(), best.end(), 0);
+  std::vector<std::pair<size_t, size_t>> used;
+  for (size_t i = 0; i < n; i++) {
+    const auto &hit = hits[i];
+    const size_t bit = size_t(1) << hit.slot;
+    const auto *after = &need[(i + 1) * masks];
+    bool on_a_group = false;
+    for (size_t mask = 0; mask < masks; mask++) {
+      if ((mask & bit) || after[mask | bit] == kNever) {
+        continue;
+      }
+      size_t reach;
+      if (mask == 0) {
+        reach = hit.end();
+      } else if (best[mask] != 0 && hit.position < best[mask] + distance) {
+        reach = std::max(best[mask], hit.end());
+      } else {
+        continue;
+      }
+      if (static_cast<int64_t>(reach) >= after[mask | bit]) {
+        best[mask | bit] = std::max(best[mask | bit], reach);
+        on_a_group = true;
+      }
+    }
+    if (on_a_group) {
+      used.emplace_back(hit.position, hit.length);
+    }
+  }
+
+  std::sort(used.begin(), used.end());
+  used.erase(std::unique(used.begin(), used.end()), used.end());
+  for (const auto &[position, length] : used) {
+    term_positions.push_back(position);
+    term_lengths.push_back(length);
+  }
+  return !used.empty();
+}
+
 inline std::shared_ptr<IPostings>
 perform_near_operation(const IInvertedIndex &inverted_index,
                        const Expression &expr, const IScopeIndex *scope_index,
@@ -5339,6 +5512,12 @@ perform_near_operation(const IInvertedIndex &inverted_index,
       filter,
       [&](const auto &postings_list, const auto &cursors, size_t /*ordinal*/,
           auto &term_positions, auto &term_lengths) {
+        if (postings_list.size() >= 3 &&
+            postings_list.size() <= kMaxChainOperands) {
+          return collect_near_chains(postings_list, cursors,
+                                     expr.near_operation_distance,
+                                     term_positions, term_lengths);
+        }
         return collect_proximity_hits(postings_list, cursors, scratch,
                                       term_positions, term_lengths,
                                       within_distance);
@@ -6212,6 +6391,9 @@ inline void InMemoryInvertedIndexBase::set_scope_ids(
 
   if (!scope_data_) {
     scope_data_ = std::make_shared<detail::ScopeIndexData>();
+  } else if (scope_data_.use_count() > 1) {
+    // A copy of this index holds the same data: write to our own.
+    scope_data_ = std::make_shared<detail::ScopeIndexData>(*scope_data_);
   }
 
   auto universe =
