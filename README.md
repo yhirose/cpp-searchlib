@@ -413,3 +413,6 @@ searchlib-cli index SOURCE INDEX_PATH
 # matching text ranges.
 searchlib-cli search INDEX_PATH QUERY [-n N]
 ```
+
+Options (`-n N`, `-v`) may come anywhere. A query that starts with `-` is how
+a query writes NOT, so put `--` before it: `searchlib-cli search idx -- -draft`.

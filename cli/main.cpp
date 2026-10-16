@@ -1,6 +1,6 @@
 #include <searchlib.h>
 
-#include "lib/flags.h"
+#include "lib/args.h"
 #include <unicodelib.h>
 
 #include <algorithm>
@@ -25,27 +25,42 @@ void usage() {
     search INDEX_PATH QUERY    - search INDEX_PATH for QUERY
 
   options:
-    -n N         limit results to N hits (search only, default 10)
-    -v           verbose output
+    -n N, --limit N   limit results to N hits (search only, default 10)
+    -v, --verbose     verbose output
+    -h, --help        show this help
+    --                end of options (put it before a query that starts
+                      with '-', which is how a query writes NOT)
 )";
 }
 
-int error(const std::string &message) {
+// A mistake in how the command was given: say so and show how it is meant.
+int usage_error(const std::string &message) {
   std::cerr << "error: " << message << std::endl;
   usage();
   return 1;
 }
 
+// A failure of the work itself, which the usage text would only bury.
+int failure(const std::string &message) {
+  std::cerr << "error: " << message << std::endl;
+  return 1;
+}
+
 // Collects regular files under `source` (or just `source` itself if it's a
 // file), sorted by path so that the index is the same across runs (its
-// ordinals follow indexing order).
-std::vector<fs::path> collect_source_files(const fs::path &source) {
+// ordinals follow indexing order). `index_path` is left out: indexing into
+// a directory it is already in would otherwise read last run's index file
+// as a document.
+std::vector<fs::path> collect_source_files(const fs::path &source,
+                                           const fs::path &index_path) {
+  auto skipped = fs::weakly_canonical(index_path);
   std::vector<fs::path> files;
   if (fs::is_regular_file(source)) {
     files.push_back(fs::absolute(source));
   } else if (fs::is_directory(source)) {
     for (const auto &entry : fs::recursive_directory_iterator(source)) {
-      if (entry.is_regular_file()) {
+      if (entry.is_regular_file() &&
+          fs::weakly_canonical(entry.path()) != skipped) {
         files.push_back(fs::absolute(entry.path()));
       }
     }
@@ -68,9 +83,9 @@ std::string read_file(const fs::path &path) {
 
 int cmd_index(const std::string &source, const std::string &index_path,
              bool verbose) {
-  auto files = collect_source_files(source);
+  auto files = collect_source_files(source, index_path);
   if (files.empty()) {
-    return error("no files found under: " + source);
+    return failure("no files found under: " + source);
   }
 
   // A file's path is its document key, so a hit comes back as the path it
@@ -101,7 +116,7 @@ int cmd_search(const std::string &index_path, const std::string &query_str,
 
   auto parsed = parse_query(normalizer, query_str);
   if (!parsed) {
-    return error("invalid query: " + query_str);
+    return failure("invalid query: " + query_str);
   }
 
   const auto &expr = *parsed;
@@ -125,11 +140,23 @@ int cmd_search(const std::string &index_path, const std::string &query_str,
     std::cout << rank << ". " << path << "  score=" << hit.score
               << std::endl;
 
-    auto content = read_file(path);
+    // The source is read again to show the matches, and may have gone or
+    // changed since it was indexed: that costs the snippets, not the hits
+    // after this one.
+    std::string content;
+    try {
+      content = read_file(path);
+    } catch (const std::exception &e) {
+      std::cout << "   (" << e.what() << ")" << std::endl;
+    }
     auto hit_count = result->search_hit_count(hit.index);
     constexpr size_t kMaxShownHits = 3;
     for (size_t h = 0; h < std::min(hit_count, kMaxShownHits); h++) {
       auto rng = invidx.text_range(*result, hit.index, h);
+      if (rng.position > content.size() ||
+          rng.length > content.size() - rng.position) {
+        continue;
+      }
       std::cout << "   [" << rng.position << ':' << rng.length << "] \""
                 << content.substr(rng.position, rng.length) << '"'
                 << std::endl;
@@ -148,35 +175,39 @@ int cmd_search(const std::string &index_path, const std::string &query_str,
 } // namespace
 
 int main(int argc, char **argv) {
-  const flags::args args(argc, argv);
-
-  if (args.positional().size() < 1) {
-    return error("missing command");
+  cli::Args args;
+  try {
+    args = cli::parse_args(argc, argv);
+  } catch (const std::invalid_argument &e) {
+    return usage_error(e.what());
+  }
+  if (args.help) {
+    usage();
+    return 0;
+  }
+  if (args.positional.empty()) {
+    return usage_error("missing command");
   }
 
-  auto verbose = args.get<bool>("v", false);
-  auto cmd = args.positional().at(0);
+  const auto &cmd = args.positional[0];
+  const auto &rest = args.positional;
 
   try {
     if (cmd == "index") {
-      auto source = args.get<std::string>(1);
-      auto index_path = args.get<std::string>(2);
-      if (!source || !index_path) {
-        return error("usage: searchlib-cli index SOURCE INDEX_PATH");
+      if (rest.size() != 3) {
+        return usage_error("usage: searchlib-cli index SOURCE INDEX_PATH");
       }
-      return cmd_index(*source, *index_path, verbose);
+      return cmd_index(rest[1], rest[2], args.verbose);
     } else if (cmd == "search") {
-      auto index_path = args.get<std::string>(1);
-      auto query = args.get<std::string>(2);
-      if (!index_path || !query) {
-        return error("usage: searchlib-cli search INDEX_PATH QUERY");
+      if (rest.size() != 3) {
+        return usage_error("usage: searchlib-cli search INDEX_PATH QUERY");
       }
-      auto limit = args.get<size_t>("n", size_t(10));
-      return cmd_search(*index_path, *query, limit, verbose);
+      return cmd_search(rest[1], rest[2], args.limit.value_or(10),
+                        args.verbose);
     } else {
-      return error("unknown command: " + std::string(cmd));
+      return usage_error("unknown command: " + cmd);
     }
   } catch (const std::exception &e) {
-    return error(e.what());
+    return failure(e.what());
   }
 }
