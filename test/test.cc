@@ -3213,3 +3213,86 @@ TEST(WildcardSearchTest, PatternWithoutLiteralsMatchesNothing) {
   EXPECT_EQ(Operation::Wildcard, expr->operation);
   EXPECT_EQ(U"*ird", expr->term_str);
 }
+
+// df counts live documents, once each however often the term occurs in one,
+// and is kept current as documents are removed or replaced rather than worked
+// out from the postings (which keep tombstoned documents) at each call.
+TEST(RemoveDocumentTest, DfTracksLiveDocuments) {
+  InMemoryInvertedIndex<TextRange> a;
+  InMemoryIndexer indexer(a, normalizer);
+  indexer.index_document(0, UTF8PlainTextTokenizer("apple apple banana"));
+  indexer.index_document(1, UTF8PlainTextTokenizer("apple cherry"));
+  indexer.index_document(2, UTF8PlainTextTokenizer("banana"));
+
+  EXPECT_EQ(2, a.df(U"apple")); // doc 0 twice is still one document
+  EXPECT_EQ(2, a.df(U"banana"));
+  EXPECT_EQ(1, a.df(U"cherry"));
+  EXPECT_EQ(0, a.df(U"missing"));
+
+  a.remove_document(0);
+  EXPECT_EQ(1, a.df(U"apple"));
+  EXPECT_EQ(1, a.df(U"banana"));
+  a.remove_document(0); // removing it again takes nothing off twice
+  EXPECT_EQ(1, a.df(U"apple"));
+
+  // An update tombstones the old copy: the postings list both, df one.
+  indexer.index_document(1, UTF8PlainTextTokenizer("cherry date"));
+  EXPECT_EQ(0, a.df(U"apple"));
+  EXPECT_EQ(1, a.df(U"cherry"));
+  EXPECT_EQ(2, a.postings(U"cherry")->size());
+  EXPECT_EQ(1, a.df(U"date"));
+  EXPECT_LE(a.df(U"cherry"), a.document_count());
+
+  // A copy has its own counts.
+  auto b = a;
+  b.remove_document(2);
+  EXPECT_EQ(0, b.df(U"banana"));
+  EXPECT_EQ(1, a.df(U"banana"));
+
+  // What a load rebuilds must agree, and keep counting afterwards.
+  for (auto format : {IndexFormat::Plain, IndexFormat::Compressed}) {
+    std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+    a.save(ss, {}, format);
+    std::string bytes = ss.str();
+
+    InMemoryInvertedIndex<TextRange> loaded;
+    std::stringstream in(bytes, std::ios::in | std::ios::binary);
+    loaded.load(in);
+    for (auto term : {U"apple", U"banana", U"cherry", U"date", U"missing"}) {
+      EXPECT_EQ(a.df(term), loaded.df(term)) << u8(term);
+    }
+    loaded.remove_document(2);
+    EXPECT_EQ(0, loaded.df(U"banana"));
+    loaded.remove_document(1);
+    EXPECT_EQ(0, loaded.df(U"cherry"));
+    EXPECT_EQ(0, loaded.df(U"date"));
+
+    if (format == IndexFormat::Compressed) {
+      std::stringstream again(bytes, std::ios::in | std::ios::binary);
+      auto read_only = load_compressed_index(again);
+      for (auto term : {U"apple", U"banana", U"cherry", U"date", U"missing"}) {
+        EXPECT_EQ(a.df(term), read_only->df(term)) << u8(term);
+      }
+    }
+  }
+}
+
+// A re-index that fails leaves df where it was, new terms and all.
+TEST(RemoveDocumentTest, FailedReindexLeavesDfUnchanged) {
+  InMemoryInvertedIndex<TextRange> invidx;
+  InMemoryIndexer indexer(invidx, normalizer);
+  indexer.index_document(0, UTF8PlainTextTokenizer("apple banana"));
+
+  Tokenizer<TextRange> fails = [](Normalizer, auto callback) {
+    callback(U"apple", 0, TextRange{0, 5});
+    callback(U"fresh", 1, TextRange{6, 5});
+    throw std::runtime_error("tokenizer failed");
+  };
+  EXPECT_THROW(indexer.index_document(0, fails), std::runtime_error);
+  EXPECT_EQ(1, invidx.df(U"apple"));
+  EXPECT_EQ(0, invidx.df(U"fresh"));
+
+  indexer.index_document(0, UTF8PlainTextTokenizer("fresh"));
+  EXPECT_EQ(0, invidx.df(U"apple"));
+  EXPECT_EQ(1, invidx.df(U"fresh"));
+}

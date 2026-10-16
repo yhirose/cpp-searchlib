@@ -431,10 +431,9 @@ public:
   // The number of live documents carrying the term: a tombstoned document
   // still sits in the term's postings until the index is rebuilt, but it is
   // not counted here, so df never exceeds document_count() -- which BM25's
-  // idf relies on to stay a real number. Discounting them is not free once
-  // an index has any: the built-in backends pay the smaller of a binary
-  // search per tombstone and a pass over the postings, which is why
-  // BM25Scorer asks once per term per query rather than once per hit.
+  // idf relies on to stay a real number. Implementations keep it current
+  // rather than work it out per call: bm25_score and tf_idf_score ask for it
+  // once per scored hit.
   virtual size_t df(const std::u32string &str) const = 0;
   virtual double tf(const std::u32string &str, size_t ordinal) const = 0;
 
@@ -818,10 +817,9 @@ Expression expand_wildcards(const IInvertedIndex &invidx,
 // edit distance is not boosted.
 Expression expand_fuzzy(const IInvertedIndex &invidx, const Expression &expr);
 
-// Scorers for one hit at a time. Each looks every term up again per call --
-// its postings, and for tf_idf_score and bm25_score its df, which an index
-// with tombstones has to discount (see IInvertedIndex::df) -- so ranking a
-// whole result is better done with BM25Scorer, which pays that once.
+// Scorers for one hit at a time. Each looks every term up again per call, so
+// ranking a whole result is better done with BM25Scorer, which pays that
+// once.
 size_t term_count_score(const IInvertedIndex &invidx, const Expression &expr,
                         const IPostings &postings, size_t index);
 
@@ -1610,11 +1608,26 @@ public:
     size_t term_count;
   };
 
+  // A term's number among the dictionary's, handed out in order of arrival
+  // and kept for the life of the index. It indexes live_df_ and names the
+  // term in document_term_ids_, as a 4-byte stand-in for a pointer that a
+  // copy of the index would leave dangling.
+  static constexpr uint32_t kNoTermId = std::numeric_limits<uint32_t>::max();
+
   struct Term {
     std::u32string str;
     size_t term_count;
     Postings postings;
+    uint32_t id = kNoTermId;
   };
+
+  // Gives a term its id the first time a document carries it.
+  uint32_t add_term_id();
+
+  // Records that the document `ordinal` -- the newest one -- carries the
+  // term, once however many times it occurs there: the term's df counts one
+  // more live document, and tombstone() will take it off again.
+  void add_document_term(uint32_t term_id);
 
   // Hands out the next ordinal: documents are numbered densely in indexing
   // order and never renumbered while the index is live, so ordinals only
@@ -1627,9 +1640,28 @@ public:
   // total behind average_document_term_count() stays correct.
   void set_document_term_count(size_t ordinal, size_t term_count);
 
+  // Rebuilds the three structures behind df() from the loaded postings.
+  void rebuild_document_terms_();
+
   std::vector<Document> documents_; // indexed by ordinal
   std::unordered_map<std::u32string /*str*/, Term> term_dictionary_;
   std::unordered_set<size_t /*ordinal*/> removed_ordinals_;
+
+  // The live document frequency of each term, indexed by Term::id: how many
+  // of its postings' documents are not tombstoned. A postings list keeps its
+  // tombstoned documents until the index is rebuilt, so its size() overstates
+  // df -- enough to push BM25's idf negative -- and discounting them on each
+  // call costs a pass over the postings per scored hit. Kept current on
+  // write instead, so df() stays one lookup.
+  std::vector<size_t> live_df_;
+  // What tombstone() needs to keep live_df_ current: the terms each document
+  // carries, as ids, in one array (a document's are the slice
+  // [document_term_offsets_[ordinal], document_term_offsets_[ordinal + 1]),
+  // the last one's running to the end). A tombstoned document's slice stays
+  // behind, unread. Postings only answer "which documents have this term",
+  // so without it a tombstone would have to ask every term in the dictionary.
+  std::vector<size_t> document_term_offsets_; // one per document
+  std::vector<uint32_t> document_term_ids_;
   std::shared_ptr<detail::ScopeIndexData> scope_data_;
 
   // Sum of every live document's term_count, maintained on write so that
@@ -2082,11 +2114,19 @@ public:
     index_.keys_.push(document_key, ordinal);
 
     for (const auto &occurrence : occurrences_) {
+      auto *term = occurrence.term;
+      if (occurrence.created) {
+        term->id = index_.base_.add_term_id();
+      }
       // A term stacked on itself (a filter that answered the same string
       // twice) is one occurrence, not two.
-      auto *term = occurrence.term;
+      auto entries = term->postings.size();
       if (term->postings.add_term_position(ordinal, occurrence.term_pos)) {
         term->term_count++;
+      }
+      // The first position the document has for the term opens its entry.
+      if (term->postings.size() != entries) {
+        index_.base_.add_document_term(term->id);
       }
     }
     if (!text_ranges.empty()) {
@@ -3337,9 +3377,11 @@ inline size_t find_postings_index_for_ordinal(const IPostings &p,
 
 // How many of the documents in `p` are not in `removed`: a term's df once
 // tombstones are discounted. Whichever side is smaller drives the count --
-// a binary search into the postings per removed ordinal, or one set lookup
-// per posting -- so an index with a handful of updates pays next to nothing
-// on a long list, and one rewritten wholesale pays at most a pass over it.
+// a binary search into the postings per removed ordinal, or a pass over the
+// postings read a block at a time -- so an index with a handful of updates
+// pays next to nothing on a long list, and one rewritten wholesale pays at
+// most the pass. For an index that does not change afterwards: it is what
+// the read-only backend settles each term's df with, once, at load.
 inline size_t
 live_document_frequency(const IPostings &p,
                         const std::unordered_set<size_t> &removed) {
@@ -3355,10 +3397,13 @@ live_document_frequency(const IPostings &p,
       }
     }
   } else {
-    for (size_t i = 0; i < n; i++) {
-      if (removed.find(p.document_ordinal(i)) != removed.end()) {
-        dead++;
+    std::array<size_t, 256> block;
+    for (size_t i = 0; i < n;) {
+      auto read = p.read_ordinals(i, block.data(), block.size());
+      for (size_t j = 0; j < read; j++) {
+        dead += removed.find(block[j]) != removed.end();
       }
+      i += read;
     }
   }
   return n - dead;
@@ -3656,6 +3701,11 @@ public:
     }
 
     read_removed_ordinals(is, term_counts_.size(), removed_ordinals_);
+    // The index never changes after this, so each term's df is counted once
+    // here rather than at every call.
+    for (auto &term : terms_) {
+      term.live_df = live_document_frequency(*term.postings, removed_ordinals_);
+    }
 
     // Scope-index section (see InMemoryInvertedIndexBase::save): read and
     // discard, since IScopeIndex is not exposed by this read-only backend
@@ -3731,7 +3781,8 @@ public:
   }
 
   size_t df(const std::u32string &str) const override {
-    return live_document_frequency(*postings(str), removed_ordinals_);
+    const auto *term = find_term_(str);
+    return term ? term->live_df : 0;
   }
 
   double tf(const std::u32string &str, size_t ordinal) const override {
@@ -3815,6 +3866,8 @@ public:
 private:
   struct CompressedTerm {
     size_t term_count = 0;
+    // Postings that are not tombstoned, settled at load (see df).
+    size_t live_df = 0;
     std::shared_ptr<const IPostings> postings;
   };
 
@@ -4020,9 +4073,7 @@ inline size_t estimate_matches(const IInvertedIndex &inverted_index,
   constexpr auto unknown = std::numeric_limits<size_t>::max();
   switch (expr.operation) {
   case Operation::Term:
-    // The postings' own size, tombstones included, rather than df: ranking
-    // operands does not need df's exactness, and df pays to discount them.
-    return inverted_index.postings(expr.term_str)->size();
+    return inverted_index.df(expr.term_str);
   case Operation::And:
   case Operation::Adjacent:
   case Operation::Near:
@@ -5927,7 +5978,18 @@ InMemoryInvertedIndexBase::document_term_count(size_t ordinal) const {
 
 inline size_t InMemoryInvertedIndexBase::push_document() {
   documents_.push_back(Document{0});
+  document_term_offsets_.push_back(document_term_ids_.size());
   return documents_.size() - 1;
+}
+
+inline uint32_t InMemoryInvertedIndexBase::add_term_id() {
+  live_df_.push_back(0);
+  return static_cast<uint32_t>(live_df_.size() - 1);
+}
+
+inline void InMemoryInvertedIndexBase::add_document_term(uint32_t term_id) {
+  document_term_ids_.push_back(term_id);
+  live_df_[term_id]++;
 }
 
 inline void
@@ -5955,6 +6017,13 @@ inline void InMemoryInvertedIndexBase::tombstone(size_t ordinal) {
   auto term_count = documents_.at(ordinal).term_count;
   if (removed_ordinals_.insert(ordinal).second) {
     total_document_term_count_ -= term_count;
+    auto first = document_term_offsets_[ordinal];
+    auto last = ordinal + 1 < document_term_offsets_.size()
+                    ? document_term_offsets_[ordinal + 1]
+                    : document_term_ids_.size();
+    for (auto i = first; i < last; i++) {
+      live_df_[document_term_ids_[i]]--;
+    }
   }
 }
 
@@ -5980,7 +6049,8 @@ inline size_t InMemoryInvertedIndexBase::term_count(const std::u32string &str,
 }
 
 inline size_t InMemoryInvertedIndexBase::df(const std::u32string &str) const {
-  return detail::live_document_frequency(*postings(str), removed_ordinals_);
+  auto it = term_dictionary_.find(str);
+  return it != term_dictionary_.end() ? live_df_[it->second.id] : 0;
 }
 
 inline double InMemoryInvertedIndexBase::tf(const std::u32string &str,
@@ -6225,6 +6295,45 @@ inline void InMemoryInvertedIndexBase::save(std::ostream &os,
   }
 }
 
+// One counting pass over every posting entry to size each live document's
+// slice, a second to fill them. Tombstoned documents get an empty slice:
+// nothing will ever tombstone them again, and none of their entries count
+// toward df.
+inline void InMemoryInvertedIndexBase::rebuild_document_terms_() {
+  live_df_.assign(term_dictionary_.size(), 0);
+  document_term_offsets_.assign(documents_.size(), 0);
+  document_term_ids_.clear();
+
+  uint32_t next_id = 0;
+  std::vector<size_t> sizes(documents_.size(), 0);
+  for (auto &[_, term] : term_dictionary_) {
+    term.id = next_id++;
+    for (size_t i = 0; i < term.postings.size(); i++) {
+      auto ordinal = term.postings.document_ordinal(i);
+      if (removed_ordinals_.find(ordinal) == removed_ordinals_.end()) {
+        sizes[ordinal]++;
+        live_df_[term.id]++;
+      }
+    }
+  }
+
+  size_t total = 0;
+  for (size_t ordinal = 0; ordinal < sizes.size(); ordinal++) {
+    document_term_offsets_[ordinal] = total;
+    total += sizes[ordinal];
+  }
+  document_term_ids_.resize(total);
+  std::vector<size_t> next = document_term_offsets_;
+  for (const auto &[_, term] : term_dictionary_) {
+    for (size_t i = 0; i < term.postings.size(); i++) {
+      auto ordinal = term.postings.document_ordinal(i);
+      if (removed_ordinals_.find(ordinal) == removed_ordinals_.end()) {
+        document_term_ids_[next[ordinal]++] = term.id;
+      }
+    }
+  }
+}
+
 inline void InMemoryInvertedIndexBase::load(std::istream &is,
                                             IndexFormat format) {
   auto compressed_format = format == IndexFormat::Compressed;
@@ -6242,6 +6351,8 @@ inline void InMemoryInvertedIndexBase::load(std::istream &is,
   term_dictionary_.clear();
   auto term_count = detail::read_scalar<uint64_t>(is);
   term_dictionary_.reserve(static_cast<size_t>(term_count));
+  // Ids and the rest of what df() rests on are rebuilt after the removed
+  // ordinals are known, below.
 
   // In the Compressed format the term strings live in one FST ahead of the
   // per-term records; recover them up front so the loop below can stay
@@ -6277,6 +6388,7 @@ inline void InMemoryInvertedIndexBase::load(std::istream &is,
       total_document_term_count_ += documents_[ordinal].term_count;
     }
   }
+  rebuild_document_terms_();
 
   scope_data_.reset();
   auto scope_name_count = detail::read_scalar<uint64_t>(is);
