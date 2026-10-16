@@ -24,9 +24,9 @@
 // corpus large enough that building it is a memory problem:
 //
 //   searchlib-bench                                   # KJV x10, defaults
-//   searchlib-bench --corpus aozora.tsv --text-field 3 \
-//                   --repeat 1 --queries ja.txt \
-//                   --splitter ja-ud-gsd.mod --text-ranges skip \
+//   searchlib-bench --corpus aozora.tsv --text-field 3
+//                   --repeat 1 --queries ja.txt
+//                   --splitter ja-ud-gsd.mod --text-ranges skip
 //                   --index /tmp/aozora.idx
 //
 // With --index the index is also saved, dropped and re-loaded, so the report

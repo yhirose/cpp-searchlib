@@ -4,3 +4,4 @@ project(searchlib-cli)
 add_executable(searchlib-cli main.cpp)
 
 target_link_libraries(searchlib-cli PRIVATE searchlib)
+searchlib_warnings(searchlib-cli)

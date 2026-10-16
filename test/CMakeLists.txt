@@ -31,6 +31,7 @@ add_executable(
 # `inline` fails to link here, which is the check that keeps the single header
 # honest.
 target_link_libraries(test-main PRIVATE gtest_main searchlib-segment)
+searchlib_warnings(test-main)
 # The command-line parser lives with the CLI, as a header of its own.
 target_include_directories(test-main PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../cli/lib)
 

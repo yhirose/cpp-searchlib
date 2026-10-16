@@ -523,7 +523,7 @@ public:
   // removals; searches filter out removed ordinals via these hooks.
   // Overridden by indexes that support IMutableInvertedIndex::remove_document.
   virtual bool has_removed_documents() const { return false; }
-  virtual bool is_document_removed(size_t ordinal) const { return false; }
+  virtual bool is_document_removed(size_t /*ordinal*/) const { return false; }
 };
 
 //-----------------------------------------------------------------------------
@@ -764,13 +764,13 @@ struct Expression {
   // The proximity window for Operation::Near, and -- reusing the same field
   // rather than adding one only two operations would ever read -- the maximum
   // edit distance for Operation::Fuzzy. Unused by every other operation.
-  size_t near_operation_distance;
-  std::vector<Expression> nodes;
+  size_t near_operation_distance = 0;
+  std::vector<Expression> nodes = {};
 
   // Only meaningful for Operation::SameScope: the scope_name passed to
   // IScopeIndex. nodes holds the two or more sub-expressions whose hits must
   // share the same scope ordinal to survive.
-  std::string scope_name;
+  std::string scope_name = {};
 };
 
 std::optional<Expression> parse_query(Normalizer normalizer,
@@ -2607,16 +2607,8 @@ public:
       return;
     }
 
-    // Low-bit width l = floor(log2(U/n)) keeps the high-bits vector at most
-    // ~2n + 1 bits long (bucket count <= 2n).
-    auto ratio = universe_ / size_;
-    while (low_bits_ + 1 < 64 && (uint64_t(1) << (low_bits_ + 1)) <= ratio) {
-      low_bits_++;
-    }
-
-    auto bucket_count = static_cast<size_t>((universe_ - 1) >> low_bits_) + 1;
-    high_ = BitVector(size_ + bucket_count);
-    low_words_.assign((size_ * low_bits_ + 63) / 64 + 1, 0);
+    high_ = BitVector(size_ + derive_layout_());
+    low_words_.assign(low_word_count_(), 0);
 
     for (size_t i = 0; i < size_; i++) {
       auto value = values[i];
@@ -2666,18 +2658,13 @@ public:
       return;
     }
 
-    auto ratio = universe_ / size_;
-    while (low_bits_ + 1 < 64 && (uint64_t(1) << (low_bits_ + 1)) <= ratio) {
-      low_bits_++;
-    }
-
+    auto bucket_count = derive_layout_();
     high_.load(is);
-    auto bucket_count = static_cast<size_t>((universe_ - 1) >> low_bits_) + 1;
     if (high_.size() != size_ + bucket_count || high_.ones() != size_) {
       throw std::runtime_error("searchlib: corrupt Elias-Fano data");
     }
 
-    low_words_.assign((size_ * low_bits_ + 63) / 64 + 1, 0);
+    low_words_.assign(low_word_count_(), 0);
     for (auto &word : low_words_) {
       word = read_scalar<uint64_t>(is);
     }
@@ -2742,6 +2729,23 @@ public:
   }
 
 private:
+  // What the layout hangs on, as functions of (size, universe) alone -- which
+  // is why save() stores nothing else -- so that the constructor and load()
+  // derive it in one place and cannot drift apart. Sets low_bits_ and returns
+  // the number of high-bit buckets. Needs size_ > 0.
+  size_t derive_layout_() {
+    // Low-bit width l = floor(log2(U/n)) keeps the high-bits vector at most
+    // ~2n + 1 bits long (bucket count <= 2n).
+    auto ratio = universe_ / size_;
+    low_bits_ = 0;
+    while (low_bits_ + 1 < 64 && (uint64_t(1) << (low_bits_ + 1)) <= ratio) {
+      low_bits_++;
+    }
+    return static_cast<size_t>((universe_ - 1) >> low_bits_) + 1;
+  }
+
+  size_t low_word_count_() const { return (size_ * low_bits_ + 63) / 64 + 1; }
+
   uint64_t low_mask_() const {
     return low_bits_ == 0 ? 0 : (uint64_t(1) << low_bits_) - 1;
   }
@@ -3578,7 +3582,8 @@ public:
     }
   }
 
-  size_t term_length(size_t index, size_t search_hit_index) const override {
+  size_t term_length(size_t /*index*/,
+                     size_t /*search_hit_index*/) const override {
     return 1;
   }
 
@@ -4074,16 +4079,16 @@ perform_search_operation(const IInvertedIndex &inverted_index,
                          const Expression &expr, const IScopeIndex *scope_index,
                          const IPostings *filter = nullptr);
 
-inline auto positings_list(const IInvertedIndex &inverted_index,
-                           const std::vector<Expression> &nodes,
-                           const IScopeIndex *scope_index,
-                           const IPostings *filter = nullptr) {
-  std::vector<std::shared_ptr<IPostings>> positings_list;
+inline auto operand_postings(const IInvertedIndex &inverted_index,
+                             const std::vector<Expression> &nodes,
+                             const IScopeIndex *scope_index,
+                             const IPostings *filter = nullptr) {
+  std::vector<std::shared_ptr<IPostings>> postings_list;
   for (const auto &expr : nodes) {
-    positings_list.push_back(
+    postings_list.push_back(
         perform_search_operation(inverted_index, expr, scope_index, filter));
   }
-  return positings_list;
+  return postings_list;
 }
 
 // An upper bound on how many documents expr can match, cheap enough to take
@@ -4216,9 +4221,9 @@ inline size_t gallop_lower_bound(P &postings, size_t cursor, size_t size,
 class OrdinalWindows {
 public:
   explicit OrdinalWindows(
-      const std::vector<std::shared_ptr<IPostings>> &positings_list) {
+      const std::vector<std::shared_ptr<IPostings>> &postings_list) {
     size_t buffered = 0;
-    for (const auto &postings : positings_list) {
+    for (const auto &postings : postings_list) {
       buffered += postings->prefers_block_reads() ? 1 : 0;
     }
 
@@ -4226,8 +4231,8 @@ public:
     // read walks it once per output document, and packing eight to a cache
     // line rather than interleaving it with block state is worth more than
     // the second indirection costs.
-    postings_.reserve(positings_list.size());
-    for (const auto &postings : positings_list) {
+    postings_.reserve(postings_list.size());
+    for (const auto &postings : postings_list) {
       postings_.push_back(postings.get());
     }
     if (buffered == 0) {
@@ -4235,10 +4240,10 @@ public:
     }
 
     scratch_.resize(buffered * kWindow);
-    blocks_.resize(positings_list.size());
+    blocks_.resize(postings_list.size());
     size_t next = 0;
-    for (size_t slot = 0; slot < positings_list.size(); slot++) {
-      if (positings_list[slot]->prefers_block_reads()) {
+    for (size_t slot = 0; slot < postings_list.size(); slot++) {
+      if (postings_list[slot]->prefers_block_reads()) {
         blocks_[slot].buffer = scratch_.data() + next;
         next += kWindow;
       }
@@ -4730,17 +4735,16 @@ inline bool increment_all_cursors(const std::vector<size_t> &sizes,
 }
 
 inline void
-increment_cursors(std::vector<std::shared_ptr<IPostings>> &positings_list,
+increment_cursors(std::vector<std::shared_ptr<IPostings>> &postings_list,
                   std::vector<size_t> &sizes, std::vector<size_t> &cursors,
-                  OrdinalWindows &windows,
-                  const std::vector<size_t> &slots) {
+                  OrdinalWindows &windows, const std::vector<size_t> &slots) {
   for (int i = slots.size() - 1; i >= 0; i--) {
     auto slot = slots[i];
     cursors[slot]++;
     if (cursors[slot] == sizes[slot]) {
       cursors.erase(cursors.begin() + slot);
       sizes.erase(sizes.begin() + slot);
-      positings_list.erase(positings_list.begin() + slot);
+      postings_list.erase(postings_list.begin() + slot);
       windows.erase(slot);
     }
   }
@@ -4758,8 +4762,8 @@ increment_cursors(std::vector<std::shared_ptr<IPostings>> &positings_list,
 // Adjacent/Near/SameScope also synthesize positions per document.
 template <typename T>
 inline void for_each_intersection(
-    const std::vector<std::shared_ptr<IPostings>> &positings_list, T fn) {
-  if (positings_list.empty()) {
+    const std::vector<std::shared_ptr<IPostings>> &postings_list, T fn) {
+  if (postings_list.empty()) {
     return;
   }
 
@@ -4767,8 +4771,8 @@ inline void for_each_intersection(
   // resolved once here rather than re-fetched through the virtual interface
   // by every cursor advance of every iteration.
   std::vector<size_t> sizes;
-  sizes.reserve(positings_list.size());
-  for (const auto &postings : positings_list) {
+  sizes.reserve(postings_list.size());
+  for (const auto &postings : postings_list) {
     auto size = postings->size();
     if (size == 0) {
       return;
@@ -4776,8 +4780,8 @@ inline void for_each_intersection(
     sizes.push_back(size);
   }
 
-  std::vector<size_t> cursors(positings_list.size(), 0);
-  OrdinalWindows windows(positings_list);
+  std::vector<size_t> cursors(postings_list.size(), 0);
+  OrdinalWindows windows(postings_list);
 
   // Same reason as the union walk above for writing this twice.
   auto done = false;
@@ -4800,8 +4804,9 @@ inline void for_each_intersection(
     auto read = [&](size_t slot, size_t index) {
       return windows.direct(slot, index);
     };
-    auto advance = [&](size_t slot, size_t cursor, size_t size, size_t ordinal) {
-      return gallop_lower_bound(*positings_list[slot], cursor, size, ordinal);
+    auto advance = [&](size_t slot, size_t cursor, size_t size,
+                       size_t ordinal) {
+      return gallop_lower_bound(*postings_list[slot], cursor, size, ordinal);
     };
     while (!done) {
       auto [min, max] = min_max_slots_scan(
@@ -4816,13 +4821,13 @@ inline void for_each_intersection(
   }
 }
 
-// positings_list with the filter appended as one more, non-owning, last slot:
+// postings_list with the filter appended as one more, non-owning, last slot:
 // the caller holds the filter for the whole walk, and the cast is as safe as
 // perform_term_operation's -- IPostings is all-const.
 inline std::vector<std::shared_ptr<IPostings>>
-with_filter_slot(const std::vector<std::shared_ptr<IPostings>> &positings_list,
+with_filter_slot(const std::vector<std::shared_ptr<IPostings>> &postings_list,
                  const IPostings &filter) {
-  auto walk = positings_list;
+  auto walk = postings_list;
   walk.emplace_back(std::shared_ptr<IPostings>(),
                     const_cast<IPostings *>(&filter));
   return walk;
@@ -4837,21 +4842,21 @@ with_filter_slot(const std::vector<std::shared_ptr<IPostings>> &positings_list,
 // only add a cursor to every step.
 template <typename T>
 inline void for_each_filtered_intersection(
-    const std::vector<std::shared_ptr<IPostings>> &positings_list,
+    const std::vector<std::shared_ptr<IPostings>> &postings_list,
     const IPostings *filter, T fn) {
-  if (filter && !positings_list.empty() &&
-      std::all_of(positings_list.begin(), positings_list.end(),
+  if (filter && !postings_list.empty() &&
+      std::all_of(postings_list.begin(), postings_list.end(),
                   [&](const auto &p) { return filter->size() < p->size(); })) {
-    for_each_intersection(with_filter_slot(positings_list, *filter), fn);
+    for_each_intersection(with_filter_slot(postings_list, *filter), fn);
   } else {
-    for_each_intersection(positings_list, fn);
+    for_each_intersection(postings_list, fn);
   }
 }
 
 template <typename T>
-inline std::shared_ptr<IPostings> intersect_postings(
-    const std::vector<std::shared_ptr<IPostings>> &positings_list,
-    const IPostings *filter, T make_positions) {
+inline std::shared_ptr<IPostings>
+intersect_postings(const std::vector<std::shared_ptr<IPostings>> &postings_list,
+                   const IPostings *filter, T make_positions) {
   auto result = std::make_shared<SearchResult>();
 
   // Filled and cleared once per matched document rather than reallocated:
@@ -4861,8 +4866,8 @@ inline std::shared_ptr<IPostings> intersect_postings(
   std::vector<size_t> term_lengths;
 
   for_each_filtered_intersection(
-      positings_list, filter, [&](const auto &cursors, size_t ordinal) {
-        if (make_positions(positings_list, cursors, ordinal, term_positions,
+      postings_list, filter, [&](const auto &cursors, size_t ordinal) {
+        if (make_positions(postings_list, cursors, ordinal, term_positions,
                            term_lengths)) {
           result->push_back(ordinal, term_positions, term_lengths);
         } else {
@@ -4875,46 +4880,46 @@ inline std::shared_ptr<IPostings> intersect_postings(
 }
 
 inline std::shared_ptr<IPostings>
-union_postings(std::vector<std::shared_ptr<IPostings>> &&positings_list) {
+union_postings(std::vector<std::shared_ptr<IPostings>> &&postings_list) {
   // The result views every operand, so it takes its own copy of the list
   // before the walk below starts dropping the ones that run out
   // (increment_cursors erases them). Built from the leftovers instead, it
   // would answer with the positions of only the terms that survived to the
   // end. The copy is k shared_ptrs, once per query.
-  auto result = std::make_shared<LazyMergeResult>(positings_list);
+  auto result = std::make_shared<LazyMergeResult>(postings_list);
 
-  std::vector<size_t> cursors(positings_list.size(), 0);
+  std::vector<size_t> cursors(postings_list.size(), 0);
   // Resolved once, then kept in step with the list as operands are dropped:
   // the walk's exhaustion check runs once per slot per output document.
   std::vector<size_t> sizes;
-  sizes.reserve(positings_list.size());
-  for (const auto &postings : positings_list) {
+  sizes.reserve(postings_list.size());
+  for (const auto &postings : postings_list) {
     sizes.push_back(postings->size());
   }
   std::vector<size_t> slots; // reused across documents
-  OrdinalWindows windows(positings_list);
+  OrdinalWindows windows(postings_list);
 
   // Two loops rather than one with the read behind a lambda or a per-document
   // test: this is the union's innermost loop, and every attempt to share it
   // cost the unbuffered path 12% to 40%. The buffered one is entered only
   // when an operand actually gains from block reads.
   if (windows.buffered()) {
-    while (!positings_list.empty()) {
+    while (!postings_list.empty()) {
       result->push_back(min_slots_scan(
           windows.size(),
           [&](size_t slot) { return windows.at(slot, cursors[slot]); },
           slots));
-      increment_cursors(positings_list, sizes, cursors, windows, slots);
-      assert(positings_list.size() == cursors.size());
+      increment_cursors(postings_list, sizes, cursors, windows, slots);
+      assert(postings_list.size() == cursors.size());
     }
   } else {
-    while (!positings_list.empty()) {
+    while (!postings_list.empty()) {
       result->push_back(min_slots_scan(
           windows.size(),
           [&](size_t slot) { return windows.direct(slot, cursors[slot]); },
           slots));
-      increment_cursors(positings_list, sizes, cursors, windows, slots);
-      assert(positings_list.size() == cursors.size());
+      increment_cursors(postings_list, sizes, cursors, windows, slots);
+      assert(postings_list.size() == cursors.size());
     }
   }
 
@@ -4940,10 +4945,10 @@ inline bool probing_pays(const IPostings &filter,
 }
 
 inline std::shared_ptr<IPostings>
-probe_union_postings(std::vector<std::shared_ptr<IPostings>> &&positings_list,
+probe_union_postings(std::vector<std::shared_ptr<IPostings>> &&postings_list,
                      const IPostings &filter) {
-  auto result = std::make_shared<LazyMergeResult>(positings_list);
-  if (positings_list.empty()) {
+  auto result = std::make_shared<LazyMergeResult>(postings_list);
+  if (postings_list.empty()) {
     return result;
   }
 
@@ -4953,8 +4958,8 @@ probe_union_postings(std::vector<std::shared_ptr<IPostings>> &&positings_list,
   // its search every time. Probing a filter of 38,770 against two operands
   // that way took 12.7ms, slower than the 11.2ms full union it was meant to
   // beat; through windows it takes 4.8ms.
-  auto operands = positings_list.size();
-  auto walk = with_filter_slot(positings_list, filter);
+  auto operands = postings_list.size();
+  auto walk = with_filter_slot(postings_list, filter);
   std::vector<size_t> sizes;
   sizes.reserve(walk.size());
   for (const auto &postings : walk) {
@@ -5037,8 +5042,8 @@ perform_and_operation(const IInvertedIndex &inverted_index,
 
   // A negative operand is only ever asked about documents every positive one
   // names, so it can take the same filter they did.
-  auto negative_postings_list = positings_list(inverted_index, negative_nodes,
-                                               scope_index, positive.filter);
+  auto negative_postings_list = operand_postings(inverted_index, negative_nodes,
+                                                 scope_index, positive.filter);
   std::vector<size_t> negative_cursors(negative_postings_list.size(), 0);
 
   auto result = std::make_shared<LazyMergeResult>(positive_postings_list);
@@ -5083,13 +5088,13 @@ inline std::shared_ptr<IPostings> perform_adjacent_operation(
       intersection_operands(inverted_index, expr.nodes, scope_index, filter)
           .postings,
       filter,
-      [&](const auto &positings_list, const auto &cursors, size_t /*ordinal*/,
+      [&](const auto &postings_list, const auto &cursors, size_t /*ordinal*/,
           auto &term_positions, auto &term_lengths) {
-        auto slot_count = positings_list.size();
+        auto slot_count = postings_list.size();
         positions.resize(slot_count);
         size_t target_slot = 0;
         for (size_t slot = 0; slot < slot_count; slot++) {
-          const auto &p = positings_list[slot];
+          const auto &p = postings_list[slot];
           auto &list = positions[slot];
           list.resize(p->search_hit_count(cursors[slot]));
           p->read_term_positions(cursors[slot], list.data());
@@ -5139,7 +5144,7 @@ perform_or_operation(const IInvertedIndex &inverted_index,
                      const Expression &expr, const IScopeIndex *scope_index,
                      const IPostings *filter) {
   auto operands =
-      positings_list(inverted_index, expr.nodes, scope_index, filter);
+      operand_postings(inverted_index, expr.nodes, scope_index, filter);
   // Both unions below take the operands with the empty ones already gone.
   operands.erase(std::remove_if(operands.begin(), operands.end(),
                                 [](const auto &postings) {
@@ -5697,7 +5702,7 @@ inline void InMemoryInvertedIndexBase::Postings::read_term_positions(
 }
 
 inline size_t InMemoryInvertedIndexBase::Postings::term_length(
-           size_t index, size_t search_hit_index) const {
+    size_t /*index*/, size_t /*search_hit_index*/) const {
   return 1;
 }
 
@@ -6624,18 +6629,23 @@ inline TermFilter to_term_filter(Normalizer normalizer) {
 // Search
 //-----------------------------------------------------------------------------
 
-inline Expression expand_prefixes(const IInvertedIndex &inverted_index,
-                                  const Expression &expr) {
-  if (expr.operation == Operation::Prefix) {
-    std::vector<Expression> nodes;
-    inverted_index.enumerate_terms_with_prefix(
-        expr.term_str, [&](const auto &str) {
-          nodes.push_back(Expression{Operation::Term, str});
-        });
+namespace detail {
 
-    // enumerate_terms_with_prefix leaves the order unspecified, and the
-    // expanded Expression is handed back to the caller, so sort to keep it
-    // reproducible for one prefix against one index.
+// Rewrites every node of expr whose operation is `operation` into the Or of
+// the Terms `enumerate` finds for it, leaving the rest of the tree alone.
+// `enumerate(node, emit)` calls emit(str) once per matching dictionary term.
+template <typename Enumerate>
+Expression expand_nodes(const Expression &expr, Operation operation,
+                        const Enumerate &enumerate) {
+  if (expr.operation == operation) {
+    std::vector<Expression> nodes;
+    enumerate(expr, [&](const std::u32string &str) {
+      nodes.push_back(Expression{Operation::Term, str});
+    });
+
+    // The enumerations leave the order unspecified, and the expanded
+    // Expression is handed back to the caller, so sort to keep it
+    // reproducible for one pattern against one index.
     std::sort(nodes.begin(), nodes.end(), [](const auto &a, const auto &b) {
       return a.term_str < b.term_str;
     });
@@ -6645,59 +6655,36 @@ inline Expression expand_prefixes(const IInvertedIndex &inverted_index,
 
   auto expanded = expr;
   for (auto &node : expanded.nodes) {
-    node = expand_prefixes(inverted_index, node);
+    node = expand_nodes(node, operation, enumerate);
   }
   return expanded;
+}
+
+} // namespace detail
+
+inline Expression expand_prefixes(const IInvertedIndex &inverted_index,
+                                  const Expression &expr) {
+  return detail::expand_nodes(
+      expr, Operation::Prefix, [&](const Expression &node, auto emit) {
+        inverted_index.enumerate_terms_with_prefix(node.term_str, emit);
+      });
 }
 
 inline Expression expand_wildcards(const IInvertedIndex &inverted_index,
                                    const Expression &expr) {
-  if (expr.operation == Operation::Wildcard) {
-    std::vector<Expression> nodes;
-    inverted_index.enumerate_terms_with_wildcard(
-        expr.term_str, [&](const auto &str) {
-          nodes.push_back(Expression{Operation::Term, str});
-        });
-
-    // enumerate_terms_with_wildcard leaves the order unspecified, same
-    // reproducibility rationale as expand_prefixes.
-    std::sort(nodes.begin(), nodes.end(), [](const auto &a, const auto &b) {
-      return a.term_str < b.term_str;
-    });
-
-    return Expression{Operation::Or, std::u32string(), 0, std::move(nodes)};
-  }
-
-  auto expanded = expr;
-  for (auto &node : expanded.nodes) {
-    node = expand_wildcards(inverted_index, node);
-  }
-  return expanded;
+  return detail::expand_nodes(
+      expr, Operation::Wildcard, [&](const Expression &node, auto emit) {
+        inverted_index.enumerate_terms_with_wildcard(node.term_str, emit);
+      });
 }
 
 inline Expression expand_fuzzy(const IInvertedIndex &inverted_index,
                                const Expression &expr) {
-  if (expr.operation == Operation::Fuzzy) {
-    std::vector<Expression> nodes;
-    inverted_index.enumerate_terms_with_edit_distance(
-        expr.term_str, expr.near_operation_distance, [&](const auto &str) {
-          nodes.push_back(Expression{Operation::Term, str});
-        });
-
-    // enumerate_terms_with_edit_distance leaves the order unspecified, same
-    // reproducibility rationale as expand_prefixes.
-    std::sort(nodes.begin(), nodes.end(), [](const auto &a, const auto &b) {
-      return a.term_str < b.term_str;
-    });
-
-    return Expression{Operation::Or, std::u32string(), 0, std::move(nodes)};
-  }
-
-  auto expanded = expr;
-  for (auto &node : expanded.nodes) {
-    node = expand_fuzzy(inverted_index, node);
-  }
-  return expanded;
+  return detail::expand_nodes(
+      expr, Operation::Fuzzy, [&](const Expression &node, auto emit) {
+        inverted_index.enumerate_terms_with_edit_distance(
+            node.term_str, node.near_operation_distance, emit);
+      });
 }
 
 namespace detail {
@@ -6761,6 +6748,30 @@ inline double tf_idf_score(const IInvertedIndex &invidx, const Expression &expr,
   return score;
 }
 
+namespace detail {
+
+// BM25's pieces, written once for the three places that evaluate them --
+// bm25_score, BM25Scorer and MaxScore's bounds -- whose scores have to agree
+// to the bit, which sharing the arithmetic keeps and copying it does not.
+//
+// The idf of a term in `n` of `N` live documents.
+inline double bm25_idf(double N, double n) {
+  return std::log2((N - n + 0.5) / (n + 0.5));
+}
+
+// The length term of the denominator for a document of `dl` terms.
+inline double bm25_norm(double k1, double b, double dl, double avgdl) {
+  return k1 * (1.0 - b + b * (dl / avgdl));
+}
+
+// What one term adds to a document's score, for the document's `norm` and the
+// term's `tf` there (0 when the document does not carry it).
+inline double bm25_term(double idf, double tf, double k1, double norm) {
+  return idf * ((tf * (k1 + 1.0)) / (tf + norm));
+}
+
+} // namespace detail
+
 inline double bm25_score(const IInvertedIndex &invidx, const Expression &expr,
                          const IPostings &postings, size_t index, double k1,
                          double b) {
@@ -6768,15 +6779,13 @@ inline double bm25_score(const IInvertedIndex &invidx, const Expression &expr,
   auto N = static_cast<double>(invidx.document_count());
   auto dl = static_cast<double>(invidx.document_term_count(ordinal));
   auto avgdl = static_cast<double>(invidx.average_document_term_count());
+  auto norm = detail::bm25_norm(k1, b, dl, avgdl);
 
   double score = 0.0;
   detail::enumerate_terms(invidx, expr, [&](const auto &term) {
     auto n = static_cast<double>(invidx.df(term));
-    auto idf = std::log2((N - n + 0.5) / (n + 0.5));
-    auto tf = invidx.tf(term, ordinal);
-
-    score +=
-        idf * ((tf * (k1 + 1.0)) / (tf + k1 * (1.0 - b + b * (dl / avgdl))));
+    score += detail::bm25_term(detail::bm25_idf(N, n), invidx.tf(term, ordinal),
+                               k1, norm);
   });
   return score;
 }
@@ -6801,9 +6810,8 @@ inline BM25Scorer::BM25Scorer(const IInvertedIndex &invidx,
     auto n = static_cast<double>(invidx.df(term));
     auto block_reads = postings->prefers_block_reads();
     windowed_ = windowed_ || block_reads;
-    terms_.push_back(TermState{std::move(postings),
-                               std::log2((N - n + 0.5) / (n + 0.5)), size, 0,
-                               0, block_reads});
+    terms_.push_back(TermState{std::move(postings), detail::bm25_idf(N, n),
+                               size, 0, 0, block_reads});
   });
   if (windowed_) {
     windows_.reserve(terms_.size());
@@ -6818,7 +6826,7 @@ inline double BM25Scorer::score_(Result &result, size_t index,
                                  TermReader term_reader) const {
   auto ordinal = result.document_ordinal(index);
   auto dl = static_cast<double>(invidx_.document_term_count(ordinal));
-  auto norm = k1_ * (1.0 - b_ + b_ * (dl / avgdl_));
+  auto norm = detail::bm25_norm(k1_, b_, dl, avgdl_);
 
   // The terms through a local pointer and count: the loop writes each
   // term's cursor, so read through the member the compiler would reload
@@ -6838,7 +6846,7 @@ inline double BM25Scorer::score_(Result &result, size_t index,
     if (i < term.size) {
       tf = static_cast<double>(reader.search_hit_count(i)) / dl;
     }
-    score += term.idf * ((tf * (k1_ + 1.0)) / (tf + norm));
+    score += detail::bm25_term(term.idf, tf, k1_, norm);
   }
   return score;
 }
@@ -6922,8 +6930,7 @@ struct MaxScore {
     auto contribution = [&](double idf, size_t count, size_t length) {
       auto dl = static_cast<double>(length);
       auto tf = static_cast<double>(count) / dl;
-      return idf *
-             ((tf * (k1 + 1.0)) / (tf + k1 * (1.0 - b + b * (dl / avgdl))));
+      return bm25_term(idf, tf, k1, bm25_norm(k1, b, dl, avgdl));
     };
 
     constexpr auto kEnd = std::numeric_limits<size_t>::max();

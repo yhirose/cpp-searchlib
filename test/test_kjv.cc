@@ -344,7 +344,7 @@ TEST(KJVTest, UTF8DecodePerformance) {
   std::string s;
   while (std::getline(fs, s)) {
     UTF8PlainTextTokenizer tokenizer(s);
-    tokenizer(normalizer, [&](auto &str, auto, auto) {});
+    tokenizer(normalizer, [&](auto &, auto, auto) {});
   }
 }
 
