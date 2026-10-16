@@ -162,6 +162,14 @@ TEST(EliasFanoTest, Duplicates) {
   verify_elias_fano({5, 5, 5, 9, 9, 100}, 200);
 }
 
+TEST(EliasFanoTest, RejectsUnsortedOrOutOfRangeValues) {
+  // The layout is sized from the sorted, in-range promise; a value that
+  // breaks it used to be written past the end of the high-bits vector.
+  EXPECT_THROW(EliasFano({1000, 0}, 1001), std::invalid_argument);
+  EXPECT_THROW(EliasFano({0, 5, 3}, 10), std::invalid_argument);
+  EXPECT_THROW(EliasFano({10}, 10), std::invalid_argument);
+}
+
 TEST(EliasFanoTest, HugeUniverse) {
   // Sparse values over a 2^40 universe exercise wide low-bit widths.
   verify_elias_fano({0, uint64_t(1) << 20, uint64_t(1) << 39},

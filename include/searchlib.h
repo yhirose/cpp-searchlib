@@ -216,6 +216,28 @@ inline std::string read_bytes(std::istream &is) {
   return bytes;
 }
 
+// The removed-ordinal section both loaders share: a count, then that many
+// ordinals. Each must name one of the `document_count` documents the file
+// holds -- an ordinal past them would make the live count (documents minus
+// removed) wrap around -- and the reservation is capped by that same count,
+// so a corrupt count cannot ask for more memory than the documents could
+// ever need.
+inline void read_removed_ordinals(std::istream &is, size_t document_count,
+                                  std::unordered_set<size_t> &removed) {
+  removed.clear();
+  auto removed_count = read_scalar<uint64_t>(is);
+  removed.reserve(
+      static_cast<size_t>(std::min<uint64_t>(removed_count, document_count)));
+  for (uint64_t i = 0; i < removed_count; i++) {
+    auto ordinal = read_scalar<uint64_t>(is);
+    if (ordinal >= document_count) {
+      throw std::runtime_error(
+          "searchlib: removed document ordinal out of range in index stream");
+    }
+    removed.insert(static_cast<size_t>(ordinal));
+  }
+}
+
 } // namespace detail
 
 //-----------------------------------------------------------------------------
@@ -764,6 +786,9 @@ std::optional<Expression> parse_query(TextSplitter splitter, TermFilter filter,
 // a memoized row it keeps inside itself, so its const methods write to it.
 // Two threads reading one result race even though neither touches the index.
 // Concurrent queries each build their own result, so this costs nothing.
+//
+// Throws std::invalid_argument for an expression parse_query would never
+// return: a Not anywhere but directly under an And with a positive child.
 std::shared_ptr<IPostings> perform_search(const IInvertedIndex &invidx,
                                           const Expression &expr,
                                           const IScopeIndex *scope_index = nullptr);
@@ -1965,15 +1990,18 @@ public:
 
   void index_document(const Key &document_key,
                       Tokenizer<T> tokenizer) override {
-    // A fresh ordinal every time: a key that already names a document has
-    // that one tombstoned first, which is what makes "update = re-index the
-    // same key" leave nothing of the old text behind, and what keeps every
-    // postings list append-only.
-    if (auto previous = index_.keys_.ordinal(document_key)) {
-      index_.base_.tombstone(*previous);
-    }
-    auto ordinal = index_.base_.push_document();
-    index_.keys_.push(document_key, ordinal);
+    auto &dictionary = index_.base_.term_dictionary_;
+
+    // The tokenizer runs to completion before the index changes, so one
+    // that throws -- including the position check below -- leaves the
+    // index as it found it: the old document still live under its key, and
+    // no half-indexed one beside it. Its terms are resolved to dictionary
+    // entries as they arrive (a reference into an unordered_map survives a
+    // rehash), and the entries this call had to create are erased again if
+    // it fails, so a failed call leaves no empty term behind either.
+    occurrences_.clear();
+    created_terms_.clear();
+    std::vector<T> text_ranges;
 
     // Positions must arrive in order, each either the next one or the one
     // just handed out: the text-range vector below is appended to once per
@@ -1984,33 +2012,68 @@ public:
     // Analyzer<T> keeps to this by construction; checking here covers a
     // hand-written Tokenizer<T>, which does not go through it.
     size_t position_count = 0;
-    tokenizer(normalizer_, [&](const auto &str, auto term_pos,
-                               auto text_range) {
-      if (term_pos == position_count) {
-        if (text_ranges_ == TextRangeStorage::Store) {
-          index_.text_range_list_[ordinal].push_back(std::move(text_range));
+    try {
+      tokenizer(normalizer_, [&](const auto &str, auto term_pos,
+                                 auto text_range) {
+        if (term_pos == position_count) {
+          if (text_ranges_ == TextRangeStorage::Store) {
+            if constexpr (std::is_same_v<T, TextRange>) {
+              // The compressed format codes a document's ranges as one
+              // ascending sequence, so they have to arrive that way.
+              if (!text_ranges.empty() &&
+                  text_range.position < text_ranges.back().position) {
+                throw std::runtime_error(
+                    "searchlib: a tokenizer must emit text ranges in "
+                    "ascending order of position");
+              }
+            }
+            text_ranges.push_back(std::move(text_range));
+          }
+          position_count++;
+        } else if (term_pos + 1 != position_count) {
+          throw std::runtime_error(
+              "searchlib: a tokenizer must emit term positions in order, "
+              "each the next one or the one just emitted (a stacked term), "
+              "because one term position holds exactly one text range; to "
+              "cut a word into a sequence of pieces use subword_splitter");
         }
-        position_count++;
-      } else if (term_pos + 1 != position_count) {
-        throw std::runtime_error(
-            "searchlib: a tokenizer must emit term positions in order, each "
-            "the next one or the one just emitted (a stacked term), because "
-            "one term position holds exactly one text range; to cut a word "
-            "into a sequence of pieces use subword_splitter");
-      }
 
-      if (index_.base_.term_dictionary_.find(str) ==
-          index_.base_.term_dictionary_.end()) {
-        index_.base_.term_dictionary_[str] = {str, 0};
+        auto it = dictionary.find(str);
+        if (it == dictionary.end()) {
+          it = dictionary
+                   .emplace(str, InMemoryInvertedIndexBase::Term{str, 0, {}})
+                   .first;
+          created_terms_.push_back(str);
+        }
+        occurrences_.emplace_back(&it->second, term_pos);
+      });
+    } catch (...) {
+      for (const auto &str : created_terms_) {
+        dictionary.erase(str);
       }
+      throw;
+    }
 
+    // A fresh ordinal every time: a key that already names a document has
+    // that one tombstoned first, which is what makes "update = re-index the
+    // same key" leave nothing of the old text behind, and what keeps every
+    // postings list append-only.
+    if (auto previous = index_.keys_.ordinal(document_key)) {
+      index_.base_.tombstone(*previous);
+    }
+    auto ordinal = index_.base_.push_document();
+    index_.keys_.push(document_key, ordinal);
+
+    for (auto [term, term_pos] : occurrences_) {
       // A term stacked on itself (a filter that answered the same string
       // twice) is one occurrence, not two.
-      auto &term = index_.base_.term_dictionary_.at(str);
-      if (term.postings.add_term_position(ordinal, term_pos)) {
-        term.term_count++;
+      if (term->postings.add_term_position(ordinal, term_pos)) {
+        term->term_count++;
       }
-    });
+    }
+    if (!text_ranges.empty()) {
+      index_.text_range_list_[ordinal] = std::move(text_ranges);
+    }
 
     // A document is as long as its positions: alternatives stacked on one
     // do not make the text longer.
@@ -2021,6 +2084,10 @@ private:
   InMemoryInvertedIndex<T, Key> &index_;
   Normalizer normalizer_;
   TextRangeStorage text_ranges_;
+  // index_document's scratch, kept to reuse its capacity across documents.
+  std::vector<std::pair<InMemoryInvertedIndexBase::Term *, size_t>>
+      occurrences_;
+  std::vector<std::u32string> created_terms_;
 };
 
 // A minimal thread-safe wrapper around an InMemoryInvertedIndex<T> for the
@@ -2436,7 +2503,8 @@ public:
   EliasFano() = default;
 
   // values must be sorted (duplicates allowed) with every element less than
-  // universe.
+  // universe. Checked, since the bit layout is sized from that promise: a
+  // value out of order or out of range would be written past the end of it.
   EliasFano(const std::vector<uint64_t> &values, uint64_t universe)
       : size_(values.size()), universe_(universe) {
     if (size_ == 0) {
@@ -2456,6 +2524,11 @@ public:
 
     for (size_t i = 0; i < size_; i++) {
       auto value = values[i];
+      if (value >= universe_ || (i > 0 && value < values[i - 1])) {
+        throw std::invalid_argument(
+            "searchlib: Elias-Fano values must be ascending and below the "
+            "universe");
+      }
       high_.set(static_cast<size_t>(value >> low_bits_) + i);
       if (low_bits_ > 0) {
         auto bit = i * low_bits_;
@@ -3558,12 +3631,7 @@ public:
       }
     }
 
-    auto removed_count = read_scalar<uint64_t>(is);
-    removed_ordinals_.reserve(static_cast<size_t>(removed_count));
-    for (uint64_t i = 0; i < removed_count; i++) {
-      removed_ordinals_.insert(
-          static_cast<size_t>(read_scalar<uint64_t>(is)));
-    }
+    read_removed_ordinals(is, term_counts_.size(), removed_ordinals_);
 
     // Scope-index section (see InMemoryInvertedIndexBase::save): read and
     // discard, since IScopeIndex is not exposed by this read-only backend
@@ -5251,7 +5319,7 @@ inline bool is_valid_expression(const Expression &expr) {
     size_t positive_count = 0;
     for (const auto &node : expr.nodes) {
       if (node.operation == Operation::Not) {
-        if (!is_valid_expression(node.nodes[0])) {
+        if (node.nodes.size() != 1 || !is_valid_expression(node.nodes[0])) {
           return false;
         }
       } else {
@@ -5853,8 +5921,12 @@ inline double InMemoryInvertedIndexBase::average_document_term_count() const {
 }
 
 inline void InMemoryInvertedIndexBase::tombstone(size_t ordinal) {
+  // Looked up before the insert: an ordinal that names no document throws
+  // here, rather than after it has already joined the removed set and made
+  // document_count() (documents minus removed) wrap around.
+  auto term_count = documents_.at(ordinal).term_count;
   if (removed_ordinals_.insert(ordinal).second) {
-    total_document_term_count_ -= documents_.at(ordinal).term_count;
+    total_document_term_count_ -= term_count;
   }
 }
 
@@ -6171,13 +6243,7 @@ inline void InMemoryInvertedIndexBase::load(std::istream &is,
     }
   }
 
-  removed_ordinals_.clear();
-  auto removed_count = detail::read_scalar<uint64_t>(is);
-  removed_ordinals_.reserve(static_cast<size_t>(removed_count));
-  for (uint64_t i = 0; i < removed_count; i++) {
-    removed_ordinals_.insert(
-        static_cast<size_t>(detail::read_scalar<uint64_t>(is)));
-  }
+  detail::read_removed_ordinals(is, documents_.size(), removed_ordinals_);
   for (size_t ordinal = 0; ordinal < documents_.size(); ordinal++) {
     if (removed_ordinals_.find(ordinal) == removed_ordinals_.end()) {
       total_document_term_count_ += documents_[ordinal].term_count;
@@ -6479,6 +6545,14 @@ inline std::shared_ptr<IPostings>
 perform_filtered_search(const IInvertedIndex &inverted_index,
                         const Expression &expr, const IScopeIndex *scope_index,
                         const IPostings *filter) {
+  // parse_query only ever returns a valid tree, but one built by hand can
+  // put a Not where nothing evaluates it (under an Or, a Near, or at the
+  // top), and its operand would come back null.
+  if (!is_valid_expression(expr)) {
+    throw std::invalid_argument(
+        "searchlib: invalid expression: Not is allowed only as a child of an "
+        "And that has a positive child");
+  }
   auto result =
       perform_search_operation(inverted_index, expr, scope_index, filter);
   // Exclude logically-deleted documents from the final result. Skipped
@@ -6968,6 +7042,13 @@ parse_query(TextSplitter splitter, TermFilter filter, std::string_view query) {
           pattern += U'*';
         }
         start = star_pos + 1;
+      }
+      // Nothing literal left (`**`, or `*the*` with "the" a stop word):
+      // the pattern would be a bare `*`, matching every term in the
+      // dictionary. Match nothing instead, as a bare `*` and a dropped
+      // prefix do.
+      if (pattern.find_first_not_of(U'*') == std::u32string::npos) {
+        return Expression{Operation::Term, std::u32string()};
       }
       return Expression{Operation::Wildcard, pattern};
     };

@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <map>
 #include <sstream>
@@ -3048,4 +3049,167 @@ TEST(SameScopeTest, HitsComeOutInPositionOrder) {
   ASSERT_EQ(2, same->size());
   EXPECT_EQ((std::vector<size_t>{1, 2}), hit_positions(*same, 0));
   EXPECT_EQ((std::vector<size_t>{0, 2}), hit_positions(*same, 1));
+}
+
+// A tokenizer that throws -- here the indexer's own position check, on a
+// tokenizer that skips from position 0 to 5 -- used to leave the old copy
+// tombstoned and a half-indexed new one live under the key.
+TEST(RemoveDocumentTest, FailedReindexLeavesTheIndexUnchanged) {
+  InMemoryInvertedIndex<TextRange> invidx;
+  InMemoryIndexer indexer(invidx, normalizer);
+  indexer.index_document(7, UTF8PlainTextTokenizer("old text"));
+  indexer.index_document(8, UTF8PlainTextTokenizer("other"));
+
+  Tokenizer<TextRange> skips = [](Normalizer, auto callback) {
+    callback(U"new", 0, TextRange{0, 3});
+    callback(U"brandnew", 5, TextRange{4, 8});
+  };
+  EXPECT_THROW(indexer.index_document(7, skips), std::runtime_error);
+
+  struct Failure {};
+  Tokenizer<TextRange> fails = [](Normalizer, auto callback) {
+    callback(U"new", 0, TextRange{0, 3});
+    throw Failure{};
+  };
+  EXPECT_THROW(indexer.index_document(7, fails), Failure);
+
+  EXPECT_EQ(2, invidx.document_count());
+  EXPECT_FALSE(invidx.has_removed_documents());
+  // Neither the terms the failed calls introduced nor their postings stay.
+  EXPECT_FALSE(invidx.term_exists(U"new"));
+  EXPECT_FALSE(invidx.term_exists(U"brandnew"));
+
+  auto old = perform_search(invidx, *parse_query(normalizer, "old"));
+  ASSERT_EQ(1, old->size());
+  auto ordinal = old->document_ordinal(0);
+  EXPECT_EQ(7, invidx.document_key(ordinal));
+  EXPECT_EQ(2, invidx.document_term_count(ordinal));
+  EXPECT_EQ(0u, invidx.text_range(*old, 0, 0).position);
+
+  // And the next call goes through as if nothing had happened.
+  indexer.index_document(7, UTF8PlainTextTokenizer("new text"));
+  EXPECT_EQ(2, invidx.document_count());
+  EXPECT_EQ(0, perform_search(invidx, *parse_query(normalizer, "old"))->size());
+  EXPECT_EQ(1, perform_search(invidx, *parse_query(normalizer, "new"))->size());
+}
+
+// The compressed format codes a document's text ranges as one ascending
+// sequence; ranges out of order used to be accepted here and then written
+// past the end of the Elias-Fano bit vector on a Compressed save.
+TEST(RemoveDocumentTest, TextRangesOutOfOrderAreRejected) {
+  InMemoryInvertedIndex<TextRange> invidx;
+  InMemoryIndexer indexer(invidx, normalizer);
+  indexer.index_document(0, UTF8PlainTextTokenizer("kept"));
+
+  Tokenizer<TextRange> backwards = [](Normalizer, auto callback) {
+    callback(U"late", 0, TextRange{1000, 5});
+    callback(U"early", 1, TextRange{0, 5});
+  };
+  EXPECT_THROW(indexer.index_document(1, backwards), std::runtime_error);
+  EXPECT_EQ(1, invidx.document_count());
+
+  std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+  invidx.save(ss, {}, IndexFormat::Compressed);
+  auto loaded = load_compressed_index(ss);
+  EXPECT_EQ(1, loaded->document_count());
+}
+
+TEST(RemoveDocumentTest, TombstoningAnUnknownOrdinalChangesNothing) {
+  InMemoryInvertedIndexBase base;
+  base.set_document_term_count(base.push_document(), 3);
+
+  EXPECT_THROW(base.tombstone(5), std::out_of_range);
+  EXPECT_EQ(1, base.document_count());
+  EXPECT_FALSE(base.has_removed_documents());
+  EXPECT_EQ(3.0, base.average_document_term_count());
+}
+
+// A removed ordinal past the documents a file holds would make the live
+// count (documents minus removed) wrap around to 2^64 - 1.
+TEST(PersistenceTest, RejectsRemovedOrdinalOutOfRange) {
+  auto save = [](size_t removed_key, IndexFormat format) {
+    auto invidx = sample_index();
+    invidx.remove_document(removed_key);
+    std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+    invidx.save(ss, {}, format);
+    return ss.str();
+  };
+
+  for (auto format : {IndexFormat::Plain, IndexFormat::Compressed}) {
+    // Two files that differ only in which ordinal is removed locate the
+    // removed-ordinal field; point it past every document.
+    auto bytes = save(1, format);
+    auto other = save(2, format);
+    ASSERT_EQ(bytes.size(), other.size());
+    auto at = std::mismatch(bytes.begin(), bytes.end(), other.begin()).first -
+              bytes.begin();
+    ASSERT_LT(static_cast<size_t>(at) + sizeof(uint64_t), bytes.size());
+    uint64_t past_the_end = sample_documents.size() + 100;
+    std::memcpy(&bytes[at], &past_the_end, sizeof(past_the_end));
+
+    {
+      std::stringstream ss(bytes, std::ios::in | std::ios::binary);
+      InMemoryInvertedIndex<TextRange> loaded;
+      EXPECT_THROW(loaded.load(ss), std::runtime_error);
+    }
+    if (format == IndexFormat::Compressed) {
+      std::stringstream ss(bytes, std::ios::in | std::ios::binary);
+      EXPECT_THROW(load_compressed_index(ss), std::runtime_error);
+    }
+  }
+}
+
+// parse_query never puts a Not anywhere but directly under an And, but a
+// tree built by hand can, and its operand used to come back null and be
+// dereferenced.
+TEST(NotTest, MisplacedNotIsRejected) {
+  const auto &invidx = sample_index();
+  auto term = [](std::u32string str) {
+    return Expression{Operation::Term, std::move(str)};
+  };
+  auto not_of = [](Expression operand) {
+    return Expression{
+        Operation::Not, std::u32string(), 0, {std::move(operand)}};
+  };
+  auto node = [](Operation operation, std::vector<Expression> nodes) {
+    return Expression{operation, std::u32string(), 4, std::move(nodes)};
+  };
+
+  for (const auto &expr :
+       {node(Operation::Or, {term(U"first"), not_of(term(U"second"))}),
+        node(Operation::Near, {term(U"first"), not_of(term(U"second"))}),
+        not_of(term(U"second")),
+        node(Operation::And, {not_of(term(U"second"))}),
+        node(Operation::And, {term(U"first"), node(Operation::Not, {})})}) {
+    EXPECT_THROW(perform_search(invidx, expr), std::invalid_argument);
+    EXPECT_THROW(bm25_top_k(invidx, expr, 10), std::invalid_argument);
+  }
+
+  // The placement parse_query produces still works.
+  auto valid =
+      node(Operation::And, {term(U"document"), not_of(term(U"third"))});
+  EXPECT_EQ(3, perform_search(invidx, valid)->size());
+}
+
+TEST(WildcardSearchTest, PatternWithoutLiteralsMatchesNothing) {
+  const auto &invidx = sample_index();
+  TermFilter drop_the = [](const std::u32string &str, auto emit) {
+    if (str != U"the") {
+      emit(to_lowercase(str));
+    }
+  };
+
+  for (auto query : {"**", "***", "*the*", "the**"}) {
+    auto expr = parse_query(drop_the, query);
+    ASSERT_TRUE(expr) << query;
+    EXPECT_EQ(Operation::Term, expr->operation) << query;
+    EXPECT_TRUE(expr->term_str.empty()) << query;
+    EXPECT_EQ(0, perform_search(invidx, *expr)->size()) << query;
+  }
+
+  // A pattern with any literal left is still a wildcard.
+  auto expr = parse_query(drop_the, "*the*ird");
+  ASSERT_TRUE(expr);
+  EXPECT_EQ(Operation::Wildcard, expr->operation);
+  EXPECT_EQ(U"*ird", expr->term_str);
 }
