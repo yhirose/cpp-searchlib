@@ -1,6 +1,6 @@
 #include <searchlib.h>
 
-#include "lib/args.h"
+#include "lib/cli_args.h"
 #include <unicodelib.h>
 
 #include <algorithm>
@@ -33,16 +33,16 @@ void usage() {
 )";
 }
 
-// A mistake in how the command was given: say so and show how it is meant.
-int usage_error(const std::string &message) {
-  std::cerr << "error: " << message << std::endl;
-  usage();
-  return 1;
-}
-
 // A failure of the work itself, which the usage text would only bury.
 int failure(const std::string &message) {
   std::cerr << "error: " << message << std::endl;
+  return 1;
+}
+
+// A mistake in how the command was given: say so and show how it is meant.
+int usage_error(const std::string &message) {
+  failure(message);
+  usage();
   return 1;
 }
 
@@ -59,8 +59,11 @@ std::vector<fs::path> collect_source_files(const fs::path &source,
     files.push_back(fs::absolute(source));
   } else if (fs::is_directory(source)) {
     for (const auto &entry : fs::recursive_directory_iterator(source)) {
+      // The name is compared first: resolving a path costs a stat per
+      // component, and nearly no file is called what the index is.
       if (entry.is_regular_file() &&
-          fs::weakly_canonical(entry.path()) != skipped) {
+          !(entry.path().filename() == skipped.filename() &&
+            fs::weakly_canonical(entry.path()) == skipped)) {
         files.push_back(fs::absolute(entry.path()));
       }
     }

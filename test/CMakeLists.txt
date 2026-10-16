@@ -27,13 +27,12 @@ add_executable(
   test_cli_args.cc
 )
 
-# Ten translation units including one header: a definition that lost its
+# Every translation unit includes the one header: a definition that lost its
 # `inline` fails to link here, which is the check that keeps the single header
 # honest.
-target_link_libraries(test-main PRIVATE gtest_main searchlib-segment)
+target_link_libraries(test-main PRIVATE gtest_main searchlib-segment
+                                        searchlib-cli-args)
 searchlib_warnings(test-main)
-# The command-line parser lives with the CLI, as a header of its own.
-target_include_directories(test-main PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../cli/lib)
 
 include(GoogleTest)
 gtest_discover_tests(test-main)

@@ -10,7 +10,6 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
-#include <vector>
 
 #include <segmentlib/segmenter.h>
 
@@ -83,55 +82,41 @@ inline TextSplitter load_segmenting_splitter(const std::string &model_path) {
 
   Segmenter segmenter = [model](std::string_view text, size_t offset,
                                 const SplitEmit &emit) -> size_t {
-    // The run of Japanese scalars from `offset`, and the scalars after it up
-    // to the next extended grapheme cluster boundary. A run ends at a scalar
-    // that is not Japanese, and one that extends the cluster before it -- a
-    // ZWJ, a variation selector -- is not (it is Format or Inherited, not a
-    // letter or a mark), so a run can stop inside a cluster. The splitter drops
-    // a span that does not end on a boundary, words and all, which would lose
-    // 東京 from 東京<ZWJ>タワー. `offset` starts a word, so a boundary, and
-    // the scalars decoded from there are all the context the test needs.
-    std::u32string cps;
-    std::vector<size_t> ends; // ends[i]: the byte after cps[i]
-    auto decode_next = [&]() {
-      auto at = ends.empty() ? offset : ends.back();
+    // The run of Japanese scalars from `offset`.
+    auto run_end = offset;
+    char32_t last = 0; // the run's last scalar, for the boundary test below
+    while (run_end < text.size()) {
       char32_t cp;
-      auto len =
-          at < text.size()
-              ? unicode::utf8::decode_codepoint(&text[at], text.size() - at, cp)
-              : 0;
-      if (len == 0) {
-        return false;
-      }
-      cps.push_back(cp);
-      ends.push_back(at + len);
-      return true;
-    };
-    // The scalar that ends the run is decoded too, since only decoding it
-    // shows it is not Japanese; it is not part of the run.
-    while (decode_next() && detail::is_japanese(cps.back())) {
-    }
-    auto run_scalars = cps.size();
-    if (run_scalars > 0 && !detail::is_japanese(cps.back())) {
-      run_scalars--;
-    }
-    auto run_end = run_scalars == 0 ? offset : ends[run_scalars - 1];
-
-    // From the end of the run, on to a cluster boundary. Scalar `j` is the
-    // first after the run; the test needs the scalar after the one it
-    // examines to be decoded too, or the end of the buffer reads as a
-    // boundary it is not.
-    auto j = run_scalars;
-    for (;;) {
-      while (cps.size() <= j && decode_next()) {
-      }
-      if (j >= cps.size() ||
-          unicode::is_grapheme_boundary(cps.data(), cps.size(), j)) {
+      auto len = unicode::utf8::decode_codepoint(&text[run_end],
+                                                 text.size() - run_end, cp);
+      if (len == 0 || !detail::is_japanese(cp)) {
         break;
       }
-      j++;
+      run_end += len;
+      last = cp;
     }
-    auto end = j == 0 ? offset : ends[j - 1];
+
+    // On to the next extended grapheme cluster boundary. The run ends at a
+    // scalar that is not Japanese, and one that extends the cluster before it
+    // -- a ZWJ, a variation selector -- is not (it is Format or Inherited, not
+    // a letter or a mark), so a run can stop inside a cluster. The splitter
+    // drops a span that does not end on a boundary, words and all, which would
+    // lose 東京 from 東京<ZWJ>タワー. Whether a boundary lies between two
+    // scalars depends on those two alone here (a Japanese scalar is never an
+    // emoji or a regional indicator, the only things that look further back),
+    // so a pair is all the test needs.
+    auto end = run_end;
+    for (auto prev = last; run_end > offset && end < text.size();) {
+      char32_t cp;
+      auto len =
+          unicode::utf8::decode_codepoint(&text[end], text.size() - end, cp);
+      const char32_t pair[] = {prev, cp};
+      if (len == 0 || unicode::is_grapheme_boundary(pair, 2, 1)) {
+        break;
+      }
+      end += len;
+      prev = cp;
+    }
 
     auto run = text.substr(offset, run_end - offset);
     auto segments = model->tokenize(run);

@@ -40,8 +40,8 @@ inline Args parse_args(const std::vector<std::string_view> &argv) {
     size_t value = 0;
     auto [end, ec] =
         std::from_chars(text.data(), text.data() + text.size(), value);
-    if (text.empty() || ec != std::errc() ||
-        end != text.data() + text.size() || value == 0) {
+    if (text.empty() || ec != std::errc() || end != text.data() + text.size() ||
+        value == 0) {
       throw std::invalid_argument("-n takes a positive number, got: '" +
                                   std::string(text) + "'");
     }

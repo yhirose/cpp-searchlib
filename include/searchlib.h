@@ -203,16 +203,17 @@ inline size_t reserve_hint(uint64_t count) {
 
 // `n` bytes off the stream, grown a chunk at a time for the reason above.
 inline std::string read_exact(std::istream &is, uint64_t n) {
+  constexpr uint64_t kChunk = uint64_t(1) << 16;
   std::string bytes;
   bytes.reserve(reserve_hint(n));
-  std::array<char, 4096> chunk;
   while (n > 0) {
-    auto take = static_cast<size_t>(std::min<uint64_t>(n, chunk.size()));
-    is.read(chunk.data(), static_cast<std::streamsize>(take));
+    auto take = static_cast<size_t>(std::min(n, kChunk));
+    auto at = bytes.size();
+    bytes.resize(at + take);
+    is.read(&bytes[at], static_cast<std::streamsize>(take));
     if (!is) {
       throw std::runtime_error("searchlib: unexpected end of index stream");
     }
-    bytes.append(chunk.data(), take);
     n -= take;
   }
   return bytes;
@@ -248,6 +249,18 @@ removed_bitmap(const std::unordered_set<size_t> &removed,
     bits[ordinal] = true;
   }
   return bits;
+}
+
+// Whether `ordinal` is removed, for a posting entry read from a file: one that
+// names a document the index does not have is refused here, since the passes
+// that call this index their own arrays by it.
+inline bool is_removed_posting(const std::vector<bool> &removed,
+                               size_t ordinal) {
+  if (ordinal >= removed.size()) {
+    throw std::runtime_error(
+        "searchlib: postings name a document the index does not have");
+  }
+  return removed[ordinal];
 }
 
 // The removed-ordinal section both loaders share: a count, then that many
@@ -1495,8 +1508,7 @@ public:
   void load(std::istream &is, size_t expected_count,
             const Deserializer &deserialize_key = {}) {
     clear();
-    auto count = detail::read_scalar<uint64_t>(is);
-    if (count != expected_count) {
+    if (detail::read_scalar<uint64_t>(is) != expected_count) {
       throw std::runtime_error(
           "searchlib: the key section disagrees with the documents section");
     }
@@ -1678,11 +1690,6 @@ public:
     std::vector<size_t> offsets_{0}; // document_ordinals_.size() + 1 entries
     std::vector<size_t> positions_;  // every position, concatenated
   };
-
-  // How many documents the index has been handed, removed ones included: the
-  // ordinals run 0 to this, which is what a file's per-document sections
-  // (keys, text ranges) are counted against.
-  size_t ordinal_count() const { return documents_.size(); }
 
 private:
   // The indexers are the only writers: what they add is kept in step across
@@ -1929,7 +1936,7 @@ public:
     auto format = detail::read_index_header(is);
 
     base_.load(is, format);
-    keys_.load(is, base_.ordinal_count(), deserialize_key);
+    keys_.load(is, base_.documents_.size(), deserialize_key);
 
     text_range_list_.clear();
     if (format == IndexFormat::Compressed) {
@@ -2504,8 +2511,19 @@ public:
     auto word_count = bit_count / 64 + (bit_count % 64 != 0);
     words_.clear();
     words_.reserve(reserve_hint(word_count));
-    for (uint64_t i = 0; i < word_count; i++) {
-      words_.push_back(read_scalar<uint64_t>(is));
+    // A block at a time rather than a word: this is most of what an index
+    // file holds. Same host-endian layout write_scalar produces.
+    constexpr uint64_t kBlockWords = 4096;
+    for (uint64_t done = 0; done < word_count;) {
+      auto take = static_cast<size_t>(std::min(word_count - done, kBlockWords));
+      auto at = words_.size();
+      words_.resize(at + take);
+      is.read(reinterpret_cast<char *>(&words_[at]),
+              static_cast<std::streamsize>(take * sizeof(uint64_t)));
+      if (!is) {
+        throw std::runtime_error("searchlib: unexpected end of index stream");
+      }
+      done += take;
     }
     bit_count_ = static_cast<size_t>(bit_count);
     build();
@@ -3145,6 +3163,7 @@ public:
     // What the FST holds is gathered first, so that nothing is sized from
     // term_count -- a count out of the file -- until the FST agrees with it.
     std::vector<std::pair<uint32_t, std::u32string>> found;
+    found.reserve(reserve_hint(term_count));
     map_->enumerate([&](const std::string &key, const uint32_t &ordinal) {
       found.emplace_back(ordinal, u32(key));
     });
@@ -3464,11 +3483,7 @@ inline size_t live_document_frequency(const IPostings &p,
   for (size_t i = 0; i < n;) {
     auto read = p.read_ordinals(i, block.data(), block.size());
     for (size_t j = 0; j < read; j++) {
-      if (block[j] >= removed.size()) {
-        throw std::runtime_error(
-            "searchlib: postings name a document the index does not have");
-      }
-      dead += removed[block[j]];
+      dead += is_removed_posting(removed, block[j]);
     }
     i += read;
   }
@@ -5768,8 +5783,9 @@ inline void InMemoryInvertedIndexBase::Postings::load(std::istream &is) {
   document_ordinals_.clear();
   offsets_.assign(1, 0);
   positions_.clear();
-  document_ordinals_.reserve(detail::reserve_hint(entry_count));
-  offsets_.reserve(detail::reserve_hint(entry_count) + 1);
+  auto hint = detail::reserve_hint(entry_count);
+  document_ordinals_.reserve(hint);
+  offsets_.reserve(hint + 1);
   for (uint64_t i = 0; i < entry_count; i++) {
     document_ordinals_.push_back(
         static_cast<size_t>(detail::read_scalar<uint64_t>(is)));
@@ -5803,8 +5819,9 @@ inline void InMemoryInvertedIndexBase::Postings::load_varint(std::istream &is) {
   document_ordinals_.clear();
   offsets_.assign(1, 0);
   positions_.clear();
-  document_ordinals_.reserve(detail::reserve_hint(entry_count));
-  offsets_.reserve(detail::reserve_hint(entry_count) + 1);
+  auto hint = detail::reserve_hint(entry_count);
+  document_ordinals_.reserve(hint);
+  offsets_.reserve(hint + 1);
   size_t previous_ordinal = 0;
   for (uint64_t i = 0; i < entry_count; i++) {
     previous_ordinal += static_cast<size_t>(detail::read_varint(is));
@@ -6348,11 +6365,7 @@ inline void InMemoryInvertedIndexBase::rebuild_document_terms_() {
   auto for_each_live_entry = [&](const Term &term, auto fn) {
     for (size_t i = 0; i < term.postings.size(); i++) {
       auto ordinal = term.postings.document_ordinal(i);
-      if (ordinal >= removed.size()) {
-        throw std::runtime_error(
-            "searchlib: postings name a document the index does not have");
-      }
-      if (!removed[ordinal]) {
+      if (!detail::is_removed_posting(removed, ordinal)) {
         fn(ordinal);
       }
     }
