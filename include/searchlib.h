@@ -431,7 +431,10 @@ public:
   // The number of live documents carrying the term: a tombstoned document
   // still sits in the term's postings until the index is rebuilt, but it is
   // not counted here, so df never exceeds document_count() -- which BM25's
-  // idf relies on to stay a real number.
+  // idf relies on to stay a real number. Discounting them is not free once
+  // an index has any: the built-in backends pay the smaller of a binary
+  // search per tombstone and a pass over the postings, which is why
+  // BM25Scorer asks once per term per query rather than once per hit.
   virtual size_t df(const std::u32string &str) const = 0;
   virtual double tf(const std::u32string &str, size_t ordinal) const = 0;
 
@@ -815,6 +818,10 @@ Expression expand_wildcards(const IInvertedIndex &invidx,
 // edit distance is not boosted.
 Expression expand_fuzzy(const IInvertedIndex &invidx, const Expression &expr);
 
+// Scorers for one hit at a time. Each looks every term up again per call --
+// its postings, and for tf_idf_score and bm25_score its df, which an index
+// with tombstones has to discount (see IInvertedIndex::df) -- so ranking a
+// whole result is better done with BM25Scorer, which pays that once.
 size_t term_count_score(const IInvertedIndex &invidx, const Expression &expr,
                         const IPostings &postings, size_t index);
 
@@ -1005,8 +1012,9 @@ std::vector<ScoredHit> top_k(size_t count, size_t k, ScoreFn score_fn) {
 
 // Convenience overload for the common case of ranking a single IPostings
 // result set, e.g.:
+//   BM25Scorer scorer(invidx, *expr);
 //   auto hits = top_k(*result, 10, [&](size_t i) {
-//     return bm25_score(invidx, *expr, *result, i);
+//     return scorer(*result, i);
 //   });
 template <typename ScoreFn>
 std::vector<ScoredHit> top_k(const IPostings &postings, size_t k,
@@ -1996,11 +2004,13 @@ public:
     // that throws -- including the position check below -- leaves the
     // index as it found it: the old document still live under its key, and
     // no half-indexed one beside it. Its terms are resolved to dictionary
-    // entries as they arrive (a reference into an unordered_map survives a
-    // rehash), and the entries this call had to create are erased again if
-    // it fails, so a failed call leaves no empty term behind either.
+    // entries as they arrive rather than buffered as strings, which would
+    // cost a copy per token (a reference into an unordered_map survives a
+    // rehash); the entries this call had to create are erased again if it
+    // fails, so a failed call leaves no empty term behind either.
     occurrences_.clear();
-    created_terms_.clear();
+    // Moved into the index at the end, so unlike occurrences_ there is no
+    // capacity to carry over to the next call.
     std::vector<T> text_ranges;
 
     // Positions must arrive in order, each either the next one or the one
@@ -2019,7 +2029,10 @@ public:
           if (text_ranges_ == TextRangeStorage::Store) {
             if constexpr (std::is_same_v<T, TextRange>) {
               // The compressed format codes a document's ranges as one
-              // ascending sequence, so they have to arrive that way.
+              // ascending sequence, so they have to arrive that way --
+              // checked here, whatever format the index is saved in later,
+              // so the mistake surfaces at the tokenizer that made it
+              // rather than at some later save.
               if (!text_ranges.empty() &&
                   text_range.position < text_ranges.back().position) {
                 throw std::runtime_error(
@@ -2039,17 +2052,21 @@ public:
         }
 
         auto it = dictionary.find(str);
-        if (it == dictionary.end()) {
+        auto created = it == dictionary.end();
+        if (created) {
           it = dictionary
                    .emplace(str, InMemoryInvertedIndexBase::Term{str, 0, {}})
                    .first;
-          created_terms_.push_back(str);
         }
-        occurrences_.emplace_back(&it->second, term_pos);
+        occurrences_.push_back(Occurrence{&it->second, term_pos, created});
       });
     } catch (...) {
-      for (const auto &str : created_terms_) {
-        dictionary.erase(str);
+      // Only a term's first occurrence is flagged, so no entry is erased
+      // twice or read after it is gone.
+      for (const auto &occurrence : occurrences_) {
+        if (occurrence.created) {
+          dictionary.erase(dictionary.find(occurrence.term->str));
+        }
       }
       throw;
     }
@@ -2064,10 +2081,11 @@ public:
     auto ordinal = index_.base_.push_document();
     index_.keys_.push(document_key, ordinal);
 
-    for (auto [term, term_pos] : occurrences_) {
+    for (const auto &occurrence : occurrences_) {
       // A term stacked on itself (a filter that answered the same string
       // twice) is one occurrence, not two.
-      if (term->postings.add_term_position(ordinal, term_pos)) {
+      auto *term = occurrence.term;
+      if (term->postings.add_term_position(ordinal, occurrence.term_pos)) {
         term->term_count++;
       }
     }
@@ -2084,10 +2102,16 @@ private:
   InMemoryInvertedIndex<T, Key> &index_;
   Normalizer normalizer_;
   TextRangeStorage text_ranges_;
+  // One term at one position, as index_document buffers them. `created`
+  // marks the occurrence that added the term to the dictionary, which is
+  // what a failed call has to take back out.
+  struct Occurrence {
+    InMemoryInvertedIndexBase::Term *term;
+    size_t term_pos;
+    bool created;
+  };
   // index_document's scratch, kept to reuse its capacity across documents.
-  std::vector<std::pair<InMemoryInvertedIndexBase::Term *, size_t>>
-      occurrences_;
-  std::vector<std::u32string> created_terms_;
+  std::vector<Occurrence> occurrences_;
 };
 
 // A minimal thread-safe wrapper around an InMemoryInvertedIndex<T> for the
@@ -5160,7 +5184,11 @@ inline bool collect_proximity_hits(
     }
   }
 
-  std::sort(hits.begin(), hits.end());
+  // Usually in order already: groups only interleave when operands' hits
+  // cluster unevenly.
+  if (!std::is_sorted(hits.begin(), hits.end())) {
+    std::sort(hits.begin(), hits.end());
+  }
   hits.erase(std::unique(hits.begin(), hits.end()), hits.end());
   for (const auto &[position, length] : hits) {
     term_positions.push_back(position);
