@@ -105,15 +105,22 @@ namespace detail {
 // independently. Both schema versions restarted from 0 when documents
 // became ordinal-addressed (see the note on IPostings::document_ordinal):
 // nothing had shipped on the earlier numbering, so there is no file to
-// migrate. Compressed is at 1 since its expanded sections -- document term
+// migrate. Compressed went to 1 when its expanded sections -- document term
 // counts, per-term frequencies, and the postings too short for Elias-Fano --
 // became varint instead of fixed-width fields, and the per-term
 // representation flag narrowed from a uint32 to one byte with them.
+//
+// Plain is at 1 and Compressed at 2 since the scope section keeps all of a
+// scope name's documents in one stream with nothing but a few fields each
+// (PackedScopeIds::save), where it had an EliasFano object a document, header
+// and select index included. Both still read the version before, whose
+// scope section is converted as it loads; it is the only section that
+// changed.
 inline constexpr char kIndexMagic[4] = {'S', 'I', 'D', 'X'};
 inline constexpr uint32_t kFormatTypePlain = 0;
 inline constexpr uint32_t kFormatTypeCompressed = 1;
-inline constexpr uint32_t kSchemaVersionPlain = 0;
-inline constexpr uint32_t kSchemaVersionCompressed = 1;
+inline constexpr uint32_t kSchemaVersionPlain = 1;
+inline constexpr uint32_t kSchemaVersionCompressed = 2;
 
 // Opaque storage for InMemoryInvertedIndexBase's scope data (each scope
 // name's ids, packed: see PackedScopeIds). Defined further down, with the
@@ -1396,31 +1403,40 @@ enum class IndexFormat : uint32_t {
 
 namespace detail {
 
+// What a file's header says: which format follows, and whether its scope
+// section is the one this version writes or the schema before's (see
+// kSchemaVersionPlain).
+struct IndexHeader {
+  IndexFormat format = IndexFormat::Plain;
+  bool packed_scopes = true;
+};
+
 // The file header both readers open with: the magic, then the format_type and
-// schema_version, which must be a pair this version wrote. Says which format
-// follows.
-inline IndexFormat read_index_header(std::istream &is) {
+// schema_version, which must be a pair this version wrote or the one before.
+inline IndexHeader read_index_header(std::istream &is) {
   char magic[sizeof(kIndexMagic)];
   is.read(magic, sizeof(magic));
   if (!is || std::memcmp(magic, kIndexMagic, sizeof(magic)) != 0) {
     throw std::runtime_error("searchlib: not a valid index file (bad magic)");
   }
   auto format_type = read_scalar<uint32_t>(is);
-  IndexFormat format;
-  uint32_t expected_schema_version;
+  IndexHeader header;
+  uint32_t current;
   if (format_type == kFormatTypePlain) {
-    format = IndexFormat::Plain;
-    expected_schema_version = kSchemaVersionPlain;
+    header.format = IndexFormat::Plain;
+    current = kSchemaVersionPlain;
   } else if (format_type == kFormatTypeCompressed) {
-    format = IndexFormat::Compressed;
-    expected_schema_version = kSchemaVersionCompressed;
+    header.format = IndexFormat::Compressed;
+    current = kSchemaVersionCompressed;
   } else {
     throw std::runtime_error("searchlib: unsupported index format_type");
   }
-  if (read_scalar<uint32_t>(is) != expected_schema_version) {
+  auto version = read_scalar<uint32_t>(is);
+  if (version != current && version != current - 1) {
     throw std::runtime_error("searchlib: unsupported index schema_version");
   }
-  return format;
+  header.packed_scopes = version == current;
+  return header;
 }
 
 // Structural Elias-Fano compression of the text-range section, available
@@ -1449,11 +1465,20 @@ void load_text_ranges_compressed(std::istream &is,
 // external locking. Key must be the type the index was saved with, and one
 // KeyTable reads without help: an integral type or std::string. There is no
 // key-deserializer parameter here, so any other Key throws on load.
+//
+// The index keeps the scope ids it was saved with, and is its own
+// IScopeIndex for SameScope, as an InMemoryInvertedIndex is:
+//
+//   auto index = load_compressed_index("index.bin");
+//   auto result = perform_search(*index, expr, index.get());
 template <typename Key = size_t>
-std::shared_ptr<IInvertedIndexWithTextRange<TextRange, Key>>
-load_compressed_index(std::istream &is);
+class ICompressedIndex : public IInvertedIndexWithTextRange<TextRange, Key>,
+                         public IScopeIndex {};
+
 template <typename Key = size_t>
-std::shared_ptr<IInvertedIndexWithTextRange<TextRange, Key>>
+std::shared_ptr<ICompressedIndex<Key>> load_compressed_index(std::istream &is);
+template <typename Key = size_t>
+std::shared_ptr<ICompressedIndex<Key>>
 load_compressed_index(const std::string &path);
 
 // The ordinal <-> key table an index keeps beside its ordinal-only core.
@@ -1758,6 +1783,9 @@ private:
   // Rebuilds what df() rests on from the loaded postings.
   void rebuild_document_terms_();
 
+  // load, for a file of either schema the header names (see IndexHeader).
+  void load_(std::istream &is, const detail::IndexHeader &header);
+
   detail::ScopeIndexData &own_scope_data_();
 
   std::vector<Document> documents_; // indexed by ordinal
@@ -1971,10 +1999,11 @@ public:
   void load(std::istream &is,
             const TextRangeDeserializer &deserialize_value = {},
             const KeyDeserializer &deserialize_key = {}) {
-    auto format = detail::read_index_header(is);
+    auto header = detail::read_index_header(is);
+    auto format = header.format;
 
     InMemoryInvertedIndexBase base;
-    base.load(is, format);
+    base.load_(is, header);
     KeyTable<Key> keys;
     keys.load(is, base.documents_.size(), deserialize_key);
 
@@ -2509,6 +2538,58 @@ inline void or_bits(uint64_t *words, uint64_t bit, unsigned width,
     words[at + 1] |= value >> (64 - shift);
   }
 }
+
+// ORs `count` bits from `from` in `src` into `dst` at `to`, a word at a time.
+inline void or_bit_range(uint64_t *dst, uint64_t to, const uint64_t *src,
+                         uint64_t from, uint64_t count) {
+  for (uint64_t done = 0; done < count; done += 64) {
+    auto width = static_cast<unsigned>(std::min<uint64_t>(64, count - done));
+    or_bits(dst, to + done, width, read_bits(src, from + done, width));
+  }
+}
+
+// Fields written one after another from the start of `words`, a word at a
+// time: what or_bits does field by field without reading the buffer back.
+// The words must be there, and flush() writes the last one.
+class BitWriter {
+public:
+  explicit BitWriter(uint64_t *words) : next_(words) {}
+
+  // `value` must fit in `width` bits, at most 64.
+  void put(uint64_t value, unsigned width) {
+    if (width == 0) {
+      return;
+    }
+    pending_ |= value << used_;
+    if (used_ + width < 64) {
+      used_ += width;
+      return;
+    }
+    *next_++ = pending_;
+    pending_ = used_ == 0 ? 0 : value >> (64 - used_);
+    used_ = used_ + width - 64;
+  }
+
+  // `count` clear bits.
+  void skip(uint64_t count) {
+    for (count += used_; count >= 64; count -= 64) {
+      *next_++ = pending_;
+      pending_ = 0;
+    }
+    used_ = static_cast<unsigned>(count);
+  }
+
+  void flush() {
+    if (used_ != 0) {
+      *next_ = pending_;
+    }
+  }
+
+private:
+  uint64_t *next_;
+  uint64_t pending_ = 0; // the word being filled
+  unsigned used_ = 0;    // its bits filled
+};
 
 // A plain bit vector with O(1) rank and O(log(n/512)) select. Constructed by
 // set()-ing bits, then build() finalizes the rank index; the vector is
@@ -3499,12 +3580,12 @@ void for_each_word(std::string_view text, const Delegation *delegation,
 // docs/postings_compression_design.ja.md section 6.2.
 inline constexpr size_t kCompressedPostingsThreshold = 16;
 
-// The scope section (see InMemoryInvertedIndexBase::save): a count of scope
-// names, each with the documents that have scope data under it. Calls
-// keep(name, ordinal, sequence) for each; a reader that has no use for the
-// data passes a callback that drops it, which keeps the sections after it
-// aligned.
-template <typename Keep> void read_scope_section(std::istream &is, Keep keep) {
+// The scope section as the schema before the packed one wrote it: a count of
+// scope names, each with the documents that have scope data under it, and
+// each of those with its ordinal and its ids as an Elias-Fano sequence.
+// Calls keep(name, ordinal, sequence) for each.
+template <typename Keep>
+void read_legacy_scope_section(std::istream &is, Keep keep) {
   auto scope_name_count = read_scalar<uint64_t>(is);
   for (uint64_t i = 0; i < scope_name_count; i++) {
     auto name = read_bytes(is);
@@ -3529,6 +3610,10 @@ template <typename Keep> void read_scope_section(std::istream &is, Keep keep) {
 // The entries are dense, one for every ordinal up to the largest
 // registered, so a name only a few documents carry still costs 24 bytes for
 // each document before the last of them.
+//
+// A file holds the ids more tightly than that (see save): a long document's
+// fixed width is set by its last id, which is what makes it fast to read,
+// and a file has no need to be read that way.
 class PackedScopeIds {
 public:
   bool contains(size_t ordinal) const {
@@ -3552,11 +3637,7 @@ public:
       throw std::invalid_argument("searchlib: too many scope ids");
     }
     uint64_t base = count == 0 ? 0 : ids[0];
-    uint64_t span = count == 0 ? 0 : ids[count - 1] - base;
-    uint8_t width = 0;
-    for (; span != 0; span >>= 1) {
-      width++;
-    }
+    auto width = bit_width_(count == 0 ? 0 : ids[count - 1] - base);
     auto bits = uint64_t(count) * width;
 
     // Everything that can fail to allocate first, so that a failure leaves
@@ -3573,7 +3654,8 @@ public:
     if (entry.width != kAbsent) {
       live_bits_ -= uint64_t(entry.count) * entry.width;
     }
-    entry = Entry{end_bits_, base, static_cast<uint32_t>(count), width};
+    entry = Entry{end_bits_, base, static_cast<uint32_t>(count),
+                  static_cast<uint8_t>(width)};
     end_bits_ += bits;
     live_bits_ += bits;
     if (end_bits_ - live_bits_ > live_bits_) {
@@ -3581,8 +3663,7 @@ public:
     }
   }
 
-  // How many documents are registered, and each one's ids in ordinal order:
-  // fn(ordinal, ids) with the ids in a vector reused between calls.
+  // How many documents are registered.
   size_t documents() const {
     return static_cast<size_t>(
         std::count_if(entries_.begin(), entries_.end(), [](const Entry &entry) {
@@ -3590,19 +3671,239 @@ public:
         }));
   }
 
-  template <typename Fn> void for_each(Fn fn) const {
-    std::vector<uint64_t> ids;
+  // The documents, then their bits. Each document's ids are written as its
+  // differences from its first, the way Elias-Fano keeps a sequence: the
+  // low `low_width` bits of each, then the rest in unary, a set bit for
+  // each id after as many clear ones as its high part has grown by. That is
+  // a little over a bit a position for ids that grow a step at a time,
+  // however long the document -- 7 bits a position held at a fixed width
+  // in a chapter of KJV with a scope every 8, 1.1 here -- and nothing for a
+  // document in one scope; and none of an EliasFano object's header or
+  // select index, which a short document cannot carry.
+  //
+  // Each document is its ordinal, as the gap from the one before it (the
+  // first: from 0), its first id, its low width and how many clear bits its
+  // unary part has; how many ids it has is its term count, which the file
+  // holds already. Its bits follow the one before's. Fields are varints in
+  // the Compressed format and u64 in the Plain one, like the rest of each,
+  // and the low width is a byte in both.
+  void save(std::ostream &os, bool compressed) const {
+    auto put = [&](uint64_t value) {
+      if (compressed) {
+        write_varint(os, value);
+      } else {
+        write_scalar<uint64_t>(os, value);
+      }
+    };
+    put(documents());
+    uint64_t bits = 0;
+    size_t next = 0;
     for (size_t ordinal = 0; ordinal < entries_.size(); ordinal++) {
       const auto &entry = entries_[ordinal];
       if (entry.width == kAbsent) {
         continue;
       }
-      ids.resize(entry.count);
-      for (size_t i = 0; i < entry.count; i++) {
-        ids[i] = id_(entry, i);
-      }
-      fn(ordinal, ids);
+      auto form = file_form_(entry);
+      put(ordinal - next);
+      put(entry.base);
+      write_scalar<uint8_t>(os, form.low_width);
+      put(form.high_zeros);
+      bits += file_bits_(entry, form);
+      next = ordinal + 1;
     }
+
+    std::vector<uint64_t> words(static_cast<size_t>((bits + 63) / 64), 0);
+    BitWriter writer(words.data());
+    for (const auto &entry : entries_) {
+      if (entry.width == kAbsent) {
+        continue;
+      }
+      auto form = file_form_(entry);
+      if (file_bits_(entry, form) == 0) {
+        continue;
+      }
+      auto low_mask =
+          form.low_width == 0 ? 0 : ~uint64_t(0) >> (64 - form.low_width);
+      for (size_t i = 0; i < entry.count; i++) {
+        writer.put((id_(entry, i) - entry.base) & low_mask, form.low_width);
+      }
+      uint64_t high = 0;
+      for (size_t i = 0; i < entry.count; i++) {
+        auto next_high = (id_(entry, i) - entry.base) >> form.low_width;
+        writer.skip(next_high - high);
+        writer.put(1, 1);
+        high = next_high;
+      }
+    }
+    writer.flush();
+    put(words.size());
+    os.write(reinterpret_cast<const char *>(words.data()),
+             static_cast<std::streamsize>(words.size() * sizeof(uint64_t)));
+  }
+
+  // Reads what save wrote, in place of any ids held, for a file of
+  // `document_count` documents whose term counts term_count(ordinal) gives.
+  // Refuses what set_scope_ids would -- a document the file does not have,
+  // or ids that go down, which would not fit the width the last one gives
+  // the document -- and fields and bits that do not add up.
+  template <typename TermCount>
+  void load(std::istream &is, bool compressed, size_t document_count,
+            TermCount term_count) {
+    auto get = [&] {
+      return compressed ? read_varint(is) : read_scalar<uint64_t>(is);
+    };
+    auto corrupt = [] {
+      throw std::runtime_error("searchlib: corrupt scope section");
+    };
+
+    // Each document's entry, in place as its ordinal comes, and its file
+    // form beside it in the order the file has them.
+    std::vector<Entry> entries;
+    std::vector<FileForm> forms;
+    auto total = get();
+    if (total > document_count) {
+      corrupt();
+    }
+    forms.reserve(static_cast<size_t>(total));
+    uint64_t file_bits = 0;
+    uint64_t next = 0;
+    for (uint64_t i = 0; i < total; i++) {
+      auto gap = get();
+      if (gap >= document_count - next) {
+        corrupt();
+      }
+      auto ordinal = static_cast<size_t>(next + gap);
+      Entry entry;
+      entry.base = get();
+      auto low_width = read_scalar<uint8_t>(is);
+      auto high_zeros = get();
+      uint64_t count = term_count(ordinal);
+      // A document without ids has no bits either, as save writes it.
+      if (low_width > 63 || high_zeros > std::numeric_limits<uint32_t>::max() ||
+          count > std::numeric_limits<uint32_t>::max() ||
+          (count == 0 && (low_width != 0 || high_zeros != 0))) {
+        corrupt();
+      }
+      entry.count = static_cast<uint32_t>(count);
+      entry.width = 0; // registered; the width comes once the bits are in
+      FileForm form{static_cast<uint32_t>(high_zeros), low_width};
+      auto bits = file_bits_(entry, form);
+      if (bits > std::numeric_limits<uint64_t>::max() - file_bits) {
+        corrupt();
+      }
+      file_bits += bits;
+      entries.resize(ordinal + 1);
+      entries[ordinal] = entry;
+      forms.push_back(form);
+      next = ordinal + 1;
+    }
+    auto word_count = get();
+    if (word_count != file_bits / 64 + (file_bits % 64 != 0)) {
+      corrupt();
+    }
+    // A chunk at a time, for the reason read_exact gives.
+    std::vector<uint64_t> file;
+    file.reserve(reserve_hint(word_count));
+    while (file.size() < word_count) {
+      auto at = file.size();
+      file.resize(at + static_cast<size_t>(std::min<uint64_t>(
+                           word_count - at, kMaxPreallocation)));
+      is.read(
+          reinterpret_cast<char *>(file.data() + at),
+          static_cast<std::streamsize>((file.size() - at) * sizeof(uint64_t)));
+      if (!is) {
+        throw std::runtime_error("searchlib: unexpected end of index stream");
+      }
+    }
+
+    // Each document's largest id is its last, whose high part is how many
+    // clear bits its unary part has: that and its low bits give the width.
+    uint64_t bits = 0;
+    uint64_t at = 0;
+    auto form = forms.begin();
+    for (auto &entry : entries) {
+      if (entry.width == kAbsent) {
+        continue;
+      }
+      uint64_t span = 0;
+      if (auto document_bits = file_bits_(entry, *form); document_bits != 0) {
+        uint64_t high_zeros = form->high_zeros;
+        unsigned low_width = form->low_width;
+        if ((high_zeros << low_width) >> low_width != high_zeros) {
+          corrupt();
+        }
+        span = (high_zeros << low_width) |
+               read_bits(file.data(),
+                         at + uint64_t(entry.count - 1) * low_width, low_width);
+        if (span > std::numeric_limits<uint64_t>::max() - entry.base) {
+          corrupt();
+        }
+        at += document_bits;
+      }
+      entry.width = static_cast<uint8_t>(bit_width_(span));
+      entry.offset = bits;
+      bits += uint64_t(entry.count) * entry.width;
+      ++form;
+    }
+
+    std::vector<uint64_t> words(static_cast<size_t>((bits + 63) / 64), 0);
+    BitWriter writer(words.data());
+    at = 0;
+    form = forms.begin();
+    for (const auto &entry : entries) {
+      if (entry.width == kAbsent) {
+        continue;
+      }
+      auto document_bits = file_bits_(entry, *form);
+      unsigned low_width = form->low_width;
+      ++form;
+      if (document_bits == 0) {
+        continue;
+      }
+      // Each set bit of the unary part, in order, is the next id's high
+      // part. Without low bits the ids can neither go down nor pass the
+      // last, the one the width was taken from: each set bit follows the
+      // one before, and the last is at the end. With them, either can
+      // happen in a corrupt file, and both are checked.
+      auto low = at;
+      auto high = at + uint64_t(entry.count) * low_width;
+      auto end = at + document_bits;
+      uint64_t i = 0;
+      uint64_t value = 0;
+      for (auto chunk_at = high; chunk_at < end; chunk_at += 64) {
+        auto width =
+            static_cast<unsigned>(std::min<uint64_t>(64, end - chunk_at));
+        for (auto chunk = read_bits(file.data(), chunk_at, width); chunk != 0;
+             chunk &= chunk - 1) {
+          if (i == entry.count) {
+            corrupt();
+          }
+          auto next_value = (chunk_at - high + ctz64(chunk) - i) << low_width;
+          if (low_width != 0) {
+            next_value |=
+                read_bits(file.data(), low + i * low_width, low_width);
+            if (next_value < value ||
+                (entry.width < 64 && next_value >> entry.width != 0)) {
+              corrupt();
+            }
+          }
+          value = next_value;
+          writer.put(value, entry.width);
+          i++;
+        }
+      }
+      if (i != entry.count) {
+        corrupt();
+      }
+      at = end;
+    }
+    writer.flush();
+
+    // Grown an ordinal at a time.
+    entries.shrink_to_fit();
+    entries_ = std::move(entries);
+    words_ = std::move(words);
+    end_bits_ = live_bits_ = bits;
   }
 
   // Gives back the room that growing one document at a time leaves, once no
@@ -3622,6 +3923,57 @@ private:
     uint8_t width = kAbsent; // bits a position; kAbsent if not registered
   };
 
+  // A document's fields in the file (see save) besides its ordinal and its
+  // first id.
+  struct FileForm {
+    uint32_t high_zeros = 0;
+    uint8_t low_width = 0;
+  };
+
+  FileForm file_form_(const Entry &entry) const {
+    FileForm form;
+    uint64_t span =
+        entry.count == 0 ? 0 : id_(entry, entry.count - 1) - entry.base;
+    if (span != 0) {
+      form.low_width = static_cast<uint8_t>(low_width_for_(entry.count, span));
+      form.high_zeros = static_cast<uint32_t>(span >> form.low_width);
+    }
+    return form;
+  }
+
+  // How many bits the file gives the document: its low bits and its unary
+  // part, or none when every id is the first.
+  static uint64_t file_bits_(const Entry &entry, const FileForm &form) {
+    if (form.low_width == 0 && form.high_zeros == 0) {
+      return 0;
+    }
+    return uint64_t(entry.count) * (form.low_width + 1u) + form.high_zeros;
+  }
+
+  static unsigned bit_width_(uint64_t value) {
+    unsigned width = 0;
+    for (; value != 0; value >>= 1) {
+      width++;
+    }
+    return width;
+  }
+
+  // The low width that takes the fewest bits for `count` ids spanning
+  // `span` in the file's form: as Elias-Fano picks it, near
+  // log2(span / count), but at least what keeps the clear bits countable
+  // in 32.
+  static unsigned low_width_for_(uint64_t count, uint64_t span) {
+    unsigned width = 0;
+    while ((span >> width) > std::numeric_limits<uint32_t>::max()) {
+      width++;
+    }
+    auto cost = [&](unsigned w) { return count * w + (span >> w); };
+    while (width < 63 && cost(width + 1) < cost(width)) {
+      width++;
+    }
+    return width;
+  }
+
   size_t id_(const Entry &entry, size_t position) const {
     return static_cast<size_t>(
         entry.base + read_bits(words_.data(),
@@ -3637,13 +3989,10 @@ private:
       if (entry.width == kAbsent) {
         continue;
       }
-      for (size_t i = 0; i < entry.count; i++) {
-        or_bits(words.data(), end + i * entry.width, entry.width,
-                read_bits(words_.data(), entry.offset + i * entry.width,
-                          entry.width));
-      }
+      auto bits = uint64_t(entry.count) * entry.width;
+      or_bit_range(words.data(), end, words_.data(), entry.offset, bits);
       entry.offset = end;
-      end += uint64_t(entry.count) * entry.width;
+      end += bits;
     }
     words_ = std::move(words);
     end_bits_ = live_bits_ = end;
@@ -3670,6 +4019,94 @@ inline const PackedScopeIds *find_scope_ids(const ScopeIndexData *data,
   }
   auto it = data->by_name.find(scope_name);
   return it == data->by_name.end() ? nullptr : &it->second;
+}
+
+// IScopeIndex over the scope data, for the two indexes that hold some. The
+// scope name is looked up once for all of scope_ids_in's positions.
+inline bool has_scope_in(const ScopeIndexData *data,
+                         const std::string &scope_name, size_t ordinal) {
+  const auto *ids = find_scope_ids(data, scope_name);
+  return ids && ids->contains(ordinal);
+}
+
+inline size_t scope_id_in(const ScopeIndexData *data,
+                          const std::string &scope_name, size_t ordinal,
+                          size_t term_pos) {
+  const auto *ids = find_scope_ids(data, scope_name);
+  return ids ? ids->at(ordinal, term_pos) : static_cast<size_t>(-1);
+}
+
+inline void scope_ids_in(const ScopeIndexData *data,
+                         const std::string &scope_name, size_t ordinal,
+                         const size_t *positions, size_t count, size_t *out) {
+  const auto *ids = find_scope_ids(data, scope_name);
+  for (size_t i = 0; i < count; i++) {
+    out[i] = ids ? ids->at(ordinal, positions[i]) : static_cast<size_t>(-1);
+  }
+}
+
+// The scope section (see InMemoryInvertedIndexBase::save): how many scope
+// names, then each one, in order, with its ids as PackedScopeIds::save
+// writes them.
+inline void save_scope_section(std::ostream &os, const ScopeIndexData *data,
+                               bool compressed) {
+  std::vector<const std::string *> names;
+  if (data) {
+    for (const auto &entry : data->by_name) {
+      names.push_back(&entry.first);
+    }
+  }
+  std::sort(names.begin(), names.end(),
+            [](const std::string *a, const std::string *b) { return *a < *b; });
+  write_scalar<uint64_t>(os, names.size());
+  for (const auto *name : names) {
+    write_bytes(os, *name);
+    data->by_name.at(*name).save(os, compressed);
+  }
+}
+
+// Reads the scope section of either schema (see IndexHeader), for a file of
+// `document_count` documents whose term counts term_count(ordinal) gives;
+// null if it names no scope. The schema before gives each document's ids as
+// an Elias-Fano sequence, packed here as they come once they pass what
+// set_scope_ids would check: a document the file has, ids that cover it
+// position for position, and ids that do not go down -- which an Elias-Fano
+// sequence can hold within one of its buckets, and which assign, re-encoding
+// them, would spill into the next document's.
+template <typename TermCount>
+std::shared_ptr<ScopeIndexData>
+load_scope_section(std::istream &is, const IndexHeader &header,
+                   size_t document_count, TermCount term_count) {
+  auto data = std::make_shared<ScopeIndexData>();
+  if (header.packed_scopes) {
+    auto name_count = read_scalar<uint64_t>(is);
+    for (uint64_t i = 0; i < name_count; i++) {
+      auto name = read_bytes(is);
+      data->by_name[name].load(is, header.format == IndexFormat::Compressed,
+                               document_count, term_count);
+    }
+  } else {
+    std::vector<size_t> ids;
+    read_legacy_scope_section(
+        is, [&](const std::string &name, size_t ordinal, EliasFano &&ef) {
+          if (ordinal >= document_count || ef.size() != term_count(ordinal)) {
+            throw std::runtime_error("searchlib: corrupt scope section");
+          }
+          ids.resize(ef.size());
+          ef.read(0, ids.data(), ids.size());
+          if (!std::is_sorted(ids.begin(), ids.end())) {
+            throw std::runtime_error("searchlib: corrupt scope section");
+          }
+          data->by_name[name].assign(ordinal, ids.data(), ids.size());
+        });
+    for (auto &entry : data->by_name) {
+      entry.second.shrink();
+    }
+  }
+  if (data->by_name.empty()) {
+    return nullptr;
+  }
+  return data;
 }
 
 // Assumes document_ordinal(index) is monotonically increasing in index,
@@ -3946,14 +4383,16 @@ private:
 // statistics are small and kept expanded (bm25 needs them anyway); the
 // memory heavyweights -- postings and text ranges -- stay Elias-Fano
 // coded. Terms below the compression threshold were written as varints and
-// are expanded into ordinary Postings. Immutable after load, hence trivially safe to
-// share across reader threads.
+// are expanded into ordinary Postings. The scope ids are held as the
+// in-memory index holds them (PackedScopeIds), so that SameScope runs as
+// fast here. Immutable after load, hence trivially safe to share across
+// reader threads.
 template <typename Key>
-class CompressedInvertedIndex
-    : public IInvertedIndexWithTextRange<TextRange, Key> {
+class CompressedInvertedIndex : public ICompressedIndex<Key> {
 public:
   void load(std::istream &is) {
-    if (read_index_header(is) != IndexFormat::Compressed) {
+    auto header = read_index_header(is);
+    if (header.format != IndexFormat::Compressed) {
       throw std::runtime_error(
           "searchlib: the compressed backend requires a Compressed-format "
           "index file");
@@ -4009,11 +4448,9 @@ public:
       }
     }
 
-    // Scope-index section (see InMemoryInvertedIndexBase::save): read and
-    // discard, since IScopeIndex is not exposed by this read-only backend
-    // yet (v1 limitation, see docs/missing_features.ja.md 3.4.1). Skipping
-    // it explicitly keeps the following sections aligned.
-    read_scope_section(is, [](const std::string &, size_t, EliasFano &&) {});
+    scope_data_ = load_scope_section(
+        is, header, term_counts_.size(),
+        [&](size_t ordinal) { return term_counts_[ordinal]; });
 
     keys_.load(is, term_counts_.size());
 
@@ -4135,6 +4572,21 @@ public:
            removed_ordinals_.end();
   }
 
+  bool has_scope(const std::string &scope_name, size_t ordinal) const override {
+    return has_scope_in(scope_data_.get(), scope_name, ordinal);
+  }
+
+  size_t scope_id(const std::string &scope_name, size_t ordinal,
+                  size_t term_pos) const override {
+    return scope_id_in(scope_data_.get(), scope_name, ordinal, term_pos);
+  }
+
+  void scope_ids(const std::string &scope_name, size_t ordinal,
+                 const size_t *positions, size_t count,
+                 size_t *out) const override {
+    scope_ids_in(scope_data_.get(), scope_name, ordinal, positions, count, out);
+  }
+
   TextRange text_range(const IPostings &positions, size_t index,
                        size_t search_hit_index) const override {
     auto ordinal = positions.document_ordinal(index);
@@ -4194,6 +4646,7 @@ private:
   std::vector<CompressedTerm> terms_; // indexed by the FST's ordinal
 
   std::unordered_set<size_t> removed_ordinals_;
+  std::shared_ptr<const ScopeIndexData> scope_data_; // null if none
   EFTextRanges text_ranges_;
   double average_document_term_count_ = 0.0;
 };
@@ -6769,8 +7222,7 @@ inline void InMemoryInvertedIndexBase::set_scope_ids(
     throw std::invalid_argument(
         "searchlib: scope_ids must be monotonically non-decreasing");
   }
-  // The saved form stores each document's largest id plus one, which SIZE_MAX
-  // overflows; it is also scope_id's answer for no scope.
+  // SIZE_MAX is scope_id's answer for no scope.
   if (!scope_ids.empty() && scope_ids.back() == static_cast<size_t>(-1)) {
     throw std::invalid_argument("searchlib: scope_ids must be below SIZE_MAX");
   }
@@ -6792,27 +7244,22 @@ inline detail::ScopeIndexData &InMemoryInvertedIndexBase::own_scope_data_() {
 
 inline bool InMemoryInvertedIndexBase::has_scope(const std::string &scope_name,
                                                  size_t ordinal) const {
-  const auto *ids = detail::find_scope_ids(scope_data_.get(), scope_name);
-  return ids && ids->contains(ordinal);
+  return detail::has_scope_in(scope_data_.get(), scope_name, ordinal);
 }
 
 inline size_t InMemoryInvertedIndexBase::scope_id(const std::string &scope_name,
                                                   size_t ordinal,
                                                   size_t term_pos) const {
-  const auto *ids = detail::find_scope_ids(scope_data_.get(), scope_name);
-  return ids ? ids->at(ordinal, term_pos) : static_cast<size_t>(-1);
+  return detail::scope_id_in(scope_data_.get(), scope_name, ordinal, term_pos);
 }
 
-// The scope name is looked up once for all the positions.
 inline void InMemoryInvertedIndexBase::scope_ids(const std::string &scope_name,
                                                  size_t ordinal,
                                                  const size_t *positions,
                                                  size_t count,
                                                  size_t *out) const {
-  const auto *ids = detail::find_scope_ids(scope_data_.get(), scope_name);
-  for (size_t i = 0; i < count; i++) {
-    out[i] = ids ? ids->at(ordinal, positions[i]) : static_cast<size_t>(-1);
-  }
+  detail::scope_ids_in(scope_data_.get(), scope_name, ordinal, positions, count,
+                       out);
 }
 
 inline void InMemoryInvertedIndexBase::save(std::ostream &os,
@@ -6887,34 +7334,9 @@ inline void InMemoryInvertedIndexBase::save(std::ostream &os,
     detail::write_scalar<uint64_t>(os, ordinal);
   }
 
-  // Scope-index section: per scope_name (sorted), per ordinal (sorted), an
-  // Elias-Fano encoded term_pos->scope-ordinal sequence, the same way
-  // regardless of `format`. That is the form this section has always had,
-  // not a compact one for short documents (some 32 bytes of each is fixed
-  // header); the index keeps the ids packed in memory, and converts.
-  if (scope_data_) {
-    detail::write_scalar<uint64_t>(os, scope_data_->by_name.size());
-    std::vector<std::string> scope_names;
-    scope_names.reserve(scope_data_->by_name.size());
-    for (const auto &[name, _] : scope_data_->by_name) {
-      scope_names.push_back(name);
-    }
-    std::sort(scope_names.begin(), scope_names.end());
-    for (const auto &name : scope_names) {
-      detail::write_scalar<uint64_t>(os, name.size());
-      os.write(name.data(), static_cast<std::streamsize>(name.size()));
-
-      const auto &ids = scope_data_->by_name.at(name);
-      detail::write_scalar<uint64_t>(os, ids.documents());
-      ids.for_each([&](size_t ordinal, const std::vector<uint64_t> &values) {
-        detail::write_scalar<uint64_t>(os, ordinal);
-        auto universe = values.empty() ? uint64_t(1) : values.back() + 1;
-        detail::EliasFano(values, universe).save(os);
-      });
-    }
-  } else {
-    detail::write_scalar<uint64_t>(os, uint64_t(0));
-  }
+  // Scope-index section: each scope name's ids as the index holds them
+  // (see PackedScopeIds::save), names sorted.
+  detail::save_scope_section(os, scope_data_.get(), compressed_format);
 }
 
 // One counting pass over every posting entry to size each live document's
@@ -6961,6 +7383,13 @@ inline void InMemoryInvertedIndexBase::rebuild_document_terms_() {
 
 inline void InMemoryInvertedIndexBase::load(std::istream &is,
                                             IndexFormat format) {
+  load_(is, detail::IndexHeader{format, true});
+}
+
+inline void
+InMemoryInvertedIndexBase::load_(std::istream &is,
+                                 const detail::IndexHeader &header) {
+  auto format = header.format;
   auto compressed_format = format == IndexFormat::Compressed;
   documents_.clear();
   auto document_count = detail::read_scalar<uint64_t>(is);
@@ -7013,30 +7442,9 @@ inline void InMemoryInvertedIndexBase::load(std::istream &is,
   }
   rebuild_document_terms_();
 
-  scope_data_.reset();
-  std::vector<size_t> ids;
-  detail::read_scope_section(
-      is, [&](const std::string &name, size_t ordinal, detail::EliasFano &&ef) {
-        // What set_scope_ids would have refused: a document that does not
-        // exist, ids that do not cover it position for position, or ids
-        // that go down, which an Elias-Fano sequence can hold within one of
-        // its buckets.
-        if (ordinal >= documents_.size() ||
-            ef.size() != documents_[ordinal].term_count) {
-          throw std::runtime_error("searchlib: corrupt scope section");
-        }
-        ids.resize(ef.size());
-        ef.read(0, ids.data(), ids.size());
-        if (!std::is_sorted(ids.begin(), ids.end())) {
-          throw std::runtime_error("searchlib: corrupt scope section");
-        }
-        own_scope_data_().by_name[name].assign(ordinal, ids.data(), ids.size());
-      });
-  if (scope_data_) {
-    for (auto &[_, packed] : scope_data_->by_name) {
-      packed.shrink();
-    }
-  }
+  scope_data_ = detail::load_scope_section(
+      is, header, documents_.size(),
+      [&](size_t ordinal) { return documents_[ordinal].term_count; });
 }
 
 //-----------------------------------------------------------------------------
@@ -7910,15 +8318,14 @@ parse_query(TextSplitter splitter, TermFilter filter, std::string_view query) {
 //-----------------------------------------------------------------------------
 
 template <typename Key>
-std::shared_ptr<IInvertedIndexWithTextRange<TextRange, Key>>
-load_compressed_index(std::istream &is) {
+std::shared_ptr<ICompressedIndex<Key>> load_compressed_index(std::istream &is) {
   auto index = std::make_shared<detail::CompressedInvertedIndex<Key>>();
   index->load(is);
   return index;
 }
 
 template <typename Key>
-std::shared_ptr<IInvertedIndexWithTextRange<TextRange, Key>>
+std::shared_ptr<ICompressedIndex<Key>>
 load_compressed_index(const std::string &path) {
   std::ifstream is(path, std::ios::binary);
   if (!is) {

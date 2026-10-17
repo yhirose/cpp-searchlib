@@ -1604,8 +1604,9 @@ TEST(SameScopeTest, SetScopeIdsRejectsNonMonotone) {
 
 // Each document's ids are kept as differences from its first, in as few
 // bits as its last needs: none when they are all one id, up to all 64. Every
-// width reads back what was set, before and after a save and load, and the
-// file says the same thing again when saved once more.
+// width reads back what was set, before and after a save and load in either
+// format and in the read-only index, and the file says the same thing again
+// when saved once more.
 TEST(SameScopeTest, ScopeIdsOfEveryWidthReadBack) {
   const auto big = std::numeric_limits<size_t>::max() - 1;
   const std::vector<std::vector<size_t>> cases = {
@@ -1624,7 +1625,7 @@ TEST(SameScopeTest, ScopeIdsOfEveryWidthReadBack) {
     invidx.set_scope_ids("p", key, cases[key]);
   }
 
-  auto expect_cases = [&](const InMemoryInvertedIndex<TextRange> &index) {
+  auto expect_cases = [&](const auto &index) {
     for (size_t key = 0; key < cases.size(); key++) {
       auto ordinal = *index.document_ordinal(key);
       const auto &ids = cases[key];
@@ -1639,19 +1640,24 @@ TEST(SameScopeTest, ScopeIdsOfEveryWidthReadBack) {
   };
   expect_cases(invidx);
 
-  std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
-  invidx.save(ss);
-  auto saved = ss.str();
-  InMemoryInvertedIndex<TextRange> loaded;
-  loaded.load(ss);
-  expect_cases(loaded);
-  std::stringstream again(std::ios::in | std::ios::out | std::ios::binary);
-  loaded.save(again);
-  EXPECT_EQ(saved, again.str());
+  for (auto format : {IndexFormat::Plain, IndexFormat::Compressed}) {
+    std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+    invidx.save(ss, {}, format);
+    auto saved = ss.str();
+    InMemoryInvertedIndex<TextRange> loaded;
+    loaded.load(ss);
+    expect_cases(loaded);
+    std::stringstream again(std::ios::in | std::ios::out | std::ios::binary);
+    loaded.save(again, {}, format);
+    EXPECT_EQ(saved, again.str());
+    if (format == IndexFormat::Compressed) {
+      std::stringstream in(saved, std::ios::in | std::ios::binary);
+      expect_cases(*load_compressed_index(in));
+    }
+  }
 }
 
-// SIZE_MAX is scope_id's answer for no scope, and the saved form cannot hold
-// it; set_scope_ids says so instead of the save failing later.
+// SIZE_MAX is scope_id's answer for no scope, so set_scope_ids refuses it.
 TEST(SameScopeTest, SetScopeIdsRejectsSizeMax) {
   InMemoryInvertedIndex<TextRange> invidx;
   InMemoryIndexer indexer(invidx, normalizer);
@@ -1712,53 +1718,313 @@ TEST(SameScopeTest, ReplacingScopeIdsKeepsEveryDocumentRight) {
   expect_model(*copy, copied);
 }
 
-// The scope section is checked against the documents as it is read, as
-// set_scope_ids checks its arguments: ids for a document the file does not
-// have, ids that do not cover their document position for position, and ids
-// that go down are a corrupt file. Ids that went down used to be packed as
-// they came, and spilled into the next document's.
-TEST(CorruptIndexTest, ScopeIdsMustFitTheirDocument) {
+// The scope section of a file as the tests below write it out by hand: one
+// scope name, its documents' fields (see PackedScopeIds::save) and its
+// bits, u64 fields in the Plain format and varints in the Compressed one.
+struct ScopeSectionDocument {
+  uint64_t gap;
+  uint64_t base;
+  uint8_t low_width;
+  uint64_t high_zeros;
+};
+
+static std::string scope_section(IndexFormat format,
+                                 const std::vector<ScopeSectionDocument> &docs,
+                                 const std::vector<uint64_t> &words) {
+  std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+  auto put = [&](uint64_t value) {
+    if (format == IndexFormat::Compressed) {
+      detail::write_varint(ss, value);
+    } else {
+      detail::write_scalar<uint64_t>(ss, value);
+    }
+  };
+  detail::write_bytes(ss, "scopename");
+  put(docs.size());
+  for (const auto &doc : docs) {
+    put(doc.gap);
+    put(doc.base);
+    detail::write_scalar<uint8_t>(ss, doc.low_width);
+    put(doc.high_zeros);
+  }
+  put(words.size());
+  for (auto word : words) {
+    detail::write_scalar<uint64_t>(ss, word);
+  }
+  return ss.str();
+}
+
+// The same file with `section` where `was` is.
+static std::string replaced(const std::string &bytes, const std::string &was,
+                            const std::string &section) {
+  auto at = bytes.find(was);
+  EXPECT_NE(std::string::npos, at);
+  if (at == std::string::npos) {
+    return bytes;
+  }
+  return bytes.substr(0, at) + section + bytes.substr(at + was.size());
+}
+
+// Documents of every kind the scope section has, with the section saved for
+// them worked out by hand.
+//
+//   0  a b c d  4 5 6 7  steps of one: no low bits, a unary 1010101
+//   1  a b c    0 0 1    1011
+//   2  a b      0 100    a jump: low width 5 (0, then 4) and unary 10001
+//   3  a        -        none registered
+//   4  a        9        one scope: no bits
+//   5  (empty)  -        no ids, and so no bits
+static InMemoryInvertedIndex<TextRange> scope_section_index() {
   InMemoryInvertedIndex<TextRange> invidx;
   InMemoryIndexer indexer(invidx, normalizer);
-  indexer.index_document(0, UTF8PlainTextTokenizer("a b c d"));
-  indexer.index_document(1, UTF8PlainTextTokenizer("a b c"));
+  for (const char *text : {"a b c d", "a b c", "a b", "a", "a", ""}) {
+    indexer.index_document(invidx.document_count(),
+                           UTF8PlainTextTokenizer(text));
+  }
   invidx.set_scope_ids("scopename", 0, {4, 5, 6, 7});
   invidx.set_scope_ids("scopename", 1, {0, 0, 1});
-  std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
-  invidx.save(ss);
-  const auto bytes = ss.str();
+  invidx.set_scope_ids("scopename", 2, {0, 100});
+  invidx.set_scope_ids("scopename", 4, {9});
+  invidx.set_scope_ids("scopename", 5, {});
+  return invidx;
+}
 
-  // The section names the scope and counts its documents, then gives the
-  // first one's ordinal and its ids as an Elias-Fano sequence.
-  std::stringstream head(std::ios::in | std::ios::out | std::ios::binary);
-  detail::write_bytes(head, "scopename");
-  detail::write_scalar<uint64_t>(head, 2);
-  auto ordinal_offset = static_cast<size_t>(head.tellp());
-  detail::write_scalar<uint64_t>(head, 0);
-  std::stringstream ef(std::ios::in | std::ios::out | std::ios::binary);
-  detail::EliasFano({4, 5, 6, 7}, 8).save(ef);
-  head << ef.str();
-  auto at = bytes.find(head.str());
-  ASSERT_NE(std::string::npos, at);
-  auto ordinal_at = at + ordinal_offset;
-  // 4 to 7 in a universe of 8 keep one low bit each, 0 1 0 1, in the first
-  // of the two words the sequence ends with.
-  auto low_bits_at = at + head.str().size() - 16;
+static const std::vector<ScopeSectionDocument> kScopeSectionDocuments = {
+    {0, 4, 0, 3}, {0, 0, 0, 1}, {0, 0, 5, 3}, {1, 9, 0, 0}, {0, 0, 0, 0}};
+// Document 0's unary part at bit 0, 1's at 7, then 2's low bits at 11 and
+// 16 (4, so bit 18) and its unary part at 21.
+static const uint64_t kScopeSectionWord =
+    0x55 | (0b1011 << 7) | (uint64_t(1) << 18) | (uint64_t(0b10001) << 21);
 
-  auto expect_refused = [&](size_t offset, uint64_t value, const char *what) {
-    auto patched = bytes;
-    std::memcpy(&patched[offset], &value, sizeof(value));
-    std::stringstream in(patched, std::ios::in | std::ios::binary);
+// The section save writes is the one above, field for field, in either
+// format, and it reads back as what was set.
+TEST(SameScopeTest, TheScopeSectionIsAsDocumented) {
+  auto invidx = scope_section_index();
+  for (auto format : {IndexFormat::Plain, IndexFormat::Compressed}) {
+    std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+    invidx.save(ss, {}, format);
+    auto bytes = ss.str();
+    EXPECT_NE(std::string::npos,
+              bytes.find(scope_section(format, kScopeSectionDocuments,
+                                       {kScopeSectionWord})));
+
+    std::stringstream in(bytes, std::ios::in | std::ios::binary);
     InMemoryInvertedIndex<TextRange> loaded;
-    EXPECT_THROW(loaded.load(in), std::runtime_error) << what;
-  };
-  expect_refused(ordinal_at, 50, "a document the file does not have");
-  expect_refused(ordinal_at, 1, "four ids for a document of three terms");
-  expect_refused(low_bits_at, 0b1001, "low bits 1 0 0 1: ids 5 4 6 7");
+    loaded.load(in);
+    EXPECT_EQ(100, loaded.scope_id("scopename", 2, 1));
+    EXPECT_EQ(9, loaded.scope_id("scopename", 4, 0));
+    EXPECT_FALSE(loaded.has_scope("scopename", 3));
+    EXPECT_TRUE(loaded.has_scope("scopename", 5));
+  }
+}
 
-  std::stringstream in(bytes, std::ios::in | std::ios::binary);
-  InMemoryInvertedIndex<TextRange> loaded;
-  EXPECT_NO_THROW(loaded.load(in));
+// The scope section is checked against the documents as it is read, as
+// set_scope_ids checks its arguments: ids for a document the file does not
+// have, and ids that go down, which would not fit the width the last one
+// gives the document, are a corrupt file; so are fields out of range, and
+// bits that do not add up to the documents' or leave an id without its set
+// bit. Each case is refused by the in-memory index and the read-only one.
+TEST(CorruptIndexTest, ScopeIdsMustFitTheirDocument) {
+  auto invidx = scope_section_index();
+  for (auto format : {IndexFormat::Plain, IndexFormat::Compressed}) {
+    std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+    invidx.save(ss, {}, format);
+    const auto bytes = ss.str();
+    const auto section =
+        scope_section(format, kScopeSectionDocuments, {kScopeSectionWord});
+
+    auto expect_refused = [&](std::vector<ScopeSectionDocument> docs,
+                              std::vector<uint64_t> words, const char *what) {
+      auto patched =
+          replaced(bytes, section, scope_section(format, docs, words));
+      std::stringstream in(patched, std::ios::in | std::ios::binary);
+      InMemoryInvertedIndex<TextRange> loaded;
+      EXPECT_THROW(loaded.load(in), std::runtime_error) << what;
+      if (format == IndexFormat::Compressed) {
+        std::stringstream again(patched, std::ios::in | std::ios::binary);
+        EXPECT_THROW(load_compressed_index(again), std::runtime_error) << what;
+      }
+    };
+    auto docs = kScopeSectionDocuments;
+    docs[0].gap = 50;
+    expect_refused(docs, {kScopeSectionWord}, "a document the file lacks");
+    docs = kScopeSectionDocuments;
+    docs[4].gap = 2;
+    expect_refused(docs, {kScopeSectionWord}, "past the last document");
+    docs = kScopeSectionDocuments;
+    docs[2].low_width = 64;
+    expect_refused(docs, {kScopeSectionWord}, "a low width past 63");
+    docs = kScopeSectionDocuments;
+    docs[4].high_zeros = 1;
+    expect_refused(docs, {kScopeSectionWord}, "bits for a document of none");
+    expect_refused(kScopeSectionDocuments, {kScopeSectionWord, 0},
+                   "a word more than the documents need");
+    expect_refused(kScopeSectionDocuments, {kScopeSectionWord & ~uint64_t(1)},
+                   "document 0's first id without its set bit");
+    // Document 2's ids in one high part, low bits 31 then 4.
+    auto down = (kScopeSectionWord & ~(uint64_t(0x7fff) << 11)) |
+                (uint64_t(31) << 11) | (uint64_t(4) << 16) |
+                (uint64_t(0b00011) << 21);
+    expect_refused(kScopeSectionDocuments, {down}, "ids 31 then 4");
+
+    std::stringstream in(bytes, std::ios::in | std::ios::binary);
+    InMemoryInvertedIndex<TextRange> loaded;
+    EXPECT_NO_THROW(loaded.load(in));
+  }
+}
+
+// A file of the schema before the scope section took its present form gave
+// each document's ids as an Elias-Fano sequence. Both indexes still read
+// one, refuse the same corrupt ones as before, and save what they read in
+// the present form.
+TEST(SameScopeTest, AFileFromTheSchemaBeforeStillLoads) {
+  auto invidx = scope_section_index();
+  // ordinal, then the ids of each registered document.
+  std::vector<std::pair<uint64_t, std::vector<uint64_t>>> registered = {
+      {0, {4, 5, 6, 7}}, {1, {0, 0, 1}}, {2, {0, 100}}, {4, {9}}, {5, {}}};
+  auto legacy_section = [&](uint64_t first_ordinal, uint64_t low_bits) {
+    std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+    detail::write_bytes(ss, "scopename");
+    detail::write_scalar<uint64_t>(ss, registered.size());
+    for (const auto &[ordinal, ids] : registered) {
+      detail::write_scalar<uint64_t>(ss,
+                                     ordinal == 0 ? first_ordinal : ordinal);
+      std::stringstream ef(std::ios::in | std::ios::out | std::ios::binary);
+      detail::EliasFano(ids, ids.empty() ? 1 : ids.back() + 1).save(ef);
+      auto bytes = ef.str();
+      // 4 to 7 in a universe of 8 keep one low bit each, 0 1 0 1, in the
+      // first of the two words the sequence ends with.
+      if (ordinal == 0) {
+        std::memcpy(&bytes[bytes.size() - 16], &low_bits, sizeof(low_bits));
+      }
+      ss << bytes;
+    }
+    return ss.str();
+  };
+
+  for (auto format : {IndexFormat::Plain, IndexFormat::Compressed}) {
+    std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+    invidx.save(ss, {}, format);
+    const auto bytes = ss.str();
+    auto legacy_file = [&](uint64_t first_ordinal, uint64_t low_bits) {
+      auto file = replaced(
+          bytes,
+          scope_section(format, kScopeSectionDocuments, {kScopeSectionWord}),
+          legacy_section(first_ordinal, low_bits));
+      uint32_t version = format == IndexFormat::Plain ? 0 : 1;
+      std::memcpy(&file[8], &version, sizeof(version));
+      return file;
+    };
+
+    auto file = legacy_file(0, 0b1010);
+    std::stringstream in(file, std::ios::in | std::ios::binary);
+    InMemoryInvertedIndex<TextRange> loaded;
+    loaded.load(in);
+    for (const auto &[ordinal, ids] : registered) {
+      for (size_t i = 0; i < ids.size(); i++) {
+        EXPECT_EQ(ids[i], loaded.scope_id("scopename", ordinal, i));
+      }
+    }
+    std::stringstream resaved(std::ios::in | std::ios::out | std::ios::binary);
+    loaded.save(resaved, {}, format);
+    EXPECT_EQ(bytes, resaved.str());
+    if (format == IndexFormat::Compressed) {
+      std::stringstream again(file, std::ios::in | std::ios::binary);
+      auto read_only = load_compressed_index(again);
+      for (const auto &[ordinal, ids] : registered) {
+        for (size_t i = 0; i < ids.size(); i++) {
+          EXPECT_EQ(ids[i], read_only->scope_id("scopename", ordinal, i));
+        }
+      }
+    }
+
+    auto expect_refused = [&](const std::string &patched, const char *what) {
+      std::stringstream in(patched, std::ios::in | std::ios::binary);
+      InMemoryInvertedIndex<TextRange> loaded;
+      EXPECT_THROW(loaded.load(in), std::runtime_error) << what;
+    };
+    expect_refused(legacy_file(50, 0b1010), "a document the file lacks");
+    expect_refused(legacy_file(1, 0b1010), "four ids for three terms");
+    // Packed as they came, ids that went down spilled into the next
+    // document's.
+    expect_refused(legacy_file(0, 0b1001), "low bits 1 0 0 1: ids 5 4 6 7");
+  }
+}
+
+// The read-only index keeps the scope ids it was saved with and answers for
+// them as the index it was saved from does -- every id, and SameScope's
+// results -- across documents of every shape: one scope, a scope every few
+// positions, ids that jump far, a large first id, none registered, removed.
+TEST(SameScopeTest, TheReadOnlyIndexAnswersAsTheOneItWasSavedFrom) {
+  std::mt19937 rng(11);
+  InMemoryInvertedIndex<TextRange> invidx;
+  InMemoryIndexer indexer(invidx, normalizer);
+  const std::vector<std::string> vocabulary = {"alpha", "beta", "gamma",
+                                               "delta"};
+  for (size_t key = 0; key < 300; key++) {
+    size_t length = rng() % 4 == 0 ? 200 + rng() % 400 : 1 + rng() % 30;
+    std::string text;
+    for (size_t i = 0; i < length; i++) {
+      text += (i ? " " : "") + vocabulary[rng() % vocabulary.size()];
+    }
+    indexer.index_document(key, UTF8PlainTextTokenizer(text));
+    for (const std::string name : {"paragraph", "section"}) {
+      if (rng() % 5 == 0) {
+        continue;
+      }
+      size_t id = rng() % 3 == 0 ? rng() : rng() % 10;
+      auto shape = rng() % 3;
+      std::vector<size_t> ids(length);
+      for (auto &value : ids) {
+        if (shape == 1) {
+          id += rng() % 6 == 0;
+        } else if (shape == 2 && rng() % 3 == 0) {
+          id += rng() % 100000;
+        }
+        value = id;
+      }
+      invidx.set_scope_ids(name, key, ids);
+    }
+  }
+  invidx.remove_document(7);
+  invidx.remove_document(150);
+
+  std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+  invidx.save(ss, {}, IndexFormat::Compressed);
+  auto read_only = load_compressed_index(ss);
+
+  for (const std::string name : {"paragraph", "section", "missing"}) {
+    for (size_t ordinal = 0; ordinal < 300; ordinal++) {
+      ASSERT_EQ(invidx.has_scope(name, ordinal),
+                read_only->has_scope(name, ordinal));
+      std::vector<size_t> positions(invidx.document_term_count(ordinal) + 1);
+      std::iota(positions.begin(), positions.end(), size_t(0));
+      std::vector<size_t> want(positions.size()), have(positions.size());
+      invidx.scope_ids(name, ordinal, positions.data(), positions.size(),
+                       want.data());
+      read_only->scope_ids(name, ordinal, positions.data(), positions.size(),
+                           have.data());
+      ASSERT_EQ(want, have) << name << " in document " << ordinal;
+    }
+  }
+
+  for (const std::string name : {"paragraph", "section"}) {
+    for (const auto &a : vocabulary) {
+      for (const auto &b : vocabulary) {
+        auto expr = same_scope_expr(name, {u32(a), u32(b)});
+        auto want = perform_search(invidx, expr, &invidx);
+        auto have = perform_search(*read_only, expr, read_only.get());
+        ASSERT_EQ(want->size(), have->size()) << name << " " << a << " " << b;
+        for (size_t i = 0; i < want->size(); i++) {
+          ASSERT_EQ(want->document_ordinal(i), have->document_ordinal(i));
+          ASSERT_EQ(want->search_hit_count(i), have->search_hit_count(i));
+          for (size_t h = 0; h < want->search_hit_count(i); h++) {
+            ASSERT_EQ(want->term_position(i, h), have->term_position(i, h));
+          }
+        }
+      }
+    }
+  }
 }
 
 TEST(SameScopeTest, PersistedScopeSurvivesRoundtrip) {

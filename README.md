@@ -260,7 +260,9 @@ loaded.load(is, [](std::istream &is) -> T { /* read and return a T */ });
 
 The default on-disk format is a "plain" host-native dump (`format_type` 0)
 tagged with a `format_type`/`schema_version` header. It is intended to be
-loaded on the same platform that wrote it.
+loaded on the same platform that wrote it. A file of the schema version
+before the current one still loads; a file saved now does not load in a
+version of the library that predates it.
 
 ### Compressed format
 
@@ -282,7 +284,12 @@ auto index = load_compressed_index("index.bin");
 ```
 
 Being immutable, it is safe to share across reader threads without external
-locking.
+locking. It keeps the scope ids registered with `set_scope_ids`, so it is its
+own `IScopeIndex` for `SameScope`, as an `InMemoryInvertedIndex` is:
+
+```cpp
+auto result = perform_search(*index, expr, index.get());
+```
 
 The FST dictionary is what makes this backend both small and good at prefix
 search: on KJV it holds the same 12,594 terms in 54KB instead of 459KB, and
