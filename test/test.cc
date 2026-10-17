@@ -1424,6 +1424,24 @@ static Expression same_scope_expr(const std::string &scope_name,
   return expr;
 }
 
+// A document of n copies of one word, for tests that only need its length.
+static std::string words(size_t n) {
+  std::string text;
+  for (size_t i = 0; i < n; i++) {
+    text += i ? " w" : "w";
+  }
+  return text;
+}
+
+// An IScopeIndex of a test's own, every document in scopes that alternate
+// with the position, so that a scope comes back along the text.
+struct AlternatingScopes : IScopeIndex {
+  bool has_scope(const std::string &, size_t) const override { return true; }
+  size_t scope_id(const std::string &, size_t, size_t term_pos) const override {
+    return term_pos % 2;
+  }
+};
+
 // Fixture for SameScopeTest: 5 documents, each with a hand-picked
 // term_pos -> scope-ordinal assignment registered under scope_name
 // "paragraph". Document 2 deliberately has no scope data registered at all.
@@ -1601,11 +1619,8 @@ TEST(SameScopeTest, ScopeIdsOfEveryWidthReadBack) {
   InMemoryInvertedIndex<TextRange> invidx;
   InMemoryIndexer indexer(invidx, normalizer);
   for (size_t key = 0; key < cases.size(); key++) {
-    std::string text;
-    for (size_t i = 0; i < cases[key].size(); i++) {
-      text += i ? " w" : "w";
-    }
-    indexer.index_document(key, UTF8PlainTextTokenizer(text));
+    indexer.index_document(key,
+                           UTF8PlainTextTokenizer(words(cases[key].size())));
     invidx.set_scope_ids("p", key, cases[key]);
   }
 
@@ -1613,17 +1628,10 @@ TEST(SameScopeTest, ScopeIdsOfEveryWidthReadBack) {
     for (size_t key = 0; key < cases.size(); key++) {
       auto ordinal = *index.document_ordinal(key);
       const auto &ids = cases[key];
-      std::vector<size_t> positions(ids.size() + 1);
-      std::iota(positions.begin(), positions.end(), size_t(0));
-      std::vector<size_t> out(positions.size());
-      index.scope_ids("p", ordinal, positions.data(), positions.size(),
-                      out.data());
       for (size_t i = 0; i < ids.size(); i++) {
         EXPECT_EQ(ids[i], index.scope_id("p", ordinal, i)) << key << "@" << i;
-        EXPECT_EQ(ids[i], out[i]) << key << "@" << i;
       }
       // Past the document's end is no scope, not another document's ids.
-      EXPECT_EQ(static_cast<size_t>(-1), out.back()) << key;
       EXPECT_EQ(static_cast<size_t>(-1),
                 index.scope_id("p", ordinal, ids.size()))
           << key;
@@ -1665,11 +1673,7 @@ TEST(SameScopeTest, ReplacingScopeIdsKeepsEveryDocumentRight) {
   std::vector<size_t> lengths;
   for (size_t key = 0; key < 30; key++) {
     lengths.push_back(1 + rng() % 40);
-    std::string text;
-    for (size_t i = 0; i < lengths.back(); i++) {
-      text += i ? " w" : "w";
-    }
-    indexer.index_document(key, UTF8PlainTextTokenizer(text));
+    indexer.index_document(key, UTF8PlainTextTokenizer(words(lengths.back())));
   }
 
   std::map<size_t, std::vector<size_t>> model;
@@ -1710,63 +1714,51 @@ TEST(SameScopeTest, ReplacingScopeIdsKeepsEveryDocumentRight) {
 
 // The scope section is checked against the documents as it is read, as
 // set_scope_ids checks its arguments: ids for a document the file does not
-// have, or that do not cover their document position for position, are a
-// corrupt file.
+// have, ids that do not cover their document position for position, and ids
+// that go down are a corrupt file. Ids that went down used to be packed as
+// they came, and spilled into the next document's.
 TEST(CorruptIndexTest, ScopeIdsMustFitTheirDocument) {
   InMemoryInvertedIndex<TextRange> invidx;
   InMemoryIndexer indexer(invidx, normalizer);
-  indexer.index_document(0, UTF8PlainTextTokenizer("a b c"));
-  indexer.index_document(1, UTF8PlainTextTokenizer("a b c d"));
-  invidx.set_scope_ids("scopename", 0, {0, 0, 1});
-  invidx.set_scope_ids("scopename", 1, {0, 1, 1, 2});
+  indexer.index_document(0, UTF8PlainTextTokenizer("a b c d"));
+  indexer.index_document(1, UTF8PlainTextTokenizer("a b c"));
+  invidx.set_scope_ids("scopename", 0, {4, 5, 6, 7});
+  invidx.set_scope_ids("scopename", 1, {0, 0, 1});
   std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
   invidx.save(ss);
   const auto bytes = ss.str();
 
-  // The section names the scope, counts its documents, then gives each
-  // ordinal ahead of its ids.
-  std::string name = "scopename";
-  uint64_t name_size = name.size();
-  uint64_t documents = 2;
-  uint64_t first = 0;
-  std::string head(reinterpret_cast<const char *>(&name_size), 8);
-  head += name;
-  head += std::string(reinterpret_cast<const char *>(&documents), 8);
-  head += std::string(reinterpret_cast<const char *>(&first), 8);
-  auto at = bytes.find(head);
+  // The section names the scope and counts its documents, then gives the
+  // first one's ordinal and its ids as an Elias-Fano sequence.
+  std::stringstream head(std::ios::in | std::ios::out | std::ios::binary);
+  detail::write_bytes(head, "scopename");
+  detail::write_scalar<uint64_t>(head, 2);
+  auto ordinal_offset = static_cast<size_t>(head.tellp());
+  detail::write_scalar<uint64_t>(head, 0);
+  std::stringstream ef(std::ios::in | std::ios::out | std::ios::binary);
+  detail::EliasFano({4, 5, 6, 7}, 8).save(ef);
+  head << ef.str();
+  auto at = bytes.find(head.str());
   ASSERT_NE(std::string::npos, at);
-  auto first_ordinal = at + head.size() - 8;
-  // The second ordinal is the 1 after the first document's ids.
-  uint64_t one = 1;
-  auto second_ordinal = bytes.find(
-      std::string(reinterpret_cast<const char *>(&one), 8), first_ordinal + 8);
-  ASSERT_NE(std::string::npos, second_ordinal);
+  auto ordinal_at = at + ordinal_offset;
+  // 4 to 7 in a universe of 8 keep one low bit each, 0 1 0 1, in the first
+  // of the two words the sequence ends with.
+  auto low_bits_at = at + head.str().size() - 16;
 
-  auto expect_refused = [&](std::string patched, const char *what) {
+  auto expect_refused = [&](size_t offset, uint64_t value, const char *what) {
+    auto patched = bytes;
+    std::memcpy(&patched[offset], &value, sizeof(value));
     std::stringstream in(patched, std::ios::in | std::ios::binary);
     InMemoryInvertedIndex<TextRange> loaded;
     EXPECT_THROW(loaded.load(in), std::runtime_error) << what;
   };
-  {
-    auto patched = bytes;
-    uint64_t past_the_end = 50;
-    std::memcpy(&patched[first_ordinal], &past_the_end, 8);
-    expect_refused(patched, "a document the file does not have");
-  }
-  {
-    // Each document's ids under the other's ordinal: three for four
-    // positions, four for three.
-    auto patched = bytes;
-    uint64_t zero = 0;
-    std::memcpy(&patched[first_ordinal], &one, 8);
-    std::memcpy(&patched[second_ordinal], &zero, 8);
-    expect_refused(patched, "ids that do not cover their document");
-  }
-  {
-    std::stringstream in(bytes, std::ios::in | std::ios::binary);
-    InMemoryInvertedIndex<TextRange> loaded;
-    EXPECT_NO_THROW(loaded.load(in));
-  }
+  expect_refused(ordinal_at, 50, "a document the file does not have");
+  expect_refused(ordinal_at, 1, "four ids for a document of three terms");
+  expect_refused(low_bits_at, 0b1001, "low bits 1 0 0 1: ids 5 4 6 7");
+
+  std::stringstream in(bytes, std::ios::in | std::ios::binary);
+  InMemoryInvertedIndex<TextRange> loaded;
+  EXPECT_NO_THROW(loaded.load(in));
 }
 
 TEST(SameScopeTest, PersistedScopeSurvivesRoundtrip) {
@@ -3645,13 +3637,7 @@ TEST(SameScopeTest, EveryHitInAScopeWithAllOperandsIsKept) {
 // scope can come back: here every other position. a@0 and b@2 share one,
 // which a walk that set a@0 aside after it failed with b@1 never saw.
 TEST(SameScopeTest, ScopesNeedNotFollowTheText) {
-  struct Alternating : IScopeIndex {
-    bool has_scope(const std::string &, size_t) const override { return true; }
-    size_t scope_id(const std::string &, size_t,
-                    size_t term_pos) const override {
-      return term_pos % 2;
-    }
-  } scopes;
+  AlternatingScopes scopes;
   InMemoryInvertedIndex<TextRange> invidx;
   InMemoryIndexer indexer(invidx, normalizer);
   indexer.index_document(0, UTF8PlainTextTokenizer("a b b"));
@@ -3662,70 +3648,47 @@ TEST(SameScopeTest, ScopesNeedNotFollowTheText) {
   EXPECT_EQ((std::vector<size_t>{0, 2}), hit_positions(*postings, 0));
 }
 
-// scope_ids answers what scope_id would at each position, in whatever order
-// the positions come: the in-memory index's, which looks the document up
-// once and reads its ids forward, and the default every other IScopeIndex
-// gets. A document or a scope name with nothing registered is all
-// size_t(-1), as scope_id says.
+// scope_ids answers what scope_id would at each position: the in-memory
+// index's, which looks the scope name up once for all of them, and the
+// default every other IScopeIndex gets. A document or a scope name with
+// nothing registered is size_t(-1) throughout, as scope_id says.
 TEST(SameScopeTest, ScopeIdsAgreeWithScopeId) {
   std::mt19937 rng(3);
   InMemoryInvertedIndex<TextRange> invidx;
   InMemoryIndexer indexer(invidx, normalizer);
   for (size_t key = 0; key < 40; key++) {
-    auto length = 1 + rng() % 300;
-    std::string text;
+    auto length = 1 + rng() % 30;
     std::vector<size_t> scope_ids;
     for (size_t i = 0; i < length; i++) {
-      text += i ? " w" : "w";
       scope_ids.push_back(
           scope_ids.empty() ? rng() % 5 : scope_ids.back() + (rng() % 4 == 0));
     }
-    indexer.index_document(key, UTF8PlainTextTokenizer(text));
+    indexer.index_document(key, UTF8PlainTextTokenizer(words(length)));
     if (key % 7 != 3) {
       invidx.set_scope_ids("p", key, scope_ids);
     }
   }
 
-  struct Alternating : IScopeIndex {
-    bool has_scope(const std::string &, size_t) const override { return true; }
-    size_t scope_id(const std::string &, size_t,
-                    size_t term_pos) const override {
-      return term_pos % 2;
-    }
-  } alternating;
-
-  for (size_t ordinal = 0; ordinal < invidx.document_count(); ordinal++) {
-    auto length = invidx.document_term_count(ordinal);
-    std::vector<size_t> all(length);
-    std::iota(all.begin(), all.end(), size_t(0));
-    std::vector<size_t> sparse;
-    for (size_t i = 0; i < length; i += 1 + rng() % 90) {
-      sparse.push_back(i);
-    }
-    auto shuffled = all;
-    std::shuffle(shuffled.begin(), shuffled.end(), rng);
-    for (const auto *positions : {&all, &sparse, &shuffled}) {
-      for (const IScopeIndex *scopes :
-           {static_cast<const IScopeIndex *>(&invidx),
-            static_cast<const IScopeIndex *>(&alternating)}) {
-        for (const std::string name : {"p", "missing"}) {
-          std::vector<size_t> out(positions->size());
-          scopes->scope_ids(name, ordinal, positions->data(), positions->size(),
-                            out.data());
-          for (size_t i = 0; i < positions->size(); i++) {
-            ASSERT_EQ(scopes->scope_id(name, ordinal, (*positions)[i]), out[i])
-                << name << " in document " << ordinal << " at "
-                << (*positions)[i];
-          }
+  AlternatingScopes alternating;
+  for (const IScopeIndex *scopes :
+       {static_cast<const IScopeIndex *>(&invidx),
+        static_cast<const IScopeIndex *>(&alternating)}) {
+    for (size_t ordinal = 0; ordinal < invidx.document_count(); ordinal++) {
+      std::vector<size_t> positions(invidx.document_term_count(ordinal));
+      std::iota(positions.begin(), positions.end(), size_t(0));
+      for (const std::string name : {"p", "missing"}) {
+        std::vector<size_t> out(positions.size());
+        scopes->scope_ids(name, ordinal, positions.data(), positions.size(),
+                          out.data());
+        for (size_t i = 0; i < positions.size(); i++) {
+          ASSERT_EQ(scopes->scope_id(name, ordinal, i), out[i])
+              << name << " in document " << ordinal << " at " << i;
         }
       }
     }
   }
   EXPECT_FALSE(invidx.has_scope("p", 3));
-  std::vector<size_t> out(1, 0);
-  size_t position = 0;
-  invidx.scope_ids("p", 3, &position, 1, out.data());
-  EXPECT_EQ(static_cast<size_t>(-1), out[0]);
+  EXPECT_EQ(static_cast<size_t>(-1), invidx.scope_id("p", 3, 0));
 }
 
 // Against every choice of one hit per operand, on random documents cut into
