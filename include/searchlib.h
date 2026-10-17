@@ -32,7 +32,6 @@
 #include <fstream>
 #include <functional>
 #include <istream>
-#include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
@@ -5292,7 +5291,7 @@ perform_fuzzy_operation(const IInvertedIndex &inverted_index,
 // the distance of the ones before it, or all in one scope). A hit that belongs
 // to a match is one worth highlighting, and one a proximity operator around
 // this one can build on: `(a ~ x) ~ c` matches when one `a` is near both.
-//
+
 // One operand's hit, as Near and SameScope weigh them.
 struct ProximityHit {
   size_t position;
@@ -5305,26 +5304,53 @@ struct ProximityHit {
 // the And path reuses its buffers: the walk runs once per document where all
 // cursors align, and these would otherwise be allocated every time.
 struct ProximityScratch {
+  // for_each_hit
+  std::vector<size_t> positions;
   // collect_near_hits_greedily
   std::vector<size_t> search_hit_cursors;
   std::vector<ProximityHit> group;
-  // All: the (position, length) of every hit kept.
+  // The (position, length) of every hit kept, for emit_unique_hits.
   std::vector<std::pair<size_t, size_t>> hits;
   // collect_near_chains
   std::vector<ProximityHit> all_hits;
   std::vector<size_t> reach;
-  std::vector<int64_t> need;
-  // collect_near_pairs: each operand's hits, and those it keeps.
+  std::vector<size_t> need;
+  // collect_near_pairs: each operand's hits.
   std::array<std::vector<ProximityHit>, 2> sides;
-  std::array<std::vector<std::pair<size_t, size_t>>, 2> kept;
-  // collect_same_scope_hits: each hit with its scope id.
+  // collect_same_scope_hits: each hit with its scope id, and per operand the
+  // scope it was last counted in, by where that scope's hits begin.
   std::vector<std::pair<size_t, ProximityHit>> scoped;
+  std::vector<size_t> seen;
 };
+
+// Calls fn(position, length) for each of one operand's hits in a document, in
+// position order. The positions are read in one go, into `positions`: on
+// Elias-Fano that is one lookup and a forward read, where term_position is a
+// select per hit.
+template <typename Fn>
+inline void for_each_hit(const IPostings &postings, size_t index,
+                         std::vector<size_t> &positions, Fn fn) {
+  auto count = postings.search_hit_count(index);
+  positions.resize(count);
+  postings.read_term_positions(index, positions.data());
+  for (size_t h = 0; h < count; h++) {
+    fn(positions[h], postings.term_length(index, h));
+  }
+}
+
+// Near's test for one hit: whether it starts within `distance` of `end`, the
+// furthest end reached before it. Starting inside that reach is no gap at all,
+// since a phrase operand can span past the start of the next one
+// (`"a b c" ~ b`). A difference rather than a sum, which cannot overflow
+// whatever the distance.
+inline bool starts_within(size_t end, size_t position, size_t distance) {
+  return position < end || position - end < distance;
+}
 
 // The kept hits of one document, written out the way every IPostings reader
 // assumes: ascending by position, an identical (position, length) once. Two
-// operands can share a hit (`a ~ a`, `apple ~ app*`), and the groups a walk
-// finds do not come out in position order.
+// operands can share a hit (`a ~ a`, `apple ~ app*`), and the greedy walk
+// finds its groups out of position order.
 inline bool emit_unique_hits(std::vector<std::pair<size_t, size_t>> &hits,
                              std::vector<size_t> &term_positions,
                              std::vector<size_t> &term_lengths) {
@@ -5367,19 +5393,13 @@ inline bool collect_near_chains(
     const std::vector<size_t> &cursors, size_t distance,
     ProximityScratch &scratch, std::vector<size_t> &term_positions,
     std::vector<size_t> &term_lengths) {
-  // A distance past every position is no limit at all, and capping it there
-  // keeps the arithmetic below from overflowing on one like SIZE_MAX.
-  distance =
-      std::min<size_t>(distance, std::numeric_limits<int64_t>::max() / 2);
-
   auto &hits = scratch.all_hits;
   hits.clear();
   for (size_t slot = 0; slot < postings_list.size(); slot++) {
-    const auto &p = *postings_list[slot];
-    for (size_t h = 0; h < p.search_hit_count(cursors[slot]); h++) {
-      hits.push_back(ProximityHit{p.term_position(cursors[slot], h),
-                                  p.term_length(cursors[slot], h), slot});
-    }
+    for_each_hit(*postings_list[slot], cursors[slot], scratch.positions,
+                 [&](size_t position, size_t length) {
+                   hits.push_back(ProximityHit{position, length, slot});
+                 });
   }
   std::sort(hits.begin(), hits.end(), [](const auto &a, const auto &b) {
     return std::tie(a.position, a.slot, a.length) <
@@ -5393,9 +5413,10 @@ inline bool collect_near_chains(
   // have for the hits from i on to finish it: kAny if none, kNever if they
   // cannot. Skipping hit i leaves the row as it was; taking it needs its start
   // to be close enough, and the larger reach it brings to be enough for what
-  // follows. Whether there is a group at all is need[0][no operands].
-  constexpr auto kAny = std::numeric_limits<int64_t>::min();
-  constexpr auto kNever = std::numeric_limits<int64_t>::max();
+  // follows. Whether there is a group at all is need[0][no operands]. kAny can
+  // be 0 because a group with a hit in it reaches at least 1.
+  constexpr size_t kAny = 0;
+  constexpr auto kNever = std::numeric_limits<size_t>::max();
   const size_t n = hits.size();
   auto &need = scratch.need;
   need.assign((n + 1) * masks, kNever);
@@ -5406,19 +5427,20 @@ inline bool collect_near_chains(
     auto *row = &need[i * masks];
     const auto *next = row + masks;
     std::copy(next, next + masks, row);
+    // The least reach that hit i starts within the distance of.
+    auto close_enough =
+        hit.position + 1 > distance ? hit.position + 1 - distance : kAny;
     for (size_t mask = 0; mask < masks; mask++) {
       if ((mask & bit) || next[mask | bit] == kNever) {
         continue;
       }
       auto after = next[mask | bit];
-      auto end = static_cast<int64_t>(hit.end());
-      auto close_enough = static_cast<int64_t>(hit.position) -
-                          static_cast<int64_t>(distance) + 1;
-      int64_t take;
+      size_t take;
       if (mask == 0) {
-        take = end >= after ? kAny : kNever;
+        take = hit.end() >= after ? kAny : kNever;
       } else {
-        take = end >= after ? close_enough : std::max(after, close_enough);
+        take =
+            hit.end() >= after ? close_enough : std::max(after, close_enough);
       }
       row[mask] = std::min(row[mask], take);
     }
@@ -5447,12 +5469,13 @@ inline bool collect_near_chains(
       size_t joined;
       if (mask == 0) {
         joined = hit.end();
-      } else if (reach[mask] != 0 && hit.position < reach[mask] + distance) {
+      } else if (reach[mask] != 0 &&
+                 starts_within(reach[mask], hit.position, distance)) {
         joined = std::max(reach[mask], hit.end());
       } else {
         continue;
       }
-      if (static_cast<int64_t>(joined) >= after[mask | bit]) {
+      if (joined >= after[mask | bit]) {
         reach[mask | bit] = std::max(reach[mask | bit], joined);
         on_a_group = true;
       }
@@ -5466,12 +5489,13 @@ inline bool collect_near_chains(
 }
 
 // Near over two operands, where collect_near_chains' test comes down to the
-// gap between the pair, so each operand's hits can be read off the other's in
-// one pass rather than searched for: a hit is on a pair when the other
-// operand has one starting at or after it, within the distance of its end, or
-// one starting before it, whose end it starts within the distance of. The
-// hits before it only ever grow in number, so the furthest end among them is
-// all that needs keeping.
+// gap between the pair, so one pass over both operands' hits in position order
+// does instead of a search: a hit is on a pair when the other operand has one
+// starting at or after it within the distance of its end -- of those, its next
+// hit is the nearest -- or one before it whose end it starts within the
+// distance of, for which the furthest end so far is all that needs keeping. A
+// hit at the same position as one of the other operand's passes either test,
+// whichever of the two the pass takes first.
 inline bool
 collect_near_pairs(const std::vector<std::shared_ptr<IPostings>> &postings_list,
                    const std::vector<size_t> &cursors, size_t distance,
@@ -5480,50 +5504,48 @@ collect_near_pairs(const std::vector<std::shared_ptr<IPostings>> &postings_list,
                    std::vector<size_t> &term_lengths) {
   auto &sides = scratch.sides;
   for (size_t slot = 0; slot < 2; slot++) {
-    const auto &p = *postings_list[slot];
-    auto index = cursors[slot];
     sides[slot].clear();
-    for (size_t h = 0; h < p.search_hit_count(index); h++) {
-      sides[slot].push_back(ProximityHit{p.term_position(index, h),
-                                         p.term_length(index, h), slot});
-    }
+    for_each_hit(*postings_list[slot], cursors[slot], scratch.positions,
+                 [&](size_t position, size_t length) {
+                   sides[slot].push_back(ProximityHit{position, length, slot});
+                 });
   }
 
-  // Whether a hit at `position` starts within the distance of `end`; inside
-  // it is no gap at all. A difference rather than a sum, which cannot
-  // overflow whatever the distance.
-  auto starts_within = [&](size_t end, size_t position) {
-    return position < end || position - end < distance;
-  };
+  // Per side, how many of its hits the pass has taken, and the furthest end
+  // among them.
+  size_t taken[2] = {0, 0};
+  size_t reach[2] = {0, 0};
+  auto kept = false;
+  while (taken[0] < sides[0].size() || taken[1] < sides[1].size()) {
+    // The next hit by (position, length), the order the result is written in.
+    size_t side = 0;
+    if (taken[0] == sides[0].size()) {
+      side = 1;
+    } else if (taken[1] < sides[1].size()) {
+      const auto &a = sides[0][taken[0]];
+      const auto &b = sides[1][taken[1]];
+      side = std::tie(b.position, b.length) < std::tie(a.position, a.length);
+    }
+    const auto &hit = sides[side][taken[side]++];
+    reach[side] = std::max(reach[side], hit.end());
 
-  auto &kept = scratch.kept;
-  for (size_t slot = 0; slot < 2; slot++) {
-    const auto &other = sides[1 - slot];
-    kept[slot].clear();
-    // The other operand's first hit starting at or after this one, and the
-    // furthest end of those before it.
-    size_t next = 0;
-    size_t reach = 0;
-    for (const auto &hit : sides[slot]) {
-      for (; next < other.size() && other[next].position < hit.position;
-           next++) {
-        reach = std::max(reach, other[next].end());
+    auto other = 1 - side;
+    const auto &others = sides[other];
+    if ((taken[other] > 0 &&
+         starts_within(reach[other], hit.position, distance)) ||
+        (taken[other] < others.size() &&
+         starts_within(hit.end(), others[taken[other]].position, distance))) {
+      // Both operands can carry the same hit (`a ~ a`); it comes out once.
+      if (kept && term_positions.back() == hit.position &&
+          term_lengths.back() == hit.length) {
+        continue;
       }
-      if ((next > 0 && starts_within(reach, hit.position)) ||
-          (next < other.size() &&
-           starts_within(hit.end(), other[next].position))) {
-        kept[slot].emplace_back(hit.position, hit.length);
-      }
+      term_positions.push_back(hit.position);
+      term_lengths.push_back(hit.length);
+      kept = true;
     }
   }
-  // Each side's hits come out in position order, so the two only need
-  // merging, not sorting.
-  auto &hits = scratch.hits;
-  hits.clear();
-  std::merge(kept[0].begin(), kept[0].end(), kept[1].begin(), kept[1].end(),
-             std::back_inserter(hits));
-
-  return emit_unique_hits(hits, term_positions, term_lengths);
+  return kept;
 }
 
 // Near past kMaxChainOperands, where collect_near_chains costs too much: the
@@ -5545,14 +5567,12 @@ inline bool collect_near_hits_greedily(
 
   // Not `near`: windows.h defines that name as a macro.
   auto within_distance = [&] {
-    // The gap is measured from the furthest end reached so far, not just
-    // the previous hit's, and a hit starting inside that reach is no gap
-    // at all: a phrase operand can span past the start of the next one
-    // (`"a b c" ~ b`).
+    // Measured from the furthest end reached so far, not just the previous
+    // hit's.
     auto reach = group.front().end();
     for (size_t i = 1; i < group.size(); i++) {
       const auto &hit = group[i];
-      if (hit.position >= reach && hit.position + 1 - reach > distance) {
+      if (!starts_within(reach, hit.position, distance)) {
         return false;
       }
       reach = std::max(reach, hit.end());
@@ -5610,29 +5630,33 @@ inline bool collect_same_scope_hits(
   auto &scoped = scratch.scoped;
   scoped.clear();
   for (size_t slot = 0; slot < postings_list.size(); slot++) {
-    const auto &p = *postings_list[slot];
-    auto index = cursors[slot];
-    for (size_t h = 0; h < p.search_hit_count(index); h++) {
-      auto position = p.term_position(index, h);
-      scoped.emplace_back(
-          scope_of(position),
-          ProximityHit{position, p.term_length(index, h), slot});
-    }
+    for_each_hit(*postings_list[slot], cursors[slot], scratch.positions,
+                 [&](size_t position, size_t length) {
+                   scoped.emplace_back(scope_of(position),
+                                       ProximityHit{position, length, slot});
+                 });
   }
+  // By scope, then position: where scope ids grow along the text, as the
+  // built-in index's do, that is position order too, and emit_unique_hits
+  // has nothing left to sort.
   std::sort(scoped.begin(), scoped.end(), [](const auto &a, const auto &b) {
-    return std::tie(a.first, a.second.slot) < std::tie(b.first, b.second.slot);
+    return std::tie(a.first, a.second.position, a.second.length) <
+           std::tie(b.first, b.second.position, b.second.length);
   });
 
+  auto &seen = scratch.seen;
+  seen.assign(postings_list.size(), std::numeric_limits<size_t>::max());
   auto &hits = scratch.hits;
   hits.clear();
   for (size_t begin = 0; begin < scoped.size();) {
-    // One scope's hits, and how many operands they cover: by slot within
-    // the scope, so each change of slot is one more operand.
-    auto end = begin + 1;
-    size_t operands = 1;
+    // One scope's hits, and how many operands they cover.
+    auto end = begin;
+    size_t operands = 0;
     for (; end < scoped.size() && scoped[end].first == scoped[begin].first;
          end++) {
-      if (scoped[end].second.slot != scoped[end - 1].second.slot) {
+      auto &last = seen[scoped[end].second.slot];
+      if (last != begin) {
+        last = begin;
         operands++;
       }
     }
@@ -7136,9 +7160,7 @@ inline double bm25_norm(double k1, double b, double dl, double avgdl) {
 
 // What one term adds to a document's score, for the document's `norm` and the
 // term's `tf` there: how many times the document carries it, 0 if it does
-// not. The count itself, not a share of the document's length -- norm already
-// weighs the length, and dividing by it too counts it twice and keeps tf so
-// far below k1 that it never saturates.
+// not. The length is norm's alone to weigh.
 inline double bm25_term(double idf, double tf, double k1, double norm) {
   return idf * ((tf * (k1 + 1.0)) / (tf + norm));
 }
@@ -7178,8 +7200,7 @@ inline BM25Scorer::BM25Scorer(const IInvertedIndex &invidx,
     auto postings = invidx.postings(term);
     auto size = postings->size();
     // df, not the postings' size: the postings still list tombstoned
-    // documents, which N leaves out, and n > N would push idf below zero, or
-    // to NaN once the log's argument goes negative.
+    // documents, which N leaves out, and n > N would push idf below zero.
     auto n = static_cast<double>(invidx.df(term));
     auto block_reads = postings->prefers_block_reads();
     windowed_ = windowed_ || block_reads;
@@ -7337,24 +7358,19 @@ struct MaxScore {
     // At least as many as the documents the walk can reach, which is all the
     // collector needs to size itself for a k larger than that.
     size_t candidates = 0;
-    // How far apart a bound and the scorer's own sum over the same terms can
-    // round: each term adds at most |idf| * (k1 + 1).
-    double magnitude = 1.0;
     for (const auto &term : scorer.terms_) {
       // What a term adds grows with its count toward idf * (k1 + 1) and
       // stays below it, since norm is above 0 in any document that carries
-      // the term. The bound is never below 0, what the term adds where it
-      // is absent; idf is positive whenever df <= N, as IInvertedIndex::df
-      // promises, so the guard only matters for an index that breaks that.
+      // the term. Never below 0, what the term adds where it is absent (idf
+      // is only negative for an index whose df exceeds N).
       //
       // A pass over the postings for each term's real maximum would be
       // tighter, but not by enough to pay for the pass: on KJV x10 it made
       // bm25_top_k 1.2x to 4.8x slower than this bound.
-      double bound = term.idf > 0.0 ? term.idf * (k1 + 1.0) : 0.0;
+      auto bound = std::max(term.idf, 0.0) * (k1 + 1.0);
       lists.push_back(List{PostingsWindow(term.postings.get()), term.size, 0,
                            kEnd, term.idf, bound});
       settle(lists.back());
-      magnitude += std::abs(term.idf) * (k1 + 1.0);
       candidates += term.size;
     }
 
@@ -7375,8 +7391,9 @@ struct MaxScore {
     TopKCollector collector(k, candidates);
     // Whether a document whose score is at most `bound` cannot get in. The
     // bound and the scorer sum the same terms in different orders, so it
-    // must clear the threshold by more than their rounding can differ.
-    auto slack = magnitude * 1e-9;
+    // must clear the threshold by more than their rounding can differ, which
+    // is in proportion to what the terms can add together.
+    auto slack = (1.0 + prefix[term_count]) * 1e-9;
     auto cannot_enter = [&](double bound) {
       return collector.full() && bound + slack <= collector.threshold();
     };

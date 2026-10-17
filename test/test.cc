@@ -3202,28 +3202,73 @@ TEST(NearTest, ThreeOperandsMeasureFromTheFurthestEnd) {
   EXPECT_EQ(3, postings->term_length(0, 0));
 }
 
+// The positions on some choice of one per operand that is_group accepts,
+// found by trying every choice: positions[w] lists where word w occurs, and
+// operands names a word per operand.
+template <typename IsGroup>
+static std::set<size_t>
+hits_on_some_group(const std::vector<std::vector<size_t>> &positions,
+                   const std::vector<int> &operands, IsGroup is_group) {
+  std::set<size_t> hits;
+  for (int operand : operands) {
+    if (positions[operand].empty()) {
+      return hits;
+    }
+  }
+  std::vector<size_t> choice(operands.size(), 0);
+  for (;;) {
+    std::vector<size_t> chosen;
+    for (size_t j = 0; j < choice.size(); j++) {
+      chosen.push_back(positions[operands[j]][choice[j]]);
+    }
+    if (is_group(chosen)) {
+      hits.insert(chosen.begin(), chosen.end());
+    }
+    size_t j = 0;
+    for (; j < choice.size(); j++) {
+      if (++choice[j] < positions[operands[j]].size()) {
+        break;
+      }
+      choice[j] = 0;
+    }
+    if (j == choice.size()) {
+      return hits;
+    }
+  }
+}
+
+// A result over one document: the positions of its hits, none if it has no
+// match.
+static std::set<size_t> hit_set(const IPostings &postings) {
+  std::set<size_t> hits;
+  if (postings.size() > 0) {
+    auto positions = hit_positions(postings, 0);
+    hits.insert(positions.begin(), positions.end());
+  }
+  return hits;
+}
+
 // Against every choice of one hit per operand, on random documents: the
 // documents that match, and the hits that are on some matching group.
-TEST(NearTest, ChainsAgreeWithABruteForce) {
-  struct Query {
-    const char *text;
-    std::vector<int> operands; // indexes into the vocabulary
-  };
-  const std::vector<Query> queries = {
-      {"a ~ b", {0, 1}},
-      {"a ~ a", {0, 0}},
-      {"a ~ b ~ c", {0, 1, 2}},
-      {"a ~ b ~ c ~ d", {0, 1, 2, 3}},
-      {"a ~ a ~ b", {0, 0, 1}},
-      {"c ~ a ~ b ~ a", {2, 0, 1, 0}},
-  };
+TEST(NearTest, AgreesWithABruteForce) {
+  const std::vector<std::vector<int>> queries = {
+      {0, 1}, {0, 0}, {0, 1, 2}, {0, 1, 2, 3}, {0, 0, 1}, {2, 0, 1, 0}};
   const char *vocabulary[] = {"a", "b", "c", "d", "x"};
-  constexpr int kDistance = 4; // DEFAULT_NEAR_SIZE
+  constexpr size_t kDistance = 4; // DEFAULT_NEAR_SIZE
+  auto within_distance = [](std::vector<size_t> chosen) {
+    std::sort(chosen.begin(), chosen.end());
+    for (size_t i = 1; i < chosen.size(); i++) {
+      if (chosen[i] - chosen[i - 1] > kDistance) {
+        return false;
+      }
+    }
+    return true;
+  };
 
   std::mt19937 rng(11);
   for (int round = 0; round < 1500; round++) {
     std::string text;
-    std::vector<std::vector<int>> positions(5);
+    std::vector<std::vector<size_t>> positions(5);
     int length = 1 + rng() % 18;
     for (int i = 0; i < length; i++) {
       int word = rng() % 5;
@@ -3234,47 +3279,18 @@ TEST(NearTest, ChainsAgreeWithABruteForce) {
     InMemoryIndexer indexer(invidx, normalizer);
     indexer.index_document(0, UTF8PlainTextTokenizer(text));
 
-    for (const auto &query : queries) {
-      std::set<size_t> expected;
-      std::vector<size_t> choice(query.operands.size(), 0);
-      bool possible = true;
-      for (int operand : query.operands) {
-        possible = possible && !positions[operand].empty();
+    for (const auto &operands : queries) {
+      std::string query;
+      for (int operand : operands) {
+        query +=
+            (query.empty() ? "" : " ~ ") + std::string(vocabulary[operand]);
       }
-      while (possible) {
-        std::vector<int> chosen;
-        for (size_t j = 0; j < choice.size(); j++) {
-          chosen.push_back(positions[query.operands[j]][choice[j]]);
-        }
-        auto sorted = chosen;
-        std::sort(sorted.begin(), sorted.end());
-        bool group = true;
-        for (size_t i = 1; i < sorted.size(); i++) {
-          group = group && sorted[i] - sorted[i - 1] <= kDistance;
-        }
-        if (group) {
-          expected.insert(chosen.begin(), chosen.end());
-        }
-        size_t j = 0;
-        for (; j < choice.size(); j++) {
-          if (++choice[j] < positions[query.operands[j]].size()) {
-            break;
-          }
-          choice[j] = 0;
-        }
-        possible = j < choice.size();
-      }
-
-      auto postings =
-          perform_search(invidx, *parse_query(normalizer, query.text));
-      std::set<size_t> actual;
-      if (postings->size() == 1) {
-        auto hits = hit_positions(*postings, 0);
-        actual.insert(hits.begin(), hits.end());
-      }
-      EXPECT_EQ(expected, actual) << query.text << " on '" << text << "'";
+      auto expected = hits_on_some_group(positions, operands, within_distance);
+      auto postings = perform_search(invidx, *parse_query(normalizer, query));
+      EXPECT_EQ(expected, hit_set(*postings))
+          << query << " on '" << text << "'";
       EXPECT_EQ(expected.empty() ? 0u : 1u, postings->size())
-          << query.text << " on '" << text << "'";
+          << query << " on '" << text << "'";
     }
   }
 }
@@ -3485,48 +3501,24 @@ TEST(SameScopeTest, AgreesWithABruteForce) {
     InMemoryIndexer indexer(invidx, normalizer);
     indexer.index_document(0, UTF8PlainTextTokenizer(text));
     invidx.set_scope_ids("p", 0, scope_ids);
+    auto in_one_scope = [&](const std::vector<size_t> &chosen) {
+      return std::all_of(chosen.begin(), chosen.end(), [&](size_t position) {
+        return scope_ids[position] == scope_ids[chosen[0]];
+      });
+    };
 
     for (const auto &operands : queries) {
-      std::set<size_t> expected;
-      std::vector<size_t> choice(operands.size(), 0);
-      bool possible = true;
-      for (int operand : operands) {
-        possible = possible && !positions[operand].empty();
-      }
-      while (possible) {
-        std::set<size_t> scopes;
-        std::vector<size_t> chosen;
-        for (size_t j = 0; j < choice.size(); j++) {
-          chosen.push_back(positions[operands[j]][choice[j]]);
-          scopes.insert(scope_ids[chosen.back()]);
-        }
-        if (scopes.size() == 1) {
-          expected.insert(chosen.begin(), chosen.end());
-        }
-        size_t j = 0;
-        for (; j < choice.size(); j++) {
-          if (++choice[j] < positions[operands[j]].size()) {
-            break;
-          }
-          choice[j] = 0;
-        }
-        possible = j < choice.size();
-      }
-
       std::vector<std::u32string> terms;
       std::string label;
       for (int operand : operands) {
         terms.emplace_back(1, static_cast<char32_t>(vocabulary[operand][0]));
         label += vocabulary[operand];
       }
+      auto expected = hits_on_some_group(positions, operands, in_one_scope);
       auto postings =
           perform_search(invidx, same_scope_expr("p", terms), &invidx);
-      std::set<size_t> actual;
-      if (postings->size() == 1) {
-        auto hits = hit_positions(*postings, 0);
-        actual.insert(hits.begin(), hits.end());
-      }
-      EXPECT_EQ(expected, actual) << label << " on '" << text << "'";
+      EXPECT_EQ(expected, hit_set(*postings))
+          << label << " on '" << text << "'";
       EXPECT_EQ(expected.empty() ? 0u : 1u, postings->size())
           << label << " on '" << text << "'";
     }

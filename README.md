@@ -87,7 +87,9 @@ for (size_t i = 0; i < result->size(); i++) {
 
 With more than two terms (`a ~ b ~ c`), each has to start within 4 positions
 of the ones before it. A NEAR result holds every hit that is part of some
-match, so in `a b x a`, `a ~ x` highlights both `a`s.
+match, so in `a b x a`, `a ~ x` highlights both `a`s. That holds up to six
+terms; past that, finding every match costs too much, and a simpler walk
+stands in that can miss some.
 
 Terms are tokenized and normalized in the same way as documents, so Unicode
 terms work as long as the tokenizer indexed them. See
