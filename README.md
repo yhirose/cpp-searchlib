@@ -180,6 +180,18 @@ skipping any term whose length alone puts it out of range.
 `term_count_score`, `tf_idf_score` and `bm25_score` are available to score
 each search result. Ranking is up to the caller.
 
+`bm25_score` is the BM25 that Lucene and Tantivy use. A term in `n` of the
+`N` documents adds, to a document of `dl` terms that carries it `tf` times,
+
+```
+idf * tf * (k1 + 1) / (tf + k1 * (1 - b + b * dl / avgdl))
+idf = ln(1 + (N - n + 0.5) / (n + 0.5))
+```
+
+with `k1` = 1.2 and `b` = 0.75 unless given. The idf stays positive however
+common the term is, so carrying a common term more often never costs a
+document rank.
+
 `top_k` collects the k highest-scoring hits using a bounded min-heap
 (`O(n log k)` instead of scoring and sorting every hit):
 

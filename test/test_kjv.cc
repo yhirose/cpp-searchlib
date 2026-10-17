@@ -57,14 +57,14 @@ TEST(KJVTest, SimpleTest) {
     EXPECT_AP(0.298, tf_idf_score(invidx, *expr, *postings, 6));
     EXPECT_AP(0.385, tf_idf_score(invidx, *expr, *postings, 7));
 
-    EXPECT_AP(0.659, bm25_score(invidx, *expr, *postings, 0));
-    EXPECT_AP(1.751, bm25_score(invidx, *expr, *postings, 1));
-    EXPECT_AP(2.144, bm25_score(invidx, *expr, *postings, 2));
-    EXPECT_AP(0.499, bm25_score(invidx, *expr, *postings, 3));
-    EXPECT_AP(0.474, bm25_score(invidx, *expr, *postings, 4));
-    EXPECT_AP(0.474, bm25_score(invidx, *expr, *postings, 5));
-    EXPECT_AP(0.374, bm25_score(invidx, *expr, *postings, 6));
-    EXPECT_AP(0.587, bm25_score(invidx, *expr, *postings, 7));
+    EXPECT_AP(7.75383, bm25_score(invidx, *expr, *postings, 0));
+    EXPECT_AP(9.66754, bm25_score(invidx, *expr, *postings, 1));
+    EXPECT_AP(10.0491, bm25_score(invidx, *expr, *postings, 2));
+    EXPECT_AP(7.20525, bm25_score(invidx, *expr, *postings, 3));
+    EXPECT_AP(7.10472, bm25_score(invidx, *expr, *postings, 4));
+    EXPECT_AP(7.10472, bm25_score(invidx, *expr, *postings, 5));
+    EXPECT_AP(6.64141, bm25_score(invidx, *expr, *postings, 6));
+    EXPECT_AP(7.52467, bm25_score(invidx, *expr, *postings, 7));
   }
 
   {
@@ -87,9 +87,9 @@ TEST(KJVTest, SimpleTest) {
     EXPECT_AP(0.556, tf_idf_score(invidx, *expr, *postings, 1));
     EXPECT_AP(1.051, tf_idf_score(invidx, *expr, *postings, 2));
 
-    EXPECT_AP(0.816, bm25_score(invidx, *expr, *postings, 0));
-    EXPECT_AP(0.775, bm25_score(invidx, *expr, *postings, 1));
-    EXPECT_AP(1.283, bm25_score(invidx, *expr, *postings, 2));
+    EXPECT_AP(11.7824, bm25_score(invidx, *expr, *postings, 0));
+    EXPECT_AP(11.618, bm25_score(invidx, *expr, *postings, 1));
+    EXPECT_AP(14.6631, bm25_score(invidx, *expr, *postings, 2));
   }
 }
 

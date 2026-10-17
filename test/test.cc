@@ -858,6 +858,64 @@ TEST(TF_IDF_Test, TF_IDF) {
   }
 }
 
+// The BM25 Lucene and Tantivy use: the term's count in the document,
+// with the length weighed once, by norm, and idf = ln(1 + (N - n + 0.5) /
+// (n + 0.5)). "a" is in two of the three documents, where the idf without
+// the 1 inside the log is negative. The three ways to get a score agree.
+TEST(BM25Test, ScoresAreTheStandardFormula) {
+  InMemoryInvertedIndex<TextRange> invidx;
+  InMemoryIndexer indexer(invidx, normalizer);
+  indexer.index_document(0, UTF8PlainTextTokenizer("a b"));
+  indexer.index_document(1, UTF8PlainTextTokenizer("a a b c"));
+  indexer.index_document(2, UTF8PlainTextTokenizer("c d"));
+
+  auto expected = [](double count, double dl) {
+    const double N = 3, n = 2, avgdl = 8.0 / 3, k1 = 1.2, b = 0.75;
+    auto idf = std::log(1 + (N - n + 0.5) / (n + 0.5));
+    return idf * count * (k1 + 1) / (count + k1 * (1 - b + b * dl / avgdl));
+  };
+
+  auto expr = *parse_query(normalizer, "a");
+  auto result = perform_search(invidx, expr);
+  ASSERT_EQ(2, result->size());
+  BM25Scorer scorer(invidx, expr);
+  const double want[] = {expected(1, 2), expected(2, 4)};
+  for (size_t i = 0; i < 2; i++) {
+    EXPECT_NEAR(want[i], bm25_score(invidx, expr, *result, i), 1e-12) << i;
+    EXPECT_NEAR(want[i], scorer(*result, i), 1e-12) << i;
+  }
+
+  auto ranked = bm25_top_k(invidx, expr, 10);
+  ASSERT_EQ(2, ranked.hits.size());
+  EXPECT_EQ(1, ranked.postings->document_ordinal(ranked.hits[0].index));
+  EXPECT_NEAR(want[1], ranked.hits[0].score, 1e-12);
+  EXPECT_NEAR(want[0], ranked.hits[1].score, 1e-12);
+}
+
+// A term in most of the documents still counts for the documents that carry
+// it more often. With a negative idf it counted against them: "the the cat"
+// ranked below "the cat dog", and both below zero.
+TEST(BM25Test, ACommonTermRanksTheDocumentCarryingItMoreFirst) {
+  InMemoryInvertedIndex<TextRange> invidx;
+  InMemoryIndexer indexer(invidx, normalizer);
+  indexer.index_document(0, UTF8PlainTextTokenizer("the cat dog"));
+  indexer.index_document(1, UTF8PlainTextTokenizer("the the cat"));
+  indexer.index_document(2, UTF8PlainTextTokenizer("dog bird fish"));
+
+  for (auto query : {"the", "the | fish"}) {
+    auto ranked = bm25_top_k(invidx, *parse_query(normalizer, query), 10);
+    std::vector<size_t> order;
+    for (const auto &hit : ranked.hits) {
+      order.push_back(ranked.postings->document_ordinal(hit.index));
+      EXPECT_GT(hit.score, 0.0) << query;
+    }
+    auto rank = [&](size_t ordinal) {
+      return std::find(order.begin(), order.end(), ordinal) - order.begin();
+    };
+    EXPECT_LT(rank(1), rank(0)) << query;
+  }
+}
+
 // One scorer scoring one result after another, the first freed before the
 // second is built (which can put it at the same address): on the compressed
 // backend, where the scorer reads in blocks, every score is the one

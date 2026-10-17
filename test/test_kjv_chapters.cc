@@ -78,14 +78,14 @@ TEST(KJVChapterTest, SimpleTest) {
     EXPECT_AP(0.0142035, tf_idf_score(invidx, *expr, *postings, 6));
     EXPECT_AP(0.0227614, tf_idf_score(invidx, *expr, *postings, 7));
 
-    EXPECT_AP(0.00579213, bm25_score(invidx, *expr, *postings, 0));
-    EXPECT_AP(0.0694968, bm25_score(invidx, *expr, *postings, 1));
-    EXPECT_AP(0.0441665, bm25_score(invidx, *expr, *postings, 2));
-    EXPECT_AP(0.0573186, bm25_score(invidx, *expr, *postings, 3));
-    EXPECT_AP(0.0550286, bm25_score(invidx, *expr, *postings, 4));
-    EXPECT_AP(0.0118435, bm25_score(invidx, *expr, *postings, 5));
-    EXPECT_AP(0.0311316, bm25_score(invidx, *expr, *postings, 6));
-    EXPECT_AP(0.0674305, bm25_score(invidx, *expr, *postings, 7));
+    EXPECT_AP(3.54165, bm25_score(invidx, *expr, *postings, 0));
+    EXPECT_AP(6.31553, bm25_score(invidx, *expr, *postings, 1));
+    EXPECT_AP(5.85041, bm25_score(invidx, *expr, *postings, 2));
+    EXPECT_AP(6.12275, bm25_score(invidx, *expr, *postings, 3));
+    EXPECT_AP(6.08099, bm25_score(invidx, *expr, *postings, 4));
+    EXPECT_AP(4.35479, bm25_score(invidx, *expr, *postings, 5));
+    EXPECT_AP(5.46767, bm25_score(invidx, *expr, *postings, 6));
+    EXPECT_AP(6.28585, bm25_score(invidx, *expr, *postings, 7));
   }
 
   {
@@ -108,9 +108,9 @@ TEST(KJVChapterTest, SimpleTest) {
     EXPECT_AP(0.0292668, tf_idf_score(invidx, *expr, *postings, 1));
     EXPECT_AP(0.0468876, tf_idf_score(invidx, *expr, *postings, 2));
 
-    EXPECT_AP(0.10807, bm25_score(invidx, *expr, *postings, 0));
-    EXPECT_AP(0.0794798, bm25_score(invidx, *expr, *postings, 1));
-    EXPECT_AP(0.0997504, bm25_score(invidx, *expr, *postings, 2));
+    EXPECT_AP(9.76625, bm25_score(invidx, *expr, *postings, 0));
+    EXPECT_AP(8.9093, bm25_score(invidx, *expr, *postings, 1));
+    EXPECT_AP(9.68959, bm25_score(invidx, *expr, *postings, 2));
   }
 
   {
@@ -153,9 +153,9 @@ TEST(KJVChapterTest, SimpleTest) {
     {
       size_t i = 0;
       for (auto expected :
-           {0.00951014, 0.0283386, 0.131482, 0.0599203, 0.117288, 0.148009,
-            0.210045, 0.110728, 0.0912804, 0.0803526, 0.0913933, 0.102833,
-            0.0658579, 0.0176168, 0.0690821, 0.0929295, 0.0849572, 0.0116986}) {
+           {5.63071, 6.71593, 9.47804, 9.99653, 9.60278, 10.9037, 11.2725,
+            11.572, 9.18432, 8.91402, 9.25727, 10.8556, 8.56498, 5.98201,
+            10.0077, 8.4222, 10.2488, 5.35214}) {
         EXPECT_AP(expected, bm25_score(invidx, *expr, *postings, i));
         i++;
       }

@@ -477,7 +477,7 @@ public:
   // The number of live documents carrying the term: a tombstoned document
   // still sits in the term's postings until the index is rebuilt, but it is
   // not counted here, so df never exceeds document_count() -- which BM25's
-  // idf relies on to stay a real number. Implementations keep it current
+  // idf relies on to stay positive. Implementations keep it current
   // rather than work it out per call: bm25_score and tf_idf_score ask for it
   // once per scored hit.
   virtual size_t df(const std::u32string &str) const = 0;
@@ -7010,9 +7010,12 @@ namespace detail {
 // bm25_score, BM25Scorer and MaxScore's bounds -- whose scores have to agree
 // to the bit, which sharing the arithmetic keeps and copying it does not.
 //
-// The idf of a term in `n` of `N` live documents.
+// The idf of a term in `n` of `N` live documents, as Lucene computes it. The
+// 1 inside the log keeps it positive: without it, a term in more than half
+// the documents gets a negative idf, which ranks a document lower the more
+// often it carries the term.
 inline double bm25_idf(double N, double n) {
-  return std::log2((N - n + 0.5) / (n + 0.5));
+  return std::log(1.0 + (N - n + 0.5) / (n + 0.5));
 }
 
 // The length term of the denominator for a document of `dl` terms.
@@ -7021,7 +7024,10 @@ inline double bm25_norm(double k1, double b, double dl, double avgdl) {
 }
 
 // What one term adds to a document's score, for the document's `norm` and the
-// term's `tf` there (0 when the document does not carry it).
+// term's `tf` there: how many times the document carries it, 0 if it does
+// not. The count itself, not a share of the document's length -- norm already
+// weighs the length, and dividing by it too counts it twice and keeps tf so
+// far below k1 that it never saturates.
 inline double bm25_term(double idf, double tf, double k1, double norm) {
   return idf * ((tf * (k1 + 1.0)) / (tf + norm));
 }
@@ -7040,8 +7046,8 @@ inline double bm25_score(const IInvertedIndex &invidx, const Expression &expr,
   double score = 0.0;
   detail::enumerate_terms(invidx, expr, [&](const auto &term) {
     auto n = static_cast<double>(invidx.df(term));
-    score += detail::bm25_term(detail::bm25_idf(N, n), invidx.tf(term, ordinal),
-                               k1, norm);
+    auto tf = static_cast<double>(invidx.term_count(term, ordinal));
+    score += detail::bm25_term(detail::bm25_idf(N, n), tf, k1, norm);
   });
   return score;
 }
@@ -7061,8 +7067,8 @@ inline BM25Scorer::BM25Scorer(const IInvertedIndex &invidx,
     auto postings = invidx.postings(term);
     auto size = postings->size();
     // df, not the postings' size: the postings still list tombstoned
-    // documents, which N leaves out, and n > N would make idf the log of a
-    // negative number -- NaN.
+    // documents, which N leaves out, and n > N would push idf below zero, or
+    // to NaN once the log's argument goes negative.
     auto n = static_cast<double>(invidx.df(term));
     auto block_reads = postings->prefers_block_reads();
     windowed_ = windowed_ || block_reads;
@@ -7100,7 +7106,7 @@ inline double BM25Scorer::score_(Result &result, size_t index,
     auto i = detail::find_from_cursor(reader, term.size, term.block_reads,
                                       term.cursor, term.last_ordinal, ordinal);
     if (i < term.size) {
-      tf = static_cast<double>(reader.search_hit_count(i)) / dl;
+      tf = static_cast<double>(reader.search_hit_count(i));
     }
     score += detail::bm25_term(term.idf, tf, k1_, norm);
   }
@@ -7191,8 +7197,8 @@ struct MaxScore {
     // BM25Scorer::score_'s arithmetic for one term a document carries.
     auto contribution = [&](double idf, size_t count, size_t length) {
       auto dl = static_cast<double>(length);
-      auto tf = static_cast<double>(count) / dl;
-      return bm25_term(idf, tf, k1, bm25_norm(k1, b, dl, avgdl));
+      return bm25_term(idf, static_cast<double>(count), k1,
+                       bm25_norm(k1, b, dl, avgdl));
     };
 
     constexpr auto kEnd = std::numeric_limits<size_t>::max();
@@ -7224,28 +7230,16 @@ struct MaxScore {
     // round: each term adds at most |idf| * (k1 + 1).
     double magnitude = 1.0;
     for (const auto &term : scorer.terms_) {
-      // A term with idf <= 0 (in more than half the documents) never adds
-      // anything positive, so its bound is 0 with no need to look. The
-      // others take one pass over their postings: a bound from idf alone,
-      // idf * (k1 + 1), is what tf saturates to, but tf here is a share of
-      // the document's length and saturates nowhere near it -- on KJV the
-      // real maximum is 7% to 59% of that, and so loose a bound prunes
-      // next to nothing.
-      double bound = 0.0;
-      if (scorer.terms_.size() == 1) {
-        // With one term there is nothing to skip to: its bound would only
-        // ever end the walk at the last document, and finding it is a whole
-        // extra pass over the list. Each document's own contribution still
-        // prunes it before the scorer runs.
-        bound = std::numeric_limits<double>::infinity();
-      } else if (term.idf > 0.0) {
-        PostingsWindow scan(term.postings.get());
-        for (size_t i = 0; i < term.size; i++) {
-          auto count = scan.search_hit_count(i);
-          auto length = invidx.document_term_count(scan.document_ordinal(i));
-          bound = std::max(bound, contribution(term.idf, count, length));
-        }
-      }
+      // What a term adds grows with its count toward idf * (k1 + 1) and
+      // stays below it, since norm is above 0 in any document that carries
+      // the term. The bound is never below 0, what the term adds where it
+      // is absent; idf is positive whenever df <= N, as IInvertedIndex::df
+      // promises, so the guard only matters for an index that breaks that.
+      //
+      // A pass over the postings for each term's real maximum would be
+      // tighter, but not by enough to pay for the pass: on KJV x10 it made
+      // bm25_top_k 1.2x to 4.8x slower than this bound.
+      double bound = term.idf > 0.0 ? term.idf * (k1 + 1.0) : 0.0;
       lists.push_back(List{PostingsWindow(term.postings.get()), term.size, 0,
                            kEnd, term.idf, bound});
       settle(lists.back());
