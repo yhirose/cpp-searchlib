@@ -1584,6 +1584,191 @@ TEST(SameScopeTest, SetScopeIdsRejectsNonMonotone) {
               std::invalid_argument);
 }
 
+// Each document's ids are kept as differences from its first, in as few
+// bits as its last needs: none when they are all one id, up to all 64. Every
+// width reads back what was set, before and after a save and load, and the
+// file says the same thing again when saved once more.
+TEST(SameScopeTest, ScopeIdsOfEveryWidthReadBack) {
+  const auto big = std::numeric_limits<size_t>::max() - 1;
+  const std::vector<std::vector<size_t>> cases = {
+      {7, 7, 7},                                              // width 0
+      {0, 0, 1, 1, 2},                                        // width 2
+      {1000000000000000, 1000000000000003, 1000000000000003}, // a large base
+      {0, 1, size_t(1) << 62},                                // width 63
+      {0, big / 2, big},                                      // width 64
+      {big, big, big}, // width 0 at the top
+  };
+  InMemoryInvertedIndex<TextRange> invidx;
+  InMemoryIndexer indexer(invidx, normalizer);
+  for (size_t key = 0; key < cases.size(); key++) {
+    std::string text;
+    for (size_t i = 0; i < cases[key].size(); i++) {
+      text += i ? " w" : "w";
+    }
+    indexer.index_document(key, UTF8PlainTextTokenizer(text));
+    invidx.set_scope_ids("p", key, cases[key]);
+  }
+
+  auto expect_cases = [&](const InMemoryInvertedIndex<TextRange> &index) {
+    for (size_t key = 0; key < cases.size(); key++) {
+      auto ordinal = *index.document_ordinal(key);
+      const auto &ids = cases[key];
+      std::vector<size_t> positions(ids.size() + 1);
+      std::iota(positions.begin(), positions.end(), size_t(0));
+      std::vector<size_t> out(positions.size());
+      index.scope_ids("p", ordinal, positions.data(), positions.size(),
+                      out.data());
+      for (size_t i = 0; i < ids.size(); i++) {
+        EXPECT_EQ(ids[i], index.scope_id("p", ordinal, i)) << key << "@" << i;
+        EXPECT_EQ(ids[i], out[i]) << key << "@" << i;
+      }
+      // Past the document's end is no scope, not another document's ids.
+      EXPECT_EQ(static_cast<size_t>(-1), out.back()) << key;
+      EXPECT_EQ(static_cast<size_t>(-1),
+                index.scope_id("p", ordinal, ids.size()))
+          << key;
+    }
+  };
+  expect_cases(invidx);
+
+  std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+  invidx.save(ss);
+  auto saved = ss.str();
+  InMemoryInvertedIndex<TextRange> loaded;
+  loaded.load(ss);
+  expect_cases(loaded);
+  std::stringstream again(std::ios::in | std::ios::out | std::ios::binary);
+  loaded.save(again);
+  EXPECT_EQ(saved, again.str());
+}
+
+// SIZE_MAX is scope_id's answer for no scope, and the saved form cannot hold
+// it; set_scope_ids says so instead of the save failing later.
+TEST(SameScopeTest, SetScopeIdsRejectsSizeMax) {
+  InMemoryInvertedIndex<TextRange> invidx;
+  InMemoryIndexer indexer(invidx, normalizer);
+  indexer.index_document(0, UTF8PlainTextTokenizer("a b"));
+  EXPECT_THROW(
+      invidx.set_scope_ids("p", 0, {0, std::numeric_limits<size_t>::max()}),
+      std::invalid_argument);
+  EXPECT_FALSE(invidx.has_scope("p", 0));
+}
+
+// Setting a document's ids again leaves the old ones in the buffer until the
+// dead outweigh the live and the buffer is packed again. However often that
+// happens, every document reads back its latest ids, and a copy taken
+// along the way keeps the ones it saw.
+TEST(SameScopeTest, ReplacingScopeIdsKeepsEveryDocumentRight) {
+  std::mt19937 rng(9);
+  InMemoryInvertedIndex<TextRange> invidx;
+  InMemoryIndexer indexer(invidx, normalizer);
+  std::vector<size_t> lengths;
+  for (size_t key = 0; key < 30; key++) {
+    lengths.push_back(1 + rng() % 40);
+    std::string text;
+    for (size_t i = 0; i < lengths.back(); i++) {
+      text += i ? " w" : "w";
+    }
+    indexer.index_document(key, UTF8PlainTextTokenizer(text));
+  }
+
+  std::map<size_t, std::vector<size_t>> model;
+  auto expect_model = [&](const InMemoryInvertedIndex<TextRange> &index,
+                          const std::map<size_t, std::vector<size_t>> &want) {
+    for (size_t key = 0; key < lengths.size(); key++) {
+      auto it = want.find(key);
+      ASSERT_EQ(it != want.end(), index.has_scope("p", key)) << key;
+      if (it == want.end()) {
+        continue;
+      }
+      for (size_t i = 0; i < it->second.size(); i++) {
+        ASSERT_EQ(it->second[i], index.scope_id("p", key, i))
+            << key << "@" << i;
+      }
+    }
+  };
+
+  std::optional<InMemoryInvertedIndex<TextRange>> copy;
+  std::map<size_t, std::vector<size_t>> copied;
+  for (int round = 0; round < 400; round++) {
+    auto key = rng() % lengths.size();
+    std::vector<size_t> ids(lengths[key]);
+    size_t id = rng() % 1000;
+    for (auto &value : ids) {
+      value = id += (rng() % 5 == 0) * (1 + rng() % 300);
+    }
+    invidx.set_scope_ids("p", key, ids);
+    model[key] = ids;
+    expect_model(invidx, model);
+    if (round == 150) {
+      copy.emplace(invidx);
+      copied = model;
+    }
+  }
+  expect_model(*copy, copied);
+}
+
+// The scope section is checked against the documents as it is read, as
+// set_scope_ids checks its arguments: ids for a document the file does not
+// have, or that do not cover their document position for position, are a
+// corrupt file.
+TEST(CorruptIndexTest, ScopeIdsMustFitTheirDocument) {
+  InMemoryInvertedIndex<TextRange> invidx;
+  InMemoryIndexer indexer(invidx, normalizer);
+  indexer.index_document(0, UTF8PlainTextTokenizer("a b c"));
+  indexer.index_document(1, UTF8PlainTextTokenizer("a b c d"));
+  invidx.set_scope_ids("scopename", 0, {0, 0, 1});
+  invidx.set_scope_ids("scopename", 1, {0, 1, 1, 2});
+  std::stringstream ss(std::ios::in | std::ios::out | std::ios::binary);
+  invidx.save(ss);
+  const auto bytes = ss.str();
+
+  // The section names the scope, counts its documents, then gives each
+  // ordinal ahead of its ids.
+  std::string name = "scopename";
+  uint64_t name_size = name.size();
+  uint64_t documents = 2;
+  uint64_t first = 0;
+  std::string head(reinterpret_cast<const char *>(&name_size), 8);
+  head += name;
+  head += std::string(reinterpret_cast<const char *>(&documents), 8);
+  head += std::string(reinterpret_cast<const char *>(&first), 8);
+  auto at = bytes.find(head);
+  ASSERT_NE(std::string::npos, at);
+  auto first_ordinal = at + head.size() - 8;
+  // The second ordinal is the 1 after the first document's ids.
+  uint64_t one = 1;
+  auto second_ordinal = bytes.find(
+      std::string(reinterpret_cast<const char *>(&one), 8), first_ordinal + 8);
+  ASSERT_NE(std::string::npos, second_ordinal);
+
+  auto expect_refused = [&](std::string patched, const char *what) {
+    std::stringstream in(patched, std::ios::in | std::ios::binary);
+    InMemoryInvertedIndex<TextRange> loaded;
+    EXPECT_THROW(loaded.load(in), std::runtime_error) << what;
+  };
+  {
+    auto patched = bytes;
+    uint64_t past_the_end = 50;
+    std::memcpy(&patched[first_ordinal], &past_the_end, 8);
+    expect_refused(patched, "a document the file does not have");
+  }
+  {
+    // Each document's ids under the other's ordinal: three for four
+    // positions, four for three.
+    auto patched = bytes;
+    uint64_t zero = 0;
+    std::memcpy(&patched[first_ordinal], &one, 8);
+    std::memcpy(&patched[second_ordinal], &zero, 8);
+    expect_refused(patched, "ids that do not cover their document");
+  }
+  {
+    std::stringstream in(bytes, std::ios::in | std::ios::binary);
+    InMemoryInvertedIndex<TextRange> loaded;
+    EXPECT_NO_THROW(loaded.load(in));
+  }
+}
+
 TEST(SameScopeTest, PersistedScopeSurvivesRoundtrip) {
   auto invidx = same_scope_index();
 

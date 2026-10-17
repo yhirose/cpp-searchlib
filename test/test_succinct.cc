@@ -49,28 +49,6 @@ static void verify_against_naive(const std::vector<bool> &bits) {
   for (size_t k = 0; k < zero_positions.size(); k++) {
     ASSERT_EQ(zero_positions[k], bv.select0(k)) << "select0(" << k << ")";
   }
-
-  // forward_select1 from every position: the n-th one after it, when that
-  // lies within max_words words past its word, and size() otherwise.
-  for (size_t position = 0; position < bits.size(); position++) {
-    auto after = static_cast<size_t>(
-        std::upper_bound(one_positions.begin(), one_positions.end(), position) -
-        one_positions.begin());
-    for (size_t n : {size_t(1), size_t(2), size_t(9), size_t(100)}) {
-      for (size_t max_words : {size_t(0), size_t(1), size_t(8)}) {
-        auto expected = bv.size();
-        if (after + n - 1 < one_positions.size()) {
-          auto target = one_positions[after + n - 1];
-          if (target / 64 <= position / 64 + max_words) {
-            expected = target;
-          }
-        }
-        ASSERT_EQ(expected, bv.forward_select1(position, n, max_words))
-            << "forward_select1(" << position << ", " << n << ", " << max_words
-            << ")";
-      }
-    }
-  }
 }
 
 TEST(BitVectorTest, EmptyAndTiny) {
@@ -148,37 +126,6 @@ static void verify_elias_fano(const std::vector<uint64_t> &values,
       ASSERT_EQ(~uint64_t(0), out[block]);
     }
     ASSERT_EQ(0u, ef.read(values.size() + 5, out.data(), block));
-  }
-
-  // access_each must answer what access() does at every index it is given:
-  // ascending with small steps (read forward), with steps too long to read
-  // forward, repeated, descending, and in no order (each a fresh select).
-  if (!values.empty()) {
-    std::vector<std::vector<size_t>> lists;
-    std::vector<size_t> all(values.size());
-    for (size_t i = 0; i < all.size(); i++) {
-      all[i] = i;
-    }
-    lists.push_back(all);
-    std::vector<size_t> strided;
-    for (size_t i = 0; i < values.size(); i += 1 + i % 700) {
-      strided.push_back(i);
-      strided.push_back(i);
-    }
-    lists.push_back(strided);
-    lists.emplace_back(all.rbegin(), all.rend());
-    std::vector<size_t> shuffled = all;
-    std::mt19937 rng(static_cast<unsigned>(values.size()));
-    std::shuffle(shuffled.begin(), shuffled.end(), rng);
-    lists.push_back(shuffled);
-    for (const auto &indexes : lists) {
-      std::vector<uint64_t> out(indexes.size());
-      ef.access_each(indexes.data(), indexes.size(), out.data());
-      for (size_t k = 0; k < indexes.size(); k++) {
-        ASSERT_EQ(values[indexes[k]], out[k])
-            << "access_each at " << indexes[k];
-      }
-    }
   }
 
   auto expect_next_geq = [&](uint64_t target) {
