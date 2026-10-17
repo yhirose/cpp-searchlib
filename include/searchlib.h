@@ -32,6 +32,7 @@
 #include <fstream>
 #include <functional>
 #include <istream>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
@@ -5286,6 +5287,12 @@ perform_fuzzy_operation(const IInvertedIndex &inverted_index,
       inverted_index, expand_fuzzy(inverted_index, expr), scope_index, filter);
 }
 
+// Near and SameScope keep, of each document every operand carries, every hit
+// on some group: one hit per operand, passing the operator's test (each within
+// the distance of the ones before it, or all in one scope). A hit that belongs
+// to a match is one worth highlighting, and one a proximity operator around
+// this one can build on: `(a ~ x) ~ c` matches when one `a` is near both.
+//
 // One operand's hit, as Near and SameScope weigh them.
 struct ProximityHit {
   size_t position;
@@ -5298,15 +5305,20 @@ struct ProximityHit {
 // the And path reuses its buffers: the walk runs once per document where all
 // cursors align, and these would otherwise be allocated every time.
 struct ProximityScratch {
-  // collect_proximity_hits
+  // collect_near_hits_greedily
   std::vector<size_t> search_hit_cursors;
   std::vector<ProximityHit> group;
-  // Both: the (position, length) of every hit kept.
+  // All: the (position, length) of every hit kept.
   std::vector<std::pair<size_t, size_t>> hits;
   // collect_near_chains
   std::vector<ProximityHit> all_hits;
   std::vector<size_t> reach;
   std::vector<int64_t> need;
+  // collect_near_pairs: each operand's hits, and those it keeps.
+  std::array<std::vector<ProximityHit>, 2> sides;
+  std::array<std::vector<std::pair<size_t, size_t>>, 2> kept;
+  // collect_same_scope_hits: each hit with its scope id.
+  std::vector<std::pair<size_t, ProximityHit>> scoped;
 };
 
 // The kept hits of one document, written out the way every IPostings reader
@@ -5328,90 +5340,26 @@ inline bool emit_unique_hits(std::vector<std::pair<size_t, size_t>> &hits,
   return !hits.empty();
 }
 
-// The hit walk SameScope shares with Near over two operands, for one document
-// every operand carries. It looks at one hit per operand at a time, in
-// position order, and asks `accept` whether that group qualifies: if so every
-// hit in it is kept and every operand moves on, otherwise only the earliest
-// one does.
+// Near's hits, for one document every operand carries and at most
+// kMaxChainOperands operands (two take collect_near_pairs' shortcut). A group
+// is one hit per operand that, in position order, each start within
+// `distance` of the furthest end so far.
 //
-// That is exact when a failing group can only be repaired by moving past its
-// earliest hit: for SameScope, where scope ids never decrease along the text,
-// and for Near over two operands, where the test is the pair's gap and so the
-// group's span. It is not for Near over more (see collect_near_chains), which
-// uses it only past kMaxChainOperands, and then it can miss groups.
-template <typename Accept>
-inline bool collect_proximity_hits(
-    const std::vector<std::shared_ptr<IPostings>> &postings_list,
-    const std::vector<size_t> &cursors, ProximityScratch &scratch,
-    std::vector<size_t> &term_positions, std::vector<size_t> &term_lengths,
-    Accept accept) {
-  auto &search_hit_cursors = scratch.search_hit_cursors;
-  auto &group = scratch.group;
-  auto &hits = scratch.hits;
-  auto slot_count = postings_list.size();
-  search_hit_cursors.assign(slot_count, 0);
-  hits.clear();
-
-  // Moves a slot to its next hit; true once it has none left.
-  auto exhausted = [&](size_t slot) {
-    return ++search_hit_cursors[slot] ==
-           postings_list[slot]->search_hit_count(cursors[slot]);
-  };
-
-  for (;;) {
-    group.clear();
-    for (size_t slot = 0; slot < slot_count; slot++) {
-      const auto &p = *postings_list[slot];
-      auto index = cursors[slot];
-      auto hit_index = search_hit_cursors[slot];
-      group.push_back(ProximityHit{p.term_position(index, hit_index),
-                                   p.term_length(index, hit_index), slot});
-    }
-    std::sort(group.begin(), group.end(), [](const auto &a, const auto &b) {
-      return std::tie(a.position, a.slot) < std::tie(b.position, b.slot);
-    });
-
-    if (accept(group)) {
-      auto done = false;
-      for (const auto &hit : group) {
-        hits.emplace_back(hit.position, hit.length);
-        done = exhausted(hit.slot) || done;
-      }
-      if (done) {
-        break;
-      }
-    } else if (exhausted(group.front().slot)) {
-      break;
-    }
-  }
-
-  return emit_unique_hits(hits, term_positions, term_lengths);
-}
-
-// Near over three or more operands.
+// Finding them takes a search, not a walk. Looking at one hit per operand at
+// a time and setting the earliest aside once a group fails keeps a hit only
+// on the group the walk reaches it in -- in `a x a`, `a ~ x` pairs x with the
+// first a and leaves the second out -- and past two operands it misses
+// groups: swapping one operand's hit for a later one can close a gap that the
+// earliest hit was not the cause of (c@1 a@4 b@9 fails on the gap before b,
+// a@5 in place of a@4 does not), so setting the earliest aside loses
+// c@1 a@5 b@9.
 //
-// The walk above is exact for two operands because its test, the gap between
-// the pair, is the span of the group, and a span only grows as the walk moves
-// right: the earliest hit can be set aside once the group fails, since any
-// group it could join has a hit at least as far right and so a span at least
-// as wide. With more operands the test is that the chosen hits, in order,
-// each start within `distance` of the furthest end so far, and that does not
-// grow with the hits: swapping one operand's hit for a later one can close a
-// gap that the earliest hit was not the cause of (c@1 a@4 b@9 fails on the
-// gap before b, a@5 in place of a@4 does not). Setting the earliest aside
-// loses c@1 a@5 b@9.
-//
-// So this looks for a group as a search: hits in position order, each one
-// either skipped or added to a group that has no hit of its operand yet and
-// that it starts close enough to. What a group's future depends on is which
-// operands it has and how far its furthest end reaches, and a larger reach is
-// never worse, so one reach per set of operands is enough: 2^k of them, for
-// the k operands. That cost caps k (kMaxChainOperands); past it the walk
-// above stands in, with the misses it can have.
-//
-// The hits that come out are those on some complete group, not one group's
-// worth consumed greedily: every hit near enough to the rest to belong to a
-// match is a hit worth highlighting.
+// So the hits are taken in position order, each either skipped or added to a
+// group that has no hit of its operand yet and that it starts close enough
+// to. What a group's future depends on is which operands it has and how far
+// its furthest end reaches, and a larger reach is never worse, so one reach
+// per set of operands is enough: 2^k of them, for the k operands. That cost
+// caps k; past it collect_near_hits_greedily stands in.
 inline constexpr size_t kMaxChainOperands = 6;
 
 inline bool collect_near_chains(
@@ -5419,6 +5367,11 @@ inline bool collect_near_chains(
     const std::vector<size_t> &cursors, size_t distance,
     ProximityScratch &scratch, std::vector<size_t> &term_positions,
     std::vector<size_t> &term_lengths) {
+  // A distance past every position is no limit at all, and capping it there
+  // keeps the arithmetic below from overflowing on one like SIZE_MAX.
+  distance =
+      std::min<size_t>(distance, std::numeric_limits<int64_t>::max() / 2);
+
   auto &hits = scratch.all_hits;
   hits.clear();
   for (size_t slot = 0; slot < postings_list.size(); slot++) {
@@ -5512,14 +5465,86 @@ inline bool collect_near_chains(
   return emit_unique_hits(used, term_positions, term_lengths);
 }
 
-inline std::shared_ptr<IPostings>
-perform_near_operation(const IInvertedIndex &inverted_index,
-                       const Expression &expr, const IScopeIndex *scope_index,
-                       const IPostings *filter) {
-  ProximityScratch scratch;
+// Near over two operands, where collect_near_chains' test comes down to the
+// gap between the pair, so each operand's hits can be read off the other's in
+// one pass rather than searched for: a hit is on a pair when the other
+// operand has one starting at or after it, within the distance of its end, or
+// one starting before it, whose end it starts within the distance of. The
+// hits before it only ever grow in number, so the furthest end among them is
+// all that needs keeping.
+inline bool
+collect_near_pairs(const std::vector<std::shared_ptr<IPostings>> &postings_list,
+                   const std::vector<size_t> &cursors, size_t distance,
+                   ProximityScratch &scratch,
+                   std::vector<size_t> &term_positions,
+                   std::vector<size_t> &term_lengths) {
+  auto &sides = scratch.sides;
+  for (size_t slot = 0; slot < 2; slot++) {
+    const auto &p = *postings_list[slot];
+    auto index = cursors[slot];
+    sides[slot].clear();
+    for (size_t h = 0; h < p.search_hit_count(index); h++) {
+      sides[slot].push_back(ProximityHit{p.term_position(index, h),
+                                         p.term_length(index, h), slot});
+    }
+  }
+
+  // Whether a hit at `position` starts within the distance of `end`; inside
+  // it is no gap at all. A difference rather than a sum, which cannot
+  // overflow whatever the distance.
+  auto starts_within = [&](size_t end, size_t position) {
+    return position < end || position - end < distance;
+  };
+
+  auto &kept = scratch.kept;
+  for (size_t slot = 0; slot < 2; slot++) {
+    const auto &other = sides[1 - slot];
+    kept[slot].clear();
+    // The other operand's first hit starting at or after this one, and the
+    // furthest end of those before it.
+    size_t next = 0;
+    size_t reach = 0;
+    for (const auto &hit : sides[slot]) {
+      for (; next < other.size() && other[next].position < hit.position;
+           next++) {
+        reach = std::max(reach, other[next].end());
+      }
+      if ((next > 0 && starts_within(reach, hit.position)) ||
+          (next < other.size() &&
+           starts_within(hit.end(), other[next].position))) {
+        kept[slot].emplace_back(hit.position, hit.length);
+      }
+    }
+  }
+  // Each side's hits come out in position order, so the two only need
+  // merging, not sorting.
+  auto &hits = scratch.hits;
+  hits.clear();
+  std::merge(kept[0].begin(), kept[0].end(), kept[1].begin(), kept[1].end(),
+             std::back_inserter(hits));
+
+  return emit_unique_hits(hits, term_positions, term_lengths);
+}
+
+// Near past kMaxChainOperands, where collect_near_chains costs too much: the
+// walk it describes, one hit per operand at a time in position order. A group
+// within the distance is kept and every operand moves on, otherwise only the
+// earliest hit does. So a hit is kept only on the group the walk reaches it
+// in, and groups can be missed altogether: past the cap Near finds less.
+inline bool collect_near_hits_greedily(
+    const std::vector<std::shared_ptr<IPostings>> &postings_list,
+    const std::vector<size_t> &cursors, size_t distance,
+    ProximityScratch &scratch, std::vector<size_t> &term_positions,
+    std::vector<size_t> &term_lengths) {
+  auto &search_hit_cursors = scratch.search_hit_cursors;
+  auto &group = scratch.group;
+  auto &hits = scratch.hits;
+  auto slot_count = postings_list.size();
+  search_hit_cursors.assign(slot_count, 0);
+  hits.clear();
 
   // Not `near`: windows.h defines that name as a macro.
-  auto within_distance = [&](const std::vector<ProximityHit> &group) {
+  auto within_distance = [&] {
     // The gap is measured from the furthest end reached so far, not just
     // the previous hit's, and a hit starting inside that reach is no gap
     // at all: a phrase operand can span past the start of the next one
@@ -5527,8 +5552,7 @@ perform_near_operation(const IInvertedIndex &inverted_index,
     auto reach = group.front().end();
     for (size_t i = 1; i < group.size(); i++) {
       const auto &hit = group[i];
-      if (hit.position >= reach &&
-          hit.position + 1 - reach > expr.near_operation_distance) {
+      if (hit.position >= reach && hit.position + 1 - reach > distance) {
         return false;
       }
       reach = std::max(reach, hit.end());
@@ -5536,32 +5560,126 @@ perform_near_operation(const IInvertedIndex &inverted_index,
     return true;
   };
 
+  // Moves a slot to its next hit; true once it has none left.
+  auto exhausted = [&](size_t slot) {
+    return ++search_hit_cursors[slot] ==
+           postings_list[slot]->search_hit_count(cursors[slot]);
+  };
+
+  for (;;) {
+    group.clear();
+    for (size_t slot = 0; slot < slot_count; slot++) {
+      const auto &p = *postings_list[slot];
+      auto index = cursors[slot];
+      auto hit_index = search_hit_cursors[slot];
+      group.push_back(ProximityHit{p.term_position(index, hit_index),
+                                   p.term_length(index, hit_index), slot});
+    }
+    std::sort(group.begin(), group.end(), [](const auto &a, const auto &b) {
+      return std::tie(a.position, a.slot) < std::tie(b.position, b.slot);
+    });
+
+    if (within_distance()) {
+      auto done = false;
+      for (const auto &hit : group) {
+        hits.emplace_back(hit.position, hit.length);
+        done = exhausted(hit.slot) || done;
+      }
+      if (done) {
+        break;
+      }
+    } else if (exhausted(group.front().slot)) {
+      break;
+    }
+  }
+
+  return emit_unique_hits(hits, term_positions, term_lengths);
+}
+
+// SameScope's hits, for one document every operand carries: every hit in a
+// scope where each operand has one, since with one hit of each other operand
+// there it makes a group. The hits are grouped by the scope ids themselves
+// rather than by runs along the text, so that holds however an IScopeIndex
+// numbers its scopes.
+template <typename ScopeOf>
+inline bool collect_same_scope_hits(
+    const std::vector<std::shared_ptr<IPostings>> &postings_list,
+    const std::vector<size_t> &cursors, ScopeOf scope_of,
+    ProximityScratch &scratch, std::vector<size_t> &term_positions,
+    std::vector<size_t> &term_lengths) {
+  auto &scoped = scratch.scoped;
+  scoped.clear();
+  for (size_t slot = 0; slot < postings_list.size(); slot++) {
+    const auto &p = *postings_list[slot];
+    auto index = cursors[slot];
+    for (size_t h = 0; h < p.search_hit_count(index); h++) {
+      auto position = p.term_position(index, h);
+      scoped.emplace_back(
+          scope_of(position),
+          ProximityHit{position, p.term_length(index, h), slot});
+    }
+  }
+  std::sort(scoped.begin(), scoped.end(), [](const auto &a, const auto &b) {
+    return std::tie(a.first, a.second.slot) < std::tie(b.first, b.second.slot);
+  });
+
+  auto &hits = scratch.hits;
+  hits.clear();
+  for (size_t begin = 0; begin < scoped.size();) {
+    // One scope's hits, and how many operands they cover: by slot within
+    // the scope, so each change of slot is one more operand.
+    auto end = begin + 1;
+    size_t operands = 1;
+    for (; end < scoped.size() && scoped[end].first == scoped[begin].first;
+         end++) {
+      if (scoped[end].second.slot != scoped[end - 1].second.slot) {
+        operands++;
+      }
+    }
+    if (operands == postings_list.size()) {
+      for (auto i = begin; i < end; i++) {
+        hits.emplace_back(scoped[i].second.position, scoped[i].second.length);
+      }
+    }
+    begin = end;
+  }
+
+  return emit_unique_hits(hits, term_positions, term_lengths);
+}
+
+inline std::shared_ptr<IPostings>
+perform_near_operation(const IInvertedIndex &inverted_index,
+                       const Expression &expr, const IScopeIndex *scope_index,
+                       const IPostings *filter) {
+  ProximityScratch scratch;
+  auto distance = expr.near_operation_distance;
+
   return intersect_postings(
       intersection_operands(inverted_index, expr.nodes, scope_index, filter)
           .postings,
       filter,
       [&](const auto &postings_list, const auto &cursors, size_t /*ordinal*/,
           auto &term_positions, auto &term_lengths) {
-        // The hit walk is exact for two operands; three or more need the
-        // search (see collect_near_chains), up to the cap on its cost.
-        if (postings_list.size() >= 3 &&
-            postings_list.size() <= kMaxChainOperands) {
-          return collect_near_chains(postings_list, cursors,
-                                     expr.near_operation_distance, scratch,
+        if (postings_list.size() == 2) {
+          return collect_near_pairs(postings_list, cursors, distance, scratch,
+                                    term_positions, term_lengths);
+        }
+        if (postings_list.size() <= kMaxChainOperands) {
+          return collect_near_chains(postings_list, cursors, distance, scratch,
                                      term_positions, term_lengths);
         }
-        return collect_proximity_hits(postings_list, cursors, scratch,
-                                      term_positions, term_lengths,
-                                      within_distance);
+        return collect_near_hits_greedily(postings_list, cursors, distance,
+                                          scratch, term_positions,
+                                          term_lengths);
       });
 }
 
-// Like perform_near_operation, but keeps only the combinations of hits (one
-// per node) that fall in the same structural unit (e.g. paragraph), per
-// scope_index->scope_id(), instead of within a fixed position distance. If
-// scope_index is null, or a candidate document has no scope data registered
-// for expr.scope_name, it contributes no matches -- the same "no match"
-// treatment as an empty And/Or operand, not an error.
+// Like perform_near_operation, but a group's hits (one per node) have to fall
+// in the same structural unit (e.g. paragraph), per scope_index->scope_id(),
+// instead of within a fixed position distance. If scope_index is null, or a
+// candidate document has no scope data registered for expr.scope_name, it
+// contributes no matches -- the same "no match" treatment as an empty And/Or
+// operand, not an error.
 inline std::shared_ptr<IPostings> perform_same_scope_operation(
     const IInvertedIndex &inverted_index, const Expression &expr,
     const IScopeIndex *scope_index, const IPostings *filter) {
@@ -5580,18 +5698,11 @@ inline std::shared_ptr<IPostings> perform_same_scope_operation(
         if (!scope_index->has_scope(expr.scope_name, ordinal)) {
           return false;
         }
-        auto same_scope = [&](const std::vector<ProximityHit> &group) {
-          auto scope_id = [&](const ProximityHit &hit) {
-            return scope_index->scope_id(expr.scope_name, ordinal,
-                                         hit.position);
-          };
-          auto reference = scope_id(group.front());
-          return std::all_of(
-              group.begin() + 1, group.end(),
-              [&](const auto &hit) { return scope_id(hit) == reference; });
+        auto scope_of = [&](size_t position) {
+          return scope_index->scope_id(expr.scope_name, ordinal, position);
         };
-        return collect_proximity_hits(postings_list, cursors, scratch,
-                                      term_positions, term_lengths, same_scope);
+        return collect_same_scope_hits(postings_list, cursors, scope_of,
+                                       scratch, term_positions, term_lengths);
       });
 }
 

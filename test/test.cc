@@ -3210,6 +3210,8 @@ TEST(NearTest, ChainsAgreeWithABruteForce) {
     std::vector<int> operands; // indexes into the vocabulary
   };
   const std::vector<Query> queries = {
+      {"a ~ b", {0, 1}},
+      {"a ~ a", {0, 0}},
       {"a ~ b ~ c", {0, 1, 2}},
       {"a ~ b ~ c ~ d", {0, 1, 2, 3}},
       {"a ~ a ~ b", {0, 0, 1}},
@@ -3386,6 +3388,149 @@ TEST(SameScopeTest, HitsComeOutInPositionOrder) {
   ASSERT_EQ(2, same->size());
   EXPECT_EQ((std::vector<size_t>{1, 2}), hit_positions(*same, 0));
   EXPECT_EQ((std::vector<size_t>{0, 2}), hit_positions(*same, 1));
+}
+
+// Every hit on some pair is kept, not only the pairs a walk through the hits
+// pairs off: in "a b x a", x is near both a's. Leaving the second a out also
+// lost the match for a Near built on this one, though that a is near both x
+// and c.
+TEST(NearTest, TwoOperandsKeepEveryHitOnAPair) {
+  InMemoryInvertedIndex<TextRange> invidx;
+  InMemoryIndexer indexer(invidx, normalizer);
+  indexer.index_document(0, UTF8PlainTextTokenizer("a b x a z z z c"));
+
+  auto pair = perform_search(invidx, *parse_query(normalizer, "a ~ x"));
+  ASSERT_EQ(1, pair->size());
+  EXPECT_EQ((std::vector<size_t>{0, 2, 3}), hit_positions(*pair, 0));
+
+  auto nested = perform_search(invidx, *parse_query(normalizer, "(a ~ x) ~ c"));
+  ASSERT_EQ(1, nested->size());
+  EXPECT_EQ((std::vector<size_t>{3, 7}), hit_positions(*nested, 0));
+}
+
+// A distance of SIZE_MAX is no limit at all. Over three operands the search
+// added it to a position, which wrapped around and rejected the document.
+TEST(NearTest, ADistanceOfSizeMaxIsNoLimit) {
+  InMemoryInvertedIndex<TextRange> invidx;
+  InMemoryIndexer indexer(invidx, normalizer);
+  indexer.index_document(
+      0, UTF8PlainTextTokenizer("a x x x x x x b x x x x x x c"));
+
+  for (auto query : {"a ~ c", "a ~ b ~ c"}) {
+    auto expr = *parse_query(normalizer, query);
+    expr.near_operation_distance = std::numeric_limits<size_t>::max();
+    auto postings = perform_search(invidx, expr);
+    ASSERT_EQ(1, postings->size()) << query;
+    EXPECT_EQ(expr.nodes.size(), postings->search_hit_count(0)) << query;
+  }
+}
+
+// Every hit in a scope that holds all the operands is kept: both a's share
+// the paragraph with b. Pairing hits off kept only the first.
+TEST(SameScopeTest, EveryHitInAScopeWithAllOperandsIsKept) {
+  InMemoryInvertedIndex<TextRange> invidx;
+  InMemoryIndexer indexer(invidx, normalizer);
+  indexer.index_document(0, UTF8PlainTextTokenizer("a a b x a"));
+  invidx.set_scope_ids("paragraph", 0, {0, 0, 0, 1, 1});
+
+  auto postings = perform_search(
+      invidx, same_scope_expr("paragraph", {U"a", U"b"}), &invidx);
+  ASSERT_EQ(1, postings->size());
+  EXPECT_EQ((std::vector<size_t>{0, 1, 2}), hit_positions(*postings, 0));
+}
+
+// IScopeIndex does not promise that scope ids grow along the text, and a
+// scope can come back: here every other position. a@0 and b@2 share one,
+// which a walk that set a@0 aside after it failed with b@1 never saw.
+TEST(SameScopeTest, ScopesNeedNotFollowTheText) {
+  struct Alternating : IScopeIndex {
+    bool has_scope(const std::string &, size_t) const override { return true; }
+    size_t scope_id(const std::string &, size_t,
+                    size_t term_pos) const override {
+      return term_pos % 2;
+    }
+  } scopes;
+  InMemoryInvertedIndex<TextRange> invidx;
+  InMemoryIndexer indexer(invidx, normalizer);
+  indexer.index_document(0, UTF8PlainTextTokenizer("a b b"));
+
+  auto postings =
+      perform_search(invidx, same_scope_expr("s", {U"a", U"b"}), &scopes);
+  ASSERT_EQ(1, postings->size());
+  EXPECT_EQ((std::vector<size_t>{0, 2}), hit_positions(*postings, 0));
+}
+
+// Against every choice of one hit per operand, on random documents cut into
+// random paragraphs: the documents that match, and the hits on some choice
+// that falls in one paragraph.
+TEST(SameScopeTest, AgreesWithABruteForce) {
+  const std::vector<std::vector<int>> queries = {
+      {0, 1}, {0, 0}, {0, 1, 2}, {0, 0, 1}, {2, 0, 1, 0}};
+  const char *vocabulary[] = {"a", "b", "c", "x"};
+
+  std::mt19937 rng(5);
+  for (int round = 0; round < 1500; round++) {
+    std::string text;
+    std::vector<std::vector<size_t>> positions(4);
+    std::vector<size_t> scope_ids;
+    int length = 1 + rng() % 16;
+    for (int i = 0; i < length; i++) {
+      int word = rng() % 4;
+      text += std::string(i ? " " : "") + vocabulary[word];
+      positions[word].push_back(i);
+      scope_ids.push_back(
+          scope_ids.empty() ? 0 : scope_ids.back() + (rng() % 3 == 0));
+    }
+    InMemoryInvertedIndex<TextRange> invidx;
+    InMemoryIndexer indexer(invidx, normalizer);
+    indexer.index_document(0, UTF8PlainTextTokenizer(text));
+    invidx.set_scope_ids("p", 0, scope_ids);
+
+    for (const auto &operands : queries) {
+      std::set<size_t> expected;
+      std::vector<size_t> choice(operands.size(), 0);
+      bool possible = true;
+      for (int operand : operands) {
+        possible = possible && !positions[operand].empty();
+      }
+      while (possible) {
+        std::set<size_t> scopes;
+        std::vector<size_t> chosen;
+        for (size_t j = 0; j < choice.size(); j++) {
+          chosen.push_back(positions[operands[j]][choice[j]]);
+          scopes.insert(scope_ids[chosen.back()]);
+        }
+        if (scopes.size() == 1) {
+          expected.insert(chosen.begin(), chosen.end());
+        }
+        size_t j = 0;
+        for (; j < choice.size(); j++) {
+          if (++choice[j] < positions[operands[j]].size()) {
+            break;
+          }
+          choice[j] = 0;
+        }
+        possible = j < choice.size();
+      }
+
+      std::vector<std::u32string> terms;
+      std::string label;
+      for (int operand : operands) {
+        terms.emplace_back(1, static_cast<char32_t>(vocabulary[operand][0]));
+        label += vocabulary[operand];
+      }
+      auto postings =
+          perform_search(invidx, same_scope_expr("p", terms), &invidx);
+      std::set<size_t> actual;
+      if (postings->size() == 1) {
+        auto hits = hit_positions(*postings, 0);
+        actual.insert(hits.begin(), hits.end());
+      }
+      EXPECT_EQ(expected, actual) << label << " on '" << text << "'";
+      EXPECT_EQ(expected.empty() ? 0u : 1u, postings->size())
+          << label << " on '" << text << "'";
+    }
+  }
 }
 
 // A tokenizer that throws -- here the indexer's own position check, on a

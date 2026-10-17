@@ -85,6 +85,10 @@ for (size_t i = 0; i < result->size(); i++) {
 | `apple~2` | Fuzzy - terms within 2 edits of `apple` |
 | `( ... )` | Grouping |
 
+With more than two terms (`a ~ b ~ c`), each has to start within 4 positions
+of the ones before it. A NEAR result holds every hit that is part of some
+match, so in `a b x a`, `a ~ x` highlights both `a`s.
+
 Terms are tokenized and normalized in the same way as documents, so Unicode
 terms work as long as the tokenizer indexed them. See
 [Words](#words) for what a term is, and
