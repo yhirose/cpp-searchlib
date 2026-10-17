@@ -123,6 +123,7 @@ inline constexpr uint32_t kSchemaVersionCompressed = 1;
 // (unlike unique_ptr<incomplete T>) since it never needs T's destructor to
 // be visible at the point of use.
 class ScopeIndexData;
+class EliasFano;
 
 template <typename T> inline void write_scalar(std::ostream &os, T value) {
   static_assert(std::is_trivially_copyable_v<T>);
@@ -745,6 +746,19 @@ public:
   // has_scope(scope_name, ordinal) is true.
   virtual size_t scope_id(const std::string &scope_name, size_t ordinal,
                           size_t term_pos) const = 0;
+
+  // scope_id at each of `count` positions of one document, into `out`: what
+  // SameScope asks for every hit an operand has in the document, in
+  // ascending order. Override it when the document can be looked up once
+  // for all of them, or its ids read forward; this default asks scope_id
+  // one position at a time.
+  virtual void scope_ids(const std::string &scope_name, size_t ordinal,
+                         const size_t *positions, size_t count,
+                         size_t *out) const {
+    for (size_t i = 0; i < count; i++) {
+      out[i] = scope_id(scope_name, ordinal, positions[i]);
+    }
+  }
 };
 
 //-----------------------------------------------------------------------------
@@ -1617,6 +1631,9 @@ public:
                 size_t ordinal) const override;
   size_t scope_id(const std::string &scope_name, size_t ordinal,
                   size_t term_pos) const override;
+  void scope_ids(const std::string &scope_name, size_t ordinal,
+                 const size_t *positions, size_t count,
+                 size_t *out) const override;
 
   // Serialize/deserialize the T-independent part of the index (documents_
   // and term_dictionary_, including postings). The templated
@@ -1744,6 +1761,9 @@ private:
   void rebuild_document_terms_();
 
   detail::ScopeIndexData &own_scope_data_();
+  // The scope ids registered for (scope_name, ordinal), or null.
+  const detail::EliasFano *find_scope_ids_(const std::string &scope_name,
+                                           size_t ordinal) const;
 
   std::vector<Document> documents_; // indexed by ordinal
   std::unordered_map<std::u32string /*str*/, Term> term_dictionary_;
@@ -1887,6 +1907,12 @@ public:
   size_t scope_id(const std::string &scope_name, size_t ordinal,
                   size_t term_pos) const override {
     return base_.scope_id(scope_name, ordinal, term_pos);
+  }
+
+  void scope_ids(const std::string &scope_name, size_t ordinal,
+                 const size_t *positions, size_t count,
+                 size_t *out) const override {
+    base_.scope_ids(scope_name, ordinal, positions, count, out);
   }
 
   T text_range(const IPostings &positions, size_t index,
@@ -2530,6 +2556,28 @@ public:
     }
   }
 
+  // Position of the n-th (1-based) 1 bit after `position`, looking at most
+  // `max_words` words past the one `position` is in; size() if it is not
+  // within them. A walk over ascending ranks steps forward this way for the
+  // cost of the words in between, where select1 starts its search over.
+  size_t forward_select1(size_t position, size_t n, size_t max_words) const {
+    auto w = position / 64;
+    // The bits after `position` in its own word; none if it is the last.
+    auto shift = position % 64 + 1;
+    auto word = shift == 64 ? 0 : words_[w] & (~uint64_t(0) << shift);
+    for (auto end = std::min(words_.size(), w + 1 + max_words);;) {
+      auto count = popcount64(word);
+      if (n <= count) {
+        return w * 64 + select_in_word(word, n - 1);
+      }
+      n -= count;
+      if (++w >= end) {
+        return bit_count_;
+      }
+      word = words_[w];
+    }
+  }
+
   // Writes the bit count and raw words; the rank index is rebuilt on load,
   // so the on-disk form stays minimal and trivially deterministic.
   void save(std::ostream &os) const {
@@ -2744,6 +2792,34 @@ public:
   uint64_t access(size_t i) const {
     auto high = static_cast<uint64_t>(high_.select1(i) - i);
     return (high << low_bits_) | low_(i);
+  }
+
+  // access() at each of `count` indexes, into `out`; every index must be
+  // less than size(). Each step to a later index reads forward from the
+  // previous one's bit, over the words in between, so an ascending run costs
+  // close to what read() does; a step back, or one further than
+  // kForwardWords words, pays for a select1 instead.
+  template <typename T>
+  void access_each(const size_t *indexes, size_t count, T *out) const {
+    constexpr size_t kForwardWords = 8; // what select1 scans past its search
+    size_t at = 0;                      // the last index read,
+    size_t position = high_.size();     // and its bit; none read yet
+    for (size_t k = 0; k < count; k++) {
+      auto i = indexes[k];
+      auto found = high_.size();
+      if (position < high_.size() && i >= at) {
+        found = i == at
+                    ? position
+                    : high_.forward_select1(position, i - at, kForwardWords);
+      }
+      if (found >= high_.size()) {
+        found = high_.select1(i);
+      }
+      at = i;
+      position = found;
+      out[k] = static_cast<T>((static_cast<uint64_t>(found - i) << low_bits_) |
+                              low_(i));
+    }
   }
 
   // Reads the values at index, index+1, ... into `out`, at most `count` of
@@ -5317,9 +5393,11 @@ struct ProximityScratch {
   std::vector<size_t> need;
   // collect_near_pairs: each operand's hits.
   std::array<std::vector<ProximityHit>, 2> sides;
-  // collect_same_scope_hits: each hit with its scope id, and per operand the
-  // scope it was last counted in, by where that scope's hits begin.
+  // collect_same_scope_hits: each hit with its scope id, an operand's scope
+  // ids as they are read, and per operand the scope it was last counted in,
+  // by where that scope's hits begin.
   std::vector<std::pair<size_t, ProximityHit>> scoped;
+  std::vector<size_t> scope_ids;
   std::vector<size_t> seen;
 };
 
@@ -5620,21 +5698,29 @@ inline bool collect_near_hits_greedily(
 // scope where each operand has one, since with one hit of each other operand
 // there it makes a group. The hits are grouped by the scope ids themselves
 // rather than by runs along the text, so that holds however an IScopeIndex
-// numbers its scopes.
-template <typename ScopeOf>
+// numbers its scopes. scope_ids_of(positions, count, out) fills in the scope
+// ids of an operand's hits, all of them in one call.
+template <typename ScopeIdsOf>
 inline bool collect_same_scope_hits(
     const std::vector<std::shared_ptr<IPostings>> &postings_list,
-    const std::vector<size_t> &cursors, ScopeOf scope_of,
+    const std::vector<size_t> &cursors, ScopeIdsOf scope_ids_of,
     ProximityScratch &scratch, std::vector<size_t> &term_positions,
     std::vector<size_t> &term_lengths) {
   auto &scoped = scratch.scoped;
+  auto &ids = scratch.scope_ids;
   scoped.clear();
   for (size_t slot = 0; slot < postings_list.size(); slot++) {
+    auto first = scoped.size();
     for_each_hit(*postings_list[slot], cursors[slot], scratch.positions,
                  [&](size_t position, size_t length) {
-                   scoped.emplace_back(scope_of(position),
-                                       ProximityHit{position, length, slot});
+                   scoped.emplace_back(0, ProximityHit{position, length, slot});
                  });
+    // for_each_hit leaves the operand's positions in scratch.positions.
+    ids.resize(scratch.positions.size());
+    scope_ids_of(scratch.positions.data(), ids.size(), ids.data());
+    for (size_t h = 0; h < ids.size(); h++) {
+      scoped[first + h].first = ids[h];
+    }
   }
   // By scope, then position: where scope ids grow along the text, as the
   // built-in index's do, that is position order too, and emit_unique_hits
@@ -5722,10 +5808,12 @@ inline std::shared_ptr<IPostings> perform_same_scope_operation(
         if (!scope_index->has_scope(expr.scope_name, ordinal)) {
           return false;
         }
-        auto scope_of = [&](size_t position) {
-          return scope_index->scope_id(expr.scope_name, ordinal, position);
+        auto scope_ids_of = [&](const size_t *positions, size_t count,
+                                size_t *out) {
+          scope_index->scope_ids(expr.scope_name, ordinal, positions, count,
+                                 out);
         };
-        return collect_same_scope_hits(postings_list, cursors, scope_of,
+        return collect_same_scope_hits(postings_list, cursors, scope_ids_of,
                                        scratch, term_positions, term_lengths);
       });
 }
@@ -6607,21 +6695,40 @@ inline bool InMemoryInvertedIndexBase::has_scope(const std::string &scope_name,
   return it->second.find(ordinal) != it->second.end();
 }
 
-inline size_t InMemoryInvertedIndexBase::scope_id(const std::string &scope_name,
-                                                  size_t ordinal,
-                                                  size_t term_pos) const {
+inline const detail::EliasFano *
+InMemoryInvertedIndexBase::find_scope_ids_(const std::string &scope_name,
+                                           size_t ordinal) const {
   if (!scope_data_) {
-    return static_cast<size_t>(-1);
+    return nullptr;
   }
   auto it = scope_data_->by_name.find(scope_name);
   if (it == scope_data_->by_name.end()) {
-    return static_cast<size_t>(-1);
+    return nullptr;
   }
   auto doc_it = it->second.find(ordinal);
-  if (doc_it == it->second.end()) {
-    return static_cast<size_t>(-1);
+  return doc_it == it->second.end() ? nullptr : &doc_it->second;
+}
+
+inline size_t InMemoryInvertedIndexBase::scope_id(const std::string &scope_name,
+                                                  size_t ordinal,
+                                                  size_t term_pos) const {
+  const auto *ids = find_scope_ids_(scope_name, ordinal);
+  return ids ? static_cast<size_t>(ids->access(term_pos))
+             : static_cast<size_t>(-1);
+}
+
+// The document's sequence found once for every position, and read forward
+// rather than with a select per position.
+inline void InMemoryInvertedIndexBase::scope_ids(const std::string &scope_name,
+                                                 size_t ordinal,
+                                                 const size_t *positions,
+                                                 size_t count,
+                                                 size_t *out) const {
+  if (const auto *ids = find_scope_ids_(scope_name, ordinal)) {
+    ids->access_each(positions, count, out);
+  } else {
+    std::fill(out, out + count, static_cast<size_t>(-1));
   }
-  return static_cast<size_t>(doc_it->second.access(term_pos));
 }
 
 inline void InMemoryInvertedIndexBase::save(std::ostream &os,

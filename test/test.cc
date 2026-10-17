@@ -3477,6 +3477,72 @@ TEST(SameScopeTest, ScopesNeedNotFollowTheText) {
   EXPECT_EQ((std::vector<size_t>{0, 2}), hit_positions(*postings, 0));
 }
 
+// scope_ids answers what scope_id would at each position, in whatever order
+// the positions come: the in-memory index's, which looks the document up
+// once and reads its ids forward, and the default every other IScopeIndex
+// gets. A document or a scope name with nothing registered is all
+// size_t(-1), as scope_id says.
+TEST(SameScopeTest, ScopeIdsAgreeWithScopeId) {
+  std::mt19937 rng(3);
+  InMemoryInvertedIndex<TextRange> invidx;
+  InMemoryIndexer indexer(invidx, normalizer);
+  for (size_t key = 0; key < 40; key++) {
+    auto length = 1 + rng() % 300;
+    std::string text;
+    std::vector<size_t> scope_ids;
+    for (size_t i = 0; i < length; i++) {
+      text += i ? " w" : "w";
+      scope_ids.push_back(
+          scope_ids.empty() ? rng() % 5 : scope_ids.back() + (rng() % 4 == 0));
+    }
+    indexer.index_document(key, UTF8PlainTextTokenizer(text));
+    if (key % 7 != 3) {
+      invidx.set_scope_ids("p", key, scope_ids);
+    }
+  }
+
+  struct Alternating : IScopeIndex {
+    bool has_scope(const std::string &, size_t) const override { return true; }
+    size_t scope_id(const std::string &, size_t,
+                    size_t term_pos) const override {
+      return term_pos % 2;
+    }
+  } alternating;
+
+  for (size_t ordinal = 0; ordinal < invidx.document_count(); ordinal++) {
+    auto length = invidx.document_term_count(ordinal);
+    std::vector<size_t> all(length);
+    std::iota(all.begin(), all.end(), size_t(0));
+    std::vector<size_t> sparse;
+    for (size_t i = 0; i < length; i += 1 + rng() % 90) {
+      sparse.push_back(i);
+    }
+    auto shuffled = all;
+    std::shuffle(shuffled.begin(), shuffled.end(), rng);
+    for (const auto *positions : {&all, &sparse, &shuffled}) {
+      for (const IScopeIndex *scopes :
+           {static_cast<const IScopeIndex *>(&invidx),
+            static_cast<const IScopeIndex *>(&alternating)}) {
+        for (const std::string name : {"p", "missing"}) {
+          std::vector<size_t> out(positions->size());
+          scopes->scope_ids(name, ordinal, positions->data(), positions->size(),
+                            out.data());
+          for (size_t i = 0; i < positions->size(); i++) {
+            ASSERT_EQ(scopes->scope_id(name, ordinal, (*positions)[i]), out[i])
+                << name << " in document " << ordinal << " at "
+                << (*positions)[i];
+          }
+        }
+      }
+    }
+  }
+  EXPECT_FALSE(invidx.has_scope("p", 3));
+  std::vector<size_t> out(1, 0);
+  size_t position = 0;
+  invidx.scope_ids("p", 3, &position, 1, out.data());
+  EXPECT_EQ(static_cast<size_t>(-1), out[0]);
+}
+
 // Against every choice of one hit per operand, on random documents cut into
 // random paragraphs: the documents that match, and the hits on some choice
 // that falls in one paragraph.
