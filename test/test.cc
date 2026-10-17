@@ -3255,7 +3255,8 @@ TEST(NearTest, AgreesWithABruteForce) {
       {0, 1}, {0, 0}, {0, 1, 2}, {0, 1, 2, 3}, {0, 0, 1}, {2, 0, 1, 0}};
   const char *vocabulary[] = {"a", "b", "c", "d", "x"};
   constexpr size_t kDistance = 4; // DEFAULT_NEAR_SIZE
-  auto within_distance = [](std::vector<size_t> chosen) {
+  // By reference: MSVC will not let a captureless lambda read kDistance.
+  auto within_distance = [&](std::vector<size_t> chosen) {
     std::sort(chosen.begin(), chosen.end());
     for (size_t i = 1; i < chosen.size(); i++) {
       if (chosen[i] - chosen[i - 1] > kDistance) {
