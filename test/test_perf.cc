@@ -2,6 +2,8 @@
 #include <searchlib.h>
 
 #include <chrono>
+#include <cstdio>
+#include <limits>
 #include <sstream>
 
 #include "test_utils.h"
@@ -11,7 +13,10 @@ using namespace searchlib;
 // Performance regressions here are expressed as ratios between two
 // measurements taken in the same process on the same machine, never as
 // absolute times. A ratio cancels out machine speed and CI load, so the
-// threshold can stay tight enough to be meaningful without being flaky.
+// threshold can stay tight enough to be meaningful without being flaky --
+// as long as the two sides are measured alike, which measure_ratio sees to.
+// Where the invariant is how often one part calls into another, the test
+// counts the calls instead, and a count is the same on every machine.
 //
 // Each test pins an invariant about what a cost is allowed to depend on. The
 // bug that motivated the first one made bm25 scoring O(hits * documents) and
@@ -46,6 +51,142 @@ std::string alpha_term(const std::string &prefix, size_t i) {
   }
   return term;
 }
+
+// A ratio of two costs, the numerator's over the denominator's, measured so
+// that noise alone is unlikely to carry it over `bound`:
+//
+// - Each side is timed in batches of at least kBatchUs, repeated as many
+//   times as that takes, so that the timer's resolution is a small part of
+//   any one measurement even for a run of a few microseconds.
+// - The two sides take turns, so that a change in clock speed or in the
+//   load on a shared CI machine lands on both rather than on one.
+// - Each side keeps its fastest batch, since noise only ever slows one.
+//   Many short batches beat a few long ones here: on a machine running
+//   four times as many busy processes as it has cores, 30 batches of 1ms
+//   kept every ratio under its bound where 15 of 2ms did not.
+// - A ratio at or over the bound is measured again, up to kAttempts times,
+//   and the lowest is kept. A regression puts every attempt over the bound;
+//   a rerun can only rescue one that noise pushed there.
+//
+// Every attempt is printed, so a CI log (ctest -V) carries each machine's
+// numbers for when a bound needs revisiting.
+struct Ratio {
+  double value;
+  double numerator_us;
+  double denominator_us;
+};
+
+template <typename Numerator, typename Denominator>
+Ratio measure_ratio(const char *what, double bound, Numerator numerator,
+                    Denominator denominator) {
+  constexpr double kBatchUs = 1000;
+  constexpr int kRounds = 30;
+  constexpr int kAttempts = 5;
+  using clock = std::chrono::steady_clock;
+  auto microseconds = [](clock::duration d) {
+    return std::chrono::duration<double, std::micro>(d).count();
+  };
+
+  // A warm-up run, then one timed run to size the batches from.
+  auto repetitions = [&](auto &f) {
+    f();
+    auto start = clock::now();
+    f();
+    auto us = microseconds(clock::now() - start);
+    return std::max<size_t>(1,
+                            static_cast<size_t>(kBatchUs / std::max(us, 0.01)));
+  };
+  auto batch_us = [&](auto &f, size_t times) {
+    auto start = clock::now();
+    for (size_t i = 0; i < times; i++) {
+      f();
+    }
+    return microseconds(clock::now() - start) / static_cast<double>(times);
+  };
+
+  auto numerator_times = repetitions(numerator);
+  auto denominator_times = repetitions(denominator);
+  Ratio best{std::numeric_limits<double>::infinity(), 0, 0};
+  for (int attempt = 0; attempt < kAttempts && !(best.value < bound);
+       attempt++) {
+    auto numerator_us = std::numeric_limits<double>::infinity();
+    auto denominator_us = std::numeric_limits<double>::infinity();
+    for (int round = 0; round < kRounds; round++) {
+      numerator_us =
+          std::min(numerator_us, batch_us(numerator, numerator_times));
+      denominator_us =
+          std::min(denominator_us, batch_us(denominator, denominator_times));
+    }
+    Ratio ratio{numerator_us / denominator_us, numerator_us, denominator_us};
+    std::printf("[   perf   ] %s: %.2fx (%.2fus / %.2fus), bound %.2fx\n", what,
+                ratio.value, numerator_us, denominator_us, bound);
+    if (ratio.value < best.value) {
+      best = ratio;
+    }
+  }
+  return best;
+}
+
+// An operand that counts every call made into it, for an invariant about how
+// often a result consults its operands.
+class CountingPostings : public IPostings {
+public:
+  explicit CountingPostings(std::shared_ptr<IPostings> inner)
+      : inner_(std::move(inner)) {}
+
+  size_t calls() const { return calls_; }
+  void reset() { calls_ = 0; }
+
+  size_t size() const override {
+    calls_++;
+    return inner_->size();
+  }
+  size_t document_ordinal(size_t index) const override {
+    calls_++;
+    return inner_->document_ordinal(index);
+  }
+  size_t search_hit_count(size_t index) const override {
+    calls_++;
+    return inner_->search_hit_count(index);
+  }
+  bool prefers_block_reads() const override {
+    calls_++;
+    return inner_->prefers_block_reads();
+  }
+  size_t read_ordinals(size_t index, size_t *out, size_t count) const override {
+    calls_++;
+    return inner_->read_ordinals(index, out, count);
+  }
+  size_t read_hit_counts(size_t index, size_t *out,
+                         size_t count) const override {
+    calls_++;
+    return inner_->read_hit_counts(index, out, count);
+  }
+  void read_term_positions(size_t index, size_t *out) const override {
+    calls_++;
+    inner_->read_term_positions(index, out);
+  }
+  size_t advance(size_t from, size_t ordinal) const override {
+    calls_++;
+    return inner_->advance(from, ordinal);
+  }
+  size_t term_position(size_t index, size_t search_hit_index) const override {
+    calls_++;
+    return inner_->term_position(index, search_hit_index);
+  }
+  size_t term_length(size_t index, size_t search_hit_index) const override {
+    calls_++;
+    return inner_->term_length(index, search_hit_index);
+  }
+  bool is_term_position(size_t index, size_t term_pos) const override {
+    calls_++;
+    return inner_->is_term_position(index, term_pos);
+  }
+
+private:
+  std::shared_ptr<IPostings> inner_;
+  mutable size_t calls_ = 0;
+};
 
 double score_all_hits(const IInvertedIndex &invidx, const Expression &expr,
                       const IPostings &result) {
@@ -85,19 +226,17 @@ TEST(PerfTest, ScoringDoesNotScaleWithDocumentCount) {
   ASSERT_EQ(kHits, small_result->size());
   ASSERT_EQ(kHits, large_result->size());
 
-  auto small_us =
-      best_of(20, [&] { score_all_hits(small, *expr, *small_result); });
-  auto large_us =
-      best_of(20, [&] { score_all_hits(large, *expr, *large_result); });
-
   // The index is 10x bigger, so the regression this guards against shows up
   // as roughly 10x. Anything below 4x means the cost is not tracking the
   // document count.
-  auto ratio = large_us / small_us;
-  EXPECT_LT(ratio, 4.0) << "scoring " << kHits << " hits took " << small_us
-                        << "us against 1,000 documents but " << large_us
-                        << "us against 10,000 -- bm25 cost is scaling with "
-                        << "the document count";
+  auto ratio = measure_ratio(
+      "scoring against 10x the documents", 4.0,
+      [&] { score_all_hits(large, *expr, *large_result); },
+      [&] { score_all_hits(small, *expr, *small_result); });
+  EXPECT_LT(ratio.value, 4.0)
+      << "scoring " << kHits << " hits took " << ratio.denominator_us
+      << "us against 1,000 documents but " << ratio.numerator_us
+      << "us against 10,000 -- bm25 cost is scaling with the document count";
 }
 
 // bm25_score answers a Prefix node by enumerating the dictionary on every
@@ -143,18 +282,16 @@ TEST(PerfTest, ScorerDoesNotScaleWithVocabulary) {
   BM25Scorer small_scorer(small, *expr);
   BM25Scorer large_scorer(large, *expr);
 
-  auto small_us =
-      best_of(20, [&] { score_all_hits(small_scorer, *small_result); });
-  auto large_us =
-      best_of(20, [&] { score_all_hits(large_scorer, *large_result); });
-
   // The dictionary is 10x bigger, so a per-hit expansion shows up as roughly
   // 10x. Anything under 2x means the cost is not tracking the vocabulary.
-  auto ratio = large_us / small_us;
-  EXPECT_LT(ratio, 2.0) << "scoring " << kHits << " prefix hits took "
-                        << small_us << "us against a 500-term vocabulary but "
-                        << large_us << "us against 5,000 -- the scorer is "
-                        << "re-expanding the prefix per hit";
+  auto ratio = measure_ratio(
+      "scoring a prefix over 10x the vocabulary", 2.0,
+      [&] { score_all_hits(large_scorer, *large_result); },
+      [&] { score_all_hits(small_scorer, *small_result); });
+  EXPECT_LT(ratio.value, 2.0)
+      << "scoring " << kHits << " prefix hits took " << ratio.denominator_us
+      << "us against a 500-term vocabulary but " << ratio.numerator_us
+      << "us against 5,000 -- the scorer is re-expanding the prefix per hit";
 }
 
 // Most hits of an Or carry only some of its terms, so "this document does not
@@ -197,25 +334,25 @@ TEST(PerfTest, ScoringAnOrDoesNotSearchForAbsentTerms) {
   // across runs would start every run but the first with a backwards walk
   // and measure the fallback instead of the forward path this test is about.
   // Construction here is two postings lookups and two logarithms.
-  auto or_us = best_of(20, [&] {
-    BM25Scorer scorer(invidx, *or_expr);
-    score_all_hits(scorer, *or_result);
-  });
-  auto single_us = best_of(20, [&] {
-    BM25Scorer scorer(invidx, *single_expr);
-    score_all_hits(scorer, *single_result);
-  });
-
   // The Or scores 10/9 as many hits and consults two terms per hit instead
   // of one, so a bit over twice the single-term work is the honest floor.
   // Measured at 1.8x with O(1) absent lookups and 3.4x when they fall back
   // to searching, both steady across runs; 2.5x sits between them.
-  auto ratio = or_us / single_us;
-  EXPECT_LT(ratio, 2.5) << "scoring " << kHits << " Or hits took "
-                        << or_us << "us against " << single_us
-                        << "us for " << single_result->size()
-                        << " single-term hits ("
-                        << ratio << "x) -- absent-term lookups are searching";
+  auto ratio = measure_ratio(
+      "scoring an Or against one term", 2.5,
+      [&] {
+        BM25Scorer scorer(invidx, *or_expr);
+        score_all_hits(scorer, *or_result);
+      },
+      [&] {
+        BM25Scorer scorer(invidx, *single_expr);
+        score_all_hits(scorer, *single_result);
+      });
+  EXPECT_LT(ratio.value, 2.5)
+      << "scoring " << kHits << " Or hits took " << ratio.numerator_us
+      << "us against " << ratio.denominator_us << "us for "
+      << single_result->size() << " single-term hits (" << ratio.value
+      << "x) -- absent-term lookups are searching";
 }
 
 // An And/Or result is a view: it keeps the matched document ids and reads
@@ -243,27 +380,29 @@ TEST(PerfTest, BuildingAUnionCostsLittleMoreThanEnumeratingItsDocumentIds) {
   auto result = perform_search(invidx, *expr);
   ASSERT_EQ(kDocuments, result->size());
 
-  auto build_us = best_of(20, [&] { perform_search(invidx, *expr); });
-  // document_ordinal only. search_hit_count would drag the operand lookups into
-  // the denominator and hide exactly what this test is about.
-  auto walk_us = best_of(20, [&] {
-    size_t sink = 0;
-    for (size_t i = 0; i < result->size(); i++) {
-      sink += result->document_ordinal(i);
-    }
-    EXPECT_GT(sink, 0u);
-  });
-
   // Both sides are one virtual call per document plus the merge, so the
   // bound comes from measurement rather than first principles: this ratio
   // reads 3.9-5.2x on the view against 27.4x when the same walk also built
   // every document's positions. 12x sits between, with better than 2x of
   // margin on either side.
-  auto ratio = build_us / walk_us;
-  EXPECT_LT(ratio, 12.0) << "building a " << kDocuments
-                         << "-hit union took " << build_us << "us against "
-                         << walk_us << "us to enumerate its document ids ("
-                         << ratio << "x) -- construction is doing per-hit work";
+  auto ratio = measure_ratio(
+      "building a union against walking its ids", 12.0,
+      [&] { perform_search(invidx, *expr); },
+      // document_ordinal only. search_hit_count would drag the operand
+      // lookups into the denominator and hide exactly what this test is
+      // about.
+      [&] {
+        size_t sink = 0;
+        for (size_t i = 0; i < result->size(); i++) {
+          sink += result->document_ordinal(i);
+        }
+        EXPECT_GT(sink, 0u);
+      });
+  EXPECT_LT(ratio.value, 12.0)
+      << "building a " << kDocuments << "-hit union took " << ratio.numerator_us
+      << "us against " << ratio.denominator_us
+      << "us to enumerate its document ids (" << ratio.value
+      << "x) -- construction is doing per-hit work";
 }
 
 // The other side of that bargain: a view has to find each document again in
@@ -272,9 +411,12 @@ TEST(PerfTest, BuildingAUnionCostsLittleMoreThanEnumeratingItsDocumentIds) {
 // a document's hits cost one merge rather than one each -- and losing either
 // turns a full position scan superlinear.
 //
-// The yardstick is the same scan over a bare term's postings, which is a
-// plain array walk. A ratio against it is flat in the hit count when both
-// mechanisms hold and grows without them.
+// Both come down to how often the view calls into its operands, so this
+// counts the calls. It used to time the scan against the same scan over a
+// bare term's postings, and that ratio depends on the machine: the view
+// costs the same per document on x86 and on Apple's cores, but Apple's run
+// the term's plain array walk twice as fast, which put the healthy ratio on
+// macOS at the bound.
 TEST(PerfTest, ReadingAUnionsPositionsResumesInsteadOfSearching) {
   constexpr size_t kDocuments = 20000;
 
@@ -286,50 +428,47 @@ TEST(PerfTest, ReadingAUnionsPositionsResumesInsteadOfSearching) {
     }
   }
 
-  auto union_expr = parse_query(perf_normalizer, "alpha | beta");
-  auto term_expr = parse_query(perf_normalizer, "gamma");
-  ASSERT_TRUE(union_expr);
-  ASSERT_TRUE(term_expr);
-
-  auto union_result = perform_search(invidx, *union_expr);
-  auto term_result = perform_search(invidx, *term_expr);
-  ASSERT_EQ(kDocuments, union_result->size());
-  ASSERT_EQ(kDocuments, term_result->size());
-
-  auto read_every_position = [](const IPostings &postings) {
-    return best_of(20, [&] {
-      size_t sink = 0;
-      for (size_t i = 0; i < postings.size(); i++) {
-        auto count = postings.search_hit_count(i);
-        for (size_t h = 0; h < count; h++) {
-          sink += postings.term_position(i, h) + postings.term_length(i, h);
-        }
-      }
-      EXPECT_GT(sink, 0u);
-    });
+  auto operand = [&](const char *term) {
+    auto expr = parse_query(perf_normalizer, term);
+    EXPECT_TRUE(expr);
+    return std::make_shared<CountingPostings>(perform_search(invidx, *expr));
   };
+  auto alpha = operand("alpha");
+  auto beta = operand("beta");
+  // What `alpha | beta` builds. The walk that builds it is the previous
+  // test's business; this one counts from the first read.
+  auto result = detail::union_postings({alpha, beta});
+  ASSERT_EQ(kDocuments, result->size());
+  alpha->reset();
+  beta->reset();
 
-  auto union_us = read_every_position(*union_result);
-  auto term_us = read_every_position(*term_result);
+  size_t hits = 0;
+  size_t sink = 0;
+  for (size_t i = 0; i < result->size(); i++) {
+    auto count = result->search_hit_count(i);
+    hits += count;
+    for (size_t h = 0; h < count; h++) {
+      sink += result->term_position(i, h) + result->term_length(i, h);
+    }
+  }
+  EXPECT_GT(sink, 0u);
+  ASSERT_EQ(2 * kDocuments, hits);
 
-  // The union reads twice the positions and merges them, so a single-digit
-  // multiple is the honest floor and the bound is measured: this ratio reads
-  // 13.2-13.3x as it stands, against 33.8x with the operand cursors taken
-  // out and 49.1x with the row memo taken out. Only the healthy one is flat
-  // in the document count; both broken ones climb with it, which is the
-  // property being pinned.
-  //
-  // 22x sits between, 1.6x above the healthy number and 1.5x below the
-  // nearest broken one. The cursor margin is the tighter of the two because
-  // the row memo absorbs most of a lost cursor: it collapses a document's
-  // repeated lookups into one, so the fallback pays one search per operand
-  // per document rather than one per probe.
-  auto ratio = union_us / term_us;
-  EXPECT_LT(ratio, 22.0) << "reading every position of a " << kDocuments
-                         << "-hit union took " << union_us << "us against "
-                         << term_us << "us for the same scan over a term's "
-                         << "postings (" << ratio << "x) -- the operands are "
-                         << "being searched per lookup";
+  // Finding a document from each operand's cursor, its hit count there, and
+  // each hit's position and length come to 6.5 calls a hit as it stands,
+  // whatever the document count. Without the cursors it is 18.9 here, a
+  // search per document per operand, and climbs with the document count
+  // (15.5 at 2,000); without the row memo it is 31.5, a merge per position
+  // read. 10 sits between, 1.5x above the healthy count and 1.9x below the
+  // nearest broken one.
+  auto calls_per_hit =
+      static_cast<double>(alpha->calls() + beta->calls()) / hits;
+  std::printf("[   perf   ] operand calls per union hit: %.2f, bound 10\n",
+              calls_per_hit);
+  EXPECT_LT(calls_per_hit, 10.0)
+      << "reading every position of a " << kDocuments << "-document union "
+      << "made " << calls_per_hit << " calls into its operands per hit -- "
+      << "it is searching them per lookup or merging a document per hit";
 }
 
 // The compressed backend stores its dictionary as an FST specifically so that
@@ -365,20 +504,21 @@ TEST(PerfTest, CompressedPrefixEnumerationScalesWithHitsNotVocabulary) {
   ASSERT_EQ(5005, all_terms);
 
   size_t sink = 0;
-  auto selective_us = best_of(20, [&] {
-    loaded->enumerate_terms_with_prefix(
-        U"zqx", [&](const auto &t) { sink += t.size(); });
-  });
-  auto all_us = best_of(20, [&] {
-    loaded->enumerate_terms_with_prefix(U"",
-                                        [&](const auto &t) { sink += t.size(); });
-  });
-  EXPECT_GT(sink, 0u);
-
   // 5 terms out of 5,005. A subtree descent is orders of magnitude cheaper
   // than a full walk; a full scan would make the two roughly equal.
-  EXPECT_LT(selective_us, all_us / 5.0)
-      << "enumerating 5 terms took " << selective_us
-      << "us against " << all_us << "us for all " << all_terms
+  auto ratio = measure_ratio(
+      "enumerating a selective prefix against all terms", 0.2,
+      [&] {
+        loaded->enumerate_terms_with_prefix(
+            U"zqx", [&](const auto &t) { sink += t.size(); });
+      },
+      [&] {
+        loaded->enumerate_terms_with_prefix(
+            U"", [&](const auto &t) { sink += t.size(); });
+      });
+  EXPECT_GT(sink, 0u);
+  EXPECT_LT(ratio.value, 0.2)
+      << "enumerating 5 terms took " << ratio.numerator_us << "us against "
+      << ratio.denominator_us << "us for all " << all_terms
       << " -- the FST dictionary is not being descended";
 }

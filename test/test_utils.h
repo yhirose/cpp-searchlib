@@ -7,9 +7,9 @@
 
 // Minimum of several runs: the fastest observed run is the one least
 // polluted by scheduling noise, so it is the stablest estimator here.
-// Shared between the perf-regression tests and the benchmark harness so the
-// two always report comparable numbers -- bench/bench.cpp's cross-run
-// comparisons assume this exact estimator.
+// bench/bench.cpp's cross-run comparisons assume this exact estimator. The
+// perf-regression tests time their ratios with measure_ratio instead, which
+// batches short runs and alternates the two sides (test/test_perf.cc).
 template <typename F> double best_of(size_t runs, F f) {
   f(); // warm up caches and any one-time allocation
   double best = std::numeric_limits<double>::max();

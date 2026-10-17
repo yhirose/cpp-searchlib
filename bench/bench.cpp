@@ -13,11 +13,9 @@
 // much per-term work is repeated for every hit. A single end-to-end number
 // hides which of the two moved.
 //
-// Timings are the best of N runs, via the same best_of estimator the
-// perf-regression tests use (shared through test/test_utils.h so the two
-// cannot drift apart). Absolute numbers are only comparable against other
-// runs on the same machine; what carries across machines is the ratio
-// between two rows.
+// Timings are the best of N runs (best_of, in test/test_utils.h). Absolute
+// numbers are only comparable against other runs on the same machine; what
+// carries across machines is the ratio between two rows.
 //
 // Everything the harness needs is an option, so that the same binary measures
 // the small English corpus the optimization work was tuned against and a
