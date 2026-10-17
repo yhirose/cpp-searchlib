@@ -4829,7 +4829,7 @@ inline void
 increment_cursors(std::vector<std::shared_ptr<IPostings>> &postings_list,
                   std::vector<size_t> &sizes, std::vector<size_t> &cursors,
                   OrdinalWindows &windows, const std::vector<size_t> &slots) {
-  for (int i = slots.size() - 1; i >= 0; i--) {
+  for (auto i = slots.size(); i-- > 0;) {
     auto slot = slots[i];
     cursors[slot]++;
     if (cursors[slot] == sizes[slot]) {
@@ -6749,7 +6749,9 @@ inline void InMemoryInvertedIndexBase::rebuild_document_terms_() {
   std::vector<Term *> terms;
   terms.reserve(term_dictionary_.size());
   document_term_offsets_.assign(documents_.size() + 1, 0);
-  for (auto &[_, term] : term_dictionary_) {
+  // Not a structured binding: C++17 does not let the lambda below capture one.
+  for (auto &entry : term_dictionary_) {
+    auto &term = entry.second;
     term.id = static_cast<uint32_t>(terms.size());
     terms.push_back(&term);
     for_each_live_entry(term, [&](size_t ordinal) {
