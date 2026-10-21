@@ -145,9 +145,11 @@ echo "    All CI checks passed."
 
 # --- Step 4: Determine the version to release ---
 # The index format constants at a revision, one "name = value" per line.
+# `-E` because the alternation needs it: `\|` in a basic regex is a GNU
+# extension, which BSD sed (macOS) reads as a literal `|` and never matches.
 index_format() {
   git show "$1:$VERSION_HEADER" 2>/dev/null |
-    sed -n 's/^inline constexpr uint32_t \(k\(FormatType\|SchemaVersion\)[A-Za-z]*\) = \([0-9]*\);.*/\1 = \3/p'
+    sed -E -n 's/^inline constexpr uint32_t (k(FormatType|SchemaVersion)[A-Za-z]*) = ([0-9]*);.*/\1 = \3/p'
 }
 
 if ! git rev-parse -q --verify "refs/tags/v$CURRENT_VERSION" >/dev/null; then
