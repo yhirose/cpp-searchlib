@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iterator>
+#include <utility>
 #include <vector>
 
 #include "segmentlib/mlp/kernels.h"
@@ -36,9 +37,12 @@ inline constexpr int kAccShift = 9;
 // The single int32 → int16 requantization used for *every* Int16-mode
 // quantity (table blocks, fallback contributions, dictionary columns, b1):
 // round-to-nearest arithmetic shift, then saturate.
+// The rounding add is in int64 so v near INT32_MAX cannot overflow.
 [[nodiscard]] constexpr std::int16_t requant_i16(std::int32_t v) noexcept {
-    const std::int32_t shifted = (v + (1 << (kAccShift - 1))) >> kAccShift;
-    return static_cast<std::int16_t>(std::clamp(shifted, -32768, 32767));
+    const std::int64_t shifted =
+        (static_cast<std::int64_t>(v) + (1 << (kAccShift - 1))) >> kAccShift;
+    return static_cast<std::int16_t>(
+        std::clamp<std::int64_t>(shifted, -32768, 32767));
 }
 
 // The first-layer precompute table of design.ja.md 4.6 (NNUE style):
@@ -60,15 +64,15 @@ public:
     PrecomputeTable() = default;
 
     // Builds the table. `emb_q` is V×d, `w1_q` is H×(2w·d), both in the 5.7
-    // layout; `r` is the rescale factor R = S_e·S_w1 / S_acc. The table
-    // keeps copies of `emb_q`/`w1_q` for the fallback path, so it does not
-    // borrow from the caller.
-    PrecomputeTable(Span<const std::int16_t> emb_q, Span<const std::int16_t> w1_q,
+    // layout; `r` is the rescale factor R = S_e·S_w1 / S_acc. The table takes
+    // ownership of both for the fallback path, so it does not borrow from the
+    // caller.
+    PrecomputeTable(std::vector<std::int16_t> emb_q, std::vector<std::int16_t> w1_q,
                     std::uint32_t vocab_size, std::uint16_t embed_dim,
                     std::uint16_t hidden, std::uint8_t window, double r,
                     TablePrecision precision = TablePrecision::Int32)
-        : emb_q_(emb_q.begin(), emb_q.end()),
-          w1_q_(w1_q.begin(), w1_q.end()),
+        : emb_q_(std::move(emb_q)),
+          w1_q_(std::move(w1_q)),
           d_(embed_dim),
           h_(hidden),
           window_(window),
@@ -120,7 +124,9 @@ public:
             return;
         }
         // Fallback synthesis (I.1-(2)) for multi-codepoint EGCs.
-        synthesize(rows, j, [&](std::size_t h, std::int32_t v) { acc[h] += v; });
+        synthesize(rows, j, [&](std::size_t h, std::int32_t v) {
+            acc[h] = kernels::scalar::wrapping_add_i32(acc[h], v);
+        });
     }
 
     // Returns the H-length Int16 contribution block for the EGC `rows` at window
@@ -146,9 +152,6 @@ public:
     }
 
 private:
-    // Per-h fallback contribution (the shared integer kernel of I.1-(2));
-    // callers requantize per mode.
-    //
     // The shared integer kernel of I.1-(1)/(2): given the constituent rows of
     // one EGC, compute every hidden unit's contribution at window position j:
     //   sum_c[k] = Σ_rows emb_q[row, k]                        (int32)

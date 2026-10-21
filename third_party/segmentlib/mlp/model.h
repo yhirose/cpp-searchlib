@@ -3,10 +3,8 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <filesystem>
-#include <fstream>
-#include <iterator>
+#include <new>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -17,6 +15,7 @@
 #include "segmentlib/mlp/precompute.h"
 #include "segmentlib/mlp/vocab.h"
 #include "segmentlib/support/expected.h"
+#include "segmentlib/support/file.h"
 #include "segmentlib/support/span.h"
 #include "segmentlib/types.h"
 #include "segmentlib/unicode/egc.h"
@@ -40,6 +39,13 @@ struct FormatId {
     std::string_view wrong_signature;
     std::string_view wrong_version;
     std::string_view malformed;
+
+    // The first line of a file in this format, without the newline.
+    [[nodiscard]] std::string header_line() const {
+        std::string line(signature);
+        line += version;
+        return line;
+    }
 };
 
 inline constexpr FormatId kMlpFormat{
@@ -70,6 +76,20 @@ inline double read_scale(bytes::BinaryReader& in, const char* what) {
     return s;
 }
 
+// b1_q must fit int32; |b2_q| ≤ 2^62 keeps dot (≤ 2^62) + b2_q in int64. The
+// negated comparisons also reject NaN.
+inline void check_biases(const std::vector<double>& b1, double b2, double acc_scale,
+                         double w2_scale) {
+    for (const double b : b1) {
+        if (!(std::fabs(b / acc_scale) <= 2147483647.0)) {
+            throw bytes::ParseError("first-layer bias out of range");
+        }
+    }
+    if (!(std::fabs(b2 / (w2_scale * acc_scale)) <= 4611686018427387904.0)) {
+        throw bytes::ParseError("output bias out of range");
+    }
+}
+
 }  // namespace detail
 
 struct Config {  // 5.7 fields 1-4b
@@ -80,10 +100,9 @@ struct Config {  // 5.7 fields 1-4b
     std::uint16_t unicode_version = 0;
 };
 
-// An immutable loaded MLP model: the raw
-// quantized parameters from the file, plus the load-time derived structures —
-// precompute table, dictionary matcher, dictionary columns and biases already
-// converted to accumulator integer scale. All the
+// An immutable loaded MLP model: the precompute table (which owns the
+// quantized embedding and W1), the dictionary matcher, W2, and the dictionary
+// columns and biases already converted to accumulator integer scale. All the
 // scorer touches is integers; no scale multiplication survives into the hot
 // path.
 //
@@ -128,22 +147,21 @@ public:
             return Model(parse(in, precision));
         } catch (const bytes::ParseError&) {
             return Unexpected(Error{ErrorCode::MalformedModel, format.malformed});
+        } catch (const std::bad_alloc&) {
+            // The V × 2w × H precompute table is the one allocation not
+            // bounded by the file size.
+            return Unexpected(Error{ErrorCode::MalformedModel, "model too large to load"});
         }
     }
 
     [[nodiscard]] static Expected<Model, Error> load_format(
         const std::filesystem::path& path, const FormatId& format,
         TablePrecision precision) {
-        std::ifstream in(path, std::ios::binary);
-        if (!in) {
-            return Unexpected(Error{ErrorCode::IoError, "cannot open model file"});
+        auto data = segmentlib::detail::read_model_file(path);
+        if (!data) {
+            return Unexpected(data.error());
         }
-        std::vector<char> data((std::istreambuf_iterator<char>(in)),
-                               std::istreambuf_iterator<char>());
-        if (in.bad()) {
-            return Unexpected(Error{ErrorCode::IoError, "cannot read model file"});
-        }
-        return load_format(as_bytes(Span<const char>(data)), format, precision);
+        return load_format(Span<const std::byte>(*data), format, precision);
     }
 
     [[nodiscard]] TablePrecision table_precision() const noexcept {
@@ -157,13 +175,8 @@ public:
     }
     [[nodiscard]] const DictMatcher& dict() const noexcept { return parts_.dict; }
 
-    // Raw quantized layers (5.7 fields 11/12/15).
-    [[nodiscard]] Span<const std::int16_t> embedding() const noexcept {
-        return parts_.embedding;
-    }
-    [[nodiscard]] Span<const std::int16_t> w1() const noexcept {
-        return parts_.w1;
-    }
+    // The output layer (5.7 field 15). The embedding and W1 live in the
+    // precompute table, which needs them for the fallback path.
     [[nodiscard]] Span<const std::int16_t> w2() const noexcept {
         return parts_.w2;
     }
@@ -197,7 +210,8 @@ public:
     }
 
     // True when the model was trained with different Unicode data than this
-    // build's EGC splitter (5.7 field 4b); the loader also warns on stderr.
+    // build's EGC splitter (5.7 field 4b); segmentation of the clusters affected
+    // by the difference may diverge. The caller decides whether to warn.
     [[nodiscard]] bool unicode_version_mismatch() const noexcept {
         return parts_.unicode_mismatch;
     }
@@ -206,8 +220,6 @@ private:
     struct Parts {
         Config config;
         Vocab vocab;
-        std::vector<std::int16_t> embedding;  // V × d
-        std::vector<std::int16_t> w1;         // H × 2w·d
         std::vector<std::int16_t> w2;         // H
         std::vector<std::int32_t> b1_q;       // H
         std::int64_t b2_q = 0;
@@ -237,13 +249,6 @@ private:
         }
         if (c.unicode_version != unicode::kEgcUnicodeVersion) {
             parts.unicode_mismatch = true;
-            std::fprintf(stderr,
-                         "segmentlib: MLP model was trained with Unicode %u.%u EGC "
-                         "rules but this build uses %u.%u; segmentation of "
-                         "clusters affected by the difference may diverge\n",
-                         c.unicode_version / 100, c.unicode_version % 100,
-                         unicode::kEgcUnicodeVersion / 100,
-                         unicode::kEgcUnicodeVersion % 100);
         }
 
         // Scales (fields 5-8b).
@@ -278,8 +283,8 @@ private:
         const std::size_t in_dim = 2u * c.char_window * d;
         const std::size_t fd =
             static_cast<std::size_t>(c.num_dicts) * kDictFeaturesPerDict;
-        parts.embedding = detail::read_i16_tensor(in, vocab_size * d);
-        parts.w1 = detail::read_i16_tensor(in, h * in_dim);
+        std::vector<std::int16_t> embedding = detail::read_i16_tensor(in, vocab_size * d);
+        std::vector<std::int16_t> w1 = detail::read_i16_tensor(in, h * in_dim);
         const std::vector<std::int16_t> wdict =
             c.num_dicts > 0 ? detail::read_i16_tensor(in, h * fd)
                             : std::vector<std::int16_t>{};
@@ -290,11 +295,15 @@ private:
         }
         parts.w2 = detail::read_i16_tensor(in, h);
         const double b2 = in.read<double>();
+        detail::check_biases(b1, b2, acc_scale, w2_scale);
 
         // Dictionaries (field 17): the compiled matcher, ready to use.
         CompiledDictionaries compiled;
         if (c.num_dicts > 0) {
             compiled = read_compiled_dictionaries(in, c.num_dicts);
+            if (!compiled.fst.empty() && !fst_byte_code_intact(compiled.fst)) {
+                throw ParseError("dictionary FST is corrupt");
+            }
         }
         if (!in.eof()) {
             throw ParseError("trailing bytes after the model");
@@ -307,7 +316,7 @@ private:
         // Load-time derived structures (I.4): everything converted to the
         // accumulator integer scale once, here.
         const double r = emb_scale * w1_scale / acc_scale;
-        parts.precompute = PrecomputeTable(parts.embedding, parts.w1, vocab_size,
+        parts.precompute = PrecomputeTable(std::move(embedding), std::move(w1), vocab_size,
                                            c.embed_dim, c.hidden, c.char_window, r,
                                            precision);
         parts.dict_cols.resize(fd * h);

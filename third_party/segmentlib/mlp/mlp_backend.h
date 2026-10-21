@@ -73,6 +73,9 @@ public:
     }
 
     [[nodiscard]] const Model& model() const noexcept { return model_; }
+    [[nodiscard]] bool unicode_version_mismatch() const noexcept {
+        return model_.unicode_version_mismatch();
+    }
 
 private:
     Model model_;

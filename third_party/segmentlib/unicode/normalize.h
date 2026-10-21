@@ -2,7 +2,6 @@
 
 #include <cstddef>
 #include <string_view>
-#include <unordered_map>
 #include <vector>
 
 #include "segmentlib/unicode/utf8.h"
@@ -44,24 +43,30 @@ inline constexpr std::string_view kNormNorm =
     "\x9a\xe3\x83\xbc\xef\xbc\x81\xe3\x80\x82\xef\xbc\x86\xef\xbc\x8a\xef\xbc\xa0"
     "\xef\xbc\x9d";
 
-inline const std::unordered_map<char32_t, char32_t>& norm_map() {
-    static const std::unordered_map<char32_t, char32_t> map = [] {
-        std::unordered_map<char32_t, char32_t> m;
-        std::size_t po = 0;
-        std::size_t pn = 0;
-        while (po < kNormOrig.size() && pn < kNormNorm.size()) {
-            const auto o = unicode::decode(kNormOrig.substr(po));
-            const auto n = unicode::decode(kNormNorm.substr(pn));
-            if (!o || !n) {
-                break;  // constants are well-formed; defensive only
-            }
-            m.emplace(o->codepoint, n->codepoint);
-            po += o->length;
-            pn += n->length;
+// The identity table over the BMP with KyTea's remappings applied. Astral
+// codepoints are never remapped, so a direct-indexed table covers every case.
+inline constexpr char32_t kBmpSize = 0x1'0000;
+
+inline std::vector<char32_t> make_bmp_table() {
+    std::vector<char32_t> table(kBmpSize);
+    for (char32_t i = 0; i < kBmpSize; ++i) {
+        table[i] = i;
+    }
+    std::size_t po = 0;
+    std::size_t pn = 0;
+    while (po < kNormOrig.size() && pn < kNormNorm.size()) {
+        const auto o = unicode::decode(kNormOrig.substr(po));
+        const auto n = unicode::decode(kNormNorm.substr(pn));
+        if (!o || !n) {
+            break;  // constants are well-formed; defensive only
         }
-        return m;
-    }();
-    return map;
+        if (o->codepoint < kBmpSize) {
+            table[o->codepoint] = n->codepoint;
+        }
+        po += o->length;
+        pn += n->length;
+    }
+    return table;
 }
 
 }  // namespace detail
@@ -73,23 +78,8 @@ inline const std::unordered_map<char32_t, char32_t>& norm_map() {
 // depending on the kytea namespace. Returns the normalized codepoint, or `cp`
 // unchanged if it is not remapped. Only BMP codepoints are ever remapped.
 [[nodiscard]] inline char32_t normalize(char32_t cp) {
-    // Normalization is model-independent and confined to the BMP, so a single
-    // static direct-indexed table (identity except for the remapped entries)
-    // replaces a per-character hash lookup. Astral codepoints are never remapped.
-    static constexpr char32_t kBmp = 0x1'0000;
-    static const std::vector<char32_t> table = [] {
-        std::vector<char32_t> t(kBmp);
-        for (char32_t i = 0; i < kBmp; ++i) {
-            t[i] = i;
-        }
-        for (const auto& [orig, norm] : detail::norm_map()) {
-            if (orig < kBmp) {
-                t[orig] = norm;
-            }
-        }
-        return t;
-    }();
-    return cp < kBmp ? table[cp] : cp;
+    static const std::vector<char32_t> table = detail::make_bmp_table();
+    return cp < detail::kBmpSize ? table[cp] : cp;
 }
 
 }  // namespace segmentlib::unicode

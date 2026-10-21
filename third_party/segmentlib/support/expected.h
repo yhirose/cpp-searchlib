@@ -1,5 +1,6 @@
 #pragma once
 
+#include <exception>
 #include <optional>
 #include <type_traits>
 #include <utility>
@@ -18,6 +19,15 @@ namespace segmentlib {
 // with different behaviour on failure in the standard, which is worse than not
 // having it. Adding any of them later is easy; guessing at their semantics now
 // is not.
+
+namespace detail {
+
+// A wrong-branch access is a precondition violation: terminate in every build.
+constexpr void require(bool ok) noexcept {
+    if (!ok) std::terminate();
+}
+
+}  // namespace detail
 
 // The tag type that turns a bare error into "this is the failure branch",
 // mirroring std::unexpected. Everything that fails does so by returning
@@ -57,24 +67,30 @@ public:
     }
     [[nodiscard]] explicit constexpr operator bool() const noexcept { return has_value(); }
 
-    [[nodiscard]] constexpr T& operator*() & noexcept { return std::get<0>(storage_); }
-    [[nodiscard]] constexpr const T& operator*() const& noexcept {
-        return std::get<0>(storage_);
-    }
-    [[nodiscard]] constexpr T&& operator*() && noexcept {
-        return std::move(std::get<0>(storage_));
-    }
+    // Reading the wrong branch is a precondition violation; it terminates in
+    // every build type (std::expected leaves it undefined).
+    [[nodiscard]] constexpr T& operator*() & noexcept { return *value_ptr(); }
+    [[nodiscard]] constexpr const T& operator*() const& noexcept { return *value_ptr(); }
+    [[nodiscard]] constexpr T&& operator*() && noexcept { return std::move(*value_ptr()); }
 
-    [[nodiscard]] constexpr T* operator->() noexcept { return &std::get<0>(storage_); }
-    [[nodiscard]] constexpr const T* operator->() const noexcept {
-        return &std::get<0>(storage_);
-    }
+    [[nodiscard]] constexpr T* operator->() noexcept { return value_ptr(); }
+    [[nodiscard]] constexpr const T* operator->() const noexcept { return value_ptr(); }
 
     [[nodiscard]] constexpr const E& error() const& noexcept {
-        return std::get<1>(storage_);
+        detail::require(!has_value());
+        return *std::get_if<1>(&storage_);
     }
 
 private:
+    constexpr T* value_ptr() noexcept {
+        detail::require(has_value());
+        return std::get_if<0>(&storage_);
+    }
+    constexpr const T* value_ptr() const noexcept {
+        detail::require(has_value());
+        return std::get_if<0>(&storage_);
+    }
+
     std::variant<T, E> storage_;
 };
 
@@ -96,7 +112,10 @@ public:
 
     constexpr void operator*() const noexcept {}
 
-    [[nodiscard]] constexpr const E& error() const& noexcept { return *error_; }
+    [[nodiscard]] constexpr const E& error() const& noexcept {
+        detail::require(!has_value());
+        return *error_;
+    }
 
 private:
     std::optional<E> error_;

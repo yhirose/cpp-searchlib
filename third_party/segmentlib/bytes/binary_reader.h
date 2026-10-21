@@ -54,30 +54,17 @@ public:
     // Reads a NUL-terminated string (KyTea's on-disk KyteaString form). The
     // terminating NUL is consumed but not included in the result.
     [[nodiscard]] std::string read_cstring() {
-        const std::size_t start = pos_;
-        while (pos_ < data_.size() && data_[pos_] != std::byte{0}) {
-            ++pos_;
-        }
-        if (pos_ >= data_.size()) {
+        const std::size_t end = find_from_pos(std::byte{0});
+        if (end == data_.size()) {
             throw ParseError("unterminated C string");
         }
-        std::string out(reinterpret_cast<const char*>(data_.data()) + start, pos_ - start);
-        ++pos_;  // consume the NUL
-        return out;
+        return take_string(end);
     }
 
     // Reads up to and including a '\n' (used for the model's header line).
     // The newline is consumed but not included in the result.
     [[nodiscard]] std::string read_line() {
-        const std::size_t start = pos_;
-        while (pos_ < data_.size() && data_[pos_] != std::byte{'\n'}) {
-            ++pos_;
-        }
-        std::string out(reinterpret_cast<const char*>(data_.data()) + start, pos_ - start);
-        if (pos_ < data_.size()) {
-            ++pos_;  // consume the newline
-        }
-        return out;
+        return take_string(find_from_pos(std::byte{'\n'}));  // else: the rest
     }
 
     // Reads `n` bytes verbatim. Used for blocks whose interior this reader
@@ -120,6 +107,23 @@ public:
     }
 
 private:
+    // Index of the first `delim` at or after the cursor, or the buffer size.
+    [[nodiscard]] std::size_t find_from_pos(std::byte delim) const noexcept {
+        std::size_t end = pos_;
+        while (end < data_.size() && data_[end] != delim) {
+            ++end;
+        }
+        return end;
+    }
+
+    // The bytes from the cursor up to `end` as a string, with the cursor moved
+    // past the delimiter at `end` (if there is one).
+    [[nodiscard]] std::string take_string(std::size_t end) {
+        std::string out(reinterpret_cast<const char*>(data_.data()) + pos_, end - pos_);
+        pos_ = end < data_.size() ? end + 1 : end;
+        return out;
+    }
+
     template <class T>
     [[nodiscard]] T read_raw() {
         if (sizeof(T) > remaining()) {

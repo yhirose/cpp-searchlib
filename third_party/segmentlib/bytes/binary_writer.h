@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -57,17 +58,11 @@ public:
     // Writes a NUL-terminated string (the form BinaryReader::read_cstring
     // consumes). `s` must not itself contain a NUL, or the reader would stop
     // short; model strings (words, header fields) never do.
-    void write_cstring(std::string_view s) {
-        write_bytes(as_bytes(Span<const char>(s)));
-        write<std::uint8_t>(0);
-    }
+    void write_cstring(std::string_view s) { write_terminated(s, 0); }
 
     // Writes `line` followed by '\n' (the form BinaryReader::read_line
     // consumes). `line` must not contain '\n'.
-    void write_line(std::string_view line) {
-        write_bytes(as_bytes(Span<const char>(line)));
-        write<std::uint8_t>('\n');
-    }
+    void write_line(std::string_view line) { write_terminated(line, '\n'); }
 
     // Appends raw bytes as-is (e.g. a whole int16 tensor already in
     // little-endian order).
@@ -76,6 +71,13 @@ public:
     }
 
 private:
+    void write_terminated(std::string_view s, std::uint8_t terminator) {
+        // The reader would stop at an embedded terminator and misparse the rest.
+        assert(s.find(static_cast<char>(terminator)) == std::string_view::npos);
+        write_bytes(as_bytes(Span<const char>(s)));
+        write<std::uint8_t>(terminator);
+    }
+
     std::vector<std::byte> buf_;
 };
 

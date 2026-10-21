@@ -230,6 +230,16 @@ inline void write_compiled_dictionaries(bytes::BinaryWriter& out,
     }
 }
 
+// fst::map follows the start address unchecked, so it must lie inside the
+// body; verify() catches corruption (not a crafted file).
+[[nodiscard]] inline bool fst_byte_code_intact(const std::string& byte_code) {
+    fst::FstHeader header;
+    fst::FstTrailer trailer;
+    return fst::read_header(byte_code.data(), byte_code.size(), header, trailer) &&
+           header.start_address < trailer.body_size &&
+           fst::verify(byte_code.data(), byte_code.size());
+}
+
 [[nodiscard]] inline CompiledDictionaries read_compiled_dictionaries(
     bytes::BinaryReader& in, std::uint32_t num_dicts) {
     CompiledDictionaries out;

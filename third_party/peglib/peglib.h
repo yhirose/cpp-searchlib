@@ -7,8 +7,8 @@
 
 #pragma once
 
-#define CPPPEGLIB_VERSION "1.17.0"
-#define CPPPEGLIB_VERSION_NUM "0x011100"
+#define CPPPEGLIB_VERSION "1.24.0"
+#define CPPPEGLIB_VERSION_NUM "0x011800"
 
 /*
  * Configuration
@@ -16,6 +16,12 @@
 
 #ifndef CPPPEGLIB_HEURISTIC_ERROR_TOKEN_MAX_CHAR_COUNT
 #define CPPPEGLIB_HEURISTIC_ERROR_TOKEN_MAX_CHAR_COUNT 32
+#endif
+
+#if defined(_MSC_VER)
+#define CPPPEGLIB_NOINLINE __declspec(noinline)
+#else
+#define CPPPEGLIB_NOINLINE __attribute__((noinline))
 #endif
 
 #include <algorithm>
@@ -27,6 +33,9 @@
 #include <charconv>
 #endif
 #include <cstdint>
+#ifdef CPPPEGLIB_TEST
+#include <cstdlib>
+#endif
 #include <cstring>
 #include <functional>
 #include <initializer_list>
@@ -39,6 +48,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -88,31 +98,66 @@ private:
  *  UTF8 functions
  *---------------------------------------------------------------------------*/
 
-inline size_t codepoint_length(const char *s8, size_t l) {
-  if (l) {
-    auto b = static_cast<uint8_t>(s8[0]);
-    if ((b & 0x80) == 0) {
-      return 1;
-    } else if ((b & 0xE0) == 0xC0 && l >= 2) {
-      return 2;
-    } else if ((b & 0xF0) == 0xE0 && l >= 3) {
-      return 3;
-    } else if ((b & 0xF8) == 0xF0 && l >= 4) {
-      return 4;
-    }
+// Only a well-formed sequence is a code point: not an overlong form, a
+// surrogate, a code point past U+10FFFF, a sequence cut short or a stray
+// byte.
+inline bool decode_codepoint(const char *s8, size_t l, size_t &bytes,
+                             char32_t &cp) {
+  if (!l) { return false; }
+  auto b = static_cast<uint8_t>(s8[0]);
+  if (b < 0x80) {
+    bytes = 1;
+    cp = b;
+    return true;
   }
-  return 0;
+  size_t len = 0;
+  char32_t min = 0;
+  char32_t value = 0;
+  if ((b & 0xE0) == 0xC0) {
+    len = 2;
+    value = b & 0x1F;
+    min = 0x80;
+  } else if ((b & 0xF0) == 0xE0) {
+    len = 3;
+    value = b & 0x0F;
+    min = 0x800;
+  } else if ((b & 0xF8) == 0xF0) {
+    len = 4;
+    value = b & 0x07;
+    min = 0x10000;
+  }
+  if (!len || len > l) { return false; }
+  for (size_t i = 1; i < len; i++) {
+    auto c = static_cast<uint8_t>(s8[i]);
+    if ((c & 0xC0) != 0x80) { return false; }
+    value = (value << 6) | (c & 0x3F);
+  }
+  if (value < min || value > 0x10FFFF || (value >= 0xD800 && value <= 0xDFFF)) {
+    return false;
+  }
+  bytes = len;
+  cp = value;
+  return true;
+}
+
+// 0 where no well-formed code point starts.
+inline size_t codepoint_length(const char *s8, size_t l) {
+  size_t bytes = 0;
+  char32_t cp;
+  decode_codepoint(s8, l, bytes, cp);
+  return bytes;
+}
+
+// Text shown to a person steps over what is not well-formed a byte at a
+// time.
+inline size_t codepoint_or_byte_length(const char *s8, size_t l) {
+  auto len = codepoint_length(s8, l);
+  return len || !l ? len : 1;
 }
 
 inline size_t codepoint_count(const char *s8, size_t l) {
   size_t count = 0;
-  for (size_t i = 0; i < l;) {
-    auto len = codepoint_length(s8 + i, l - i);
-    if (len == 0) {
-      // Invalid UTF-8 byte, treat as single byte to avoid infinite loop
-      len = 1;
-    }
-    i += len;
+  for (size_t i = 0; i < l; i += codepoint_or_byte_length(s8 + i, l - i)) {
     count++;
   }
   return count;
@@ -155,43 +200,6 @@ inline std::string encode_codepoint(char32_t cp) {
   return std::string(buff, l);
 }
 
-inline bool decode_codepoint(const char *s8, size_t l, size_t &bytes,
-                             char32_t &cp) {
-  if (l) {
-    auto b = static_cast<uint8_t>(s8[0]);
-    if ((b & 0x80) == 0) {
-      bytes = 1;
-      cp = b;
-      return true;
-    } else if ((b & 0xE0) == 0xC0) {
-      if (l >= 2) {
-        bytes = 2;
-        cp = ((static_cast<char32_t>(s8[0] & 0x1F)) << 6) |
-             (static_cast<char32_t>(s8[1] & 0x3F));
-        return true;
-      }
-    } else if ((b & 0xF0) == 0xE0) {
-      if (l >= 3) {
-        bytes = 3;
-        cp = ((static_cast<char32_t>(s8[0] & 0x0F)) << 12) |
-             ((static_cast<char32_t>(s8[1] & 0x3F)) << 6) |
-             (static_cast<char32_t>(s8[2] & 0x3F));
-        return true;
-      }
-    } else if ((b & 0xF8) == 0xF0) {
-      if (l >= 4) {
-        bytes = 4;
-        cp = ((static_cast<char32_t>(s8[0] & 0x07)) << 18) |
-             ((static_cast<char32_t>(s8[1] & 0x3F)) << 12) |
-             ((static_cast<char32_t>(s8[2] & 0x3F)) << 6) |
-             (static_cast<char32_t>(s8[3] & 0x3F));
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
 inline size_t decode_codepoint(const char *s8, size_t l, char32_t &cp) {
   size_t bytes;
   if (decode_codepoint(s8, l, bytes, cp)) { return bytes; }
@@ -206,13 +214,8 @@ inline char32_t decode_codepoint(const char *s8, size_t l) {
 
 inline std::u32string decode(const char *s8, size_t l) {
   std::u32string out;
-  size_t i = 0;
-  while (i < l) {
-    auto beg = i++;
-    while (i < l && (s8[i] & 0xc0) == 0x80) {
-      i++;
-    }
-    out += decode_codepoint(&s8[beg], (i - beg));
+  for (size_t i = 0; i < l; i += codepoint_or_byte_length(s8 + i, l - i)) {
+    out += decode_codepoint(s8 + i, l - i);
   }
   return out;
 }
@@ -271,11 +274,20 @@ inline bool is_digit(char c, int &v) {
   return false;
 }
 
+inline bool is_octal(char c, int &v) {
+  if ('0' <= c && c <= '7') {
+    v = c - '0';
+    return true;
+  }
+  return false;
+}
+
 inline std::pair<int, size_t> parse_hex_number(const char *s, size_t n,
-                                               size_t i) {
+                                               size_t i, size_t max_digits) {
   int ret = 0;
   int val;
-  while (i < n && is_hex(s[i], val)) {
+  const auto end = i + std::min(max_digits, n - i);
+  while (i < end && is_hex(s[i], val)) {
     ret = static_cast<int>(ret * 16 + val);
     i++;
   }
@@ -283,10 +295,11 @@ inline std::pair<int, size_t> parse_hex_number(const char *s, size_t n,
 }
 
 inline std::pair<int, size_t> parse_octal_number(const char *s, size_t n,
-                                                 size_t i) {
+                                                 size_t i, size_t max_digits) {
   int ret = 0;
   int val;
-  while (i < n && is_digit(s[i], val)) {
+  const auto end = i + std::min(max_digits, n - i);
+  while (i < end && is_octal(s[i], val)) {
     ret = static_cast<int>(ret * 8 + val);
     i++;
   }
@@ -302,8 +315,13 @@ inline std::string resolve_escape_sequence(const char *s, size_t n) {
     auto ch = s[i];
     if (ch == '\\') {
       i++;
-      assert(i < n);
+      if (i == n) {
+        r += '\\';
+        break;
+      }
 
+      // An escape takes only as many digits as the grammar's Char rule does,
+      // so a digit after it is a character of its own.
       switch (s[i]) {
       case 'f':
         r += '\f';
@@ -353,16 +371,26 @@ inline std::string resolve_escape_sequence(const char *s, size_t n) {
         r += '\\';
         i++;
         break;
-      case 'x':
-      case 'u': {
+      case 'x': {
         char32_t cp;
-        std::tie(cp, i) = parse_hex_number(s, n, i + 1);
+        std::tie(cp, i) = parse_hex_number(s, n, i + 1, 2);
+        r += encode_codepoint(cp);
+        break;
+      }
+      case 'u': {
+        // Six digits from 0 or 10 (up to U+10FFFF), else four or five.
+        const auto six = i + 2 < n && (s[i + 1] == '0' ||
+                                       (s[i + 1] == '1' && s[i + 2] == '0'));
+        char32_t cp;
+        std::tie(cp, i) = parse_hex_number(s, n, i + 1, six ? 6 : 5);
         r += encode_codepoint(cp);
         break;
       }
       default: {
+        // Three digits up to \377, else two.
+        const auto three = '0' <= s[i] && s[i] <= '3';
         char32_t cp;
-        std::tie(cp, i) = parse_octal_number(s, n, i);
+        std::tie(cp, i) = parse_octal_number(s, n, i, three ? 3 : 2);
         r += encode_codepoint(cp);
         break;
       }
@@ -402,17 +430,48 @@ predefined_character_class(std::string_view name) {
   return it != table.end() ? &it->second : nullptr;
 }
 
-// Ranges must be sorted and non-overlapping.
-inline std::vector<std::pair<char32_t, char32_t>> complement_character_ranges(
-    const std::vector<std::pair<char32_t, char32_t>> &ranges) {
+inline std::vector<std::pair<char32_t, char32_t>>
+complement_character_ranges(std::vector<std::pair<char32_t, char32_t>> ranges) {
+  std::sort(ranges.begin(), ranges.end());
   std::vector<std::pair<char32_t, char32_t>> r;
   char32_t next = 0;
   for (const auto &[lo, hi] : ranges) {
     if (lo > next) { r.emplace_back(next, lo - 1); }
-    next = hi + 1;
+    next = std::max<char32_t>(next, hi + 1);
   }
   if (next <= 0x10FFFF) { r.emplace_back(next, 0x10FFFF); }
   return r;
+}
+
+// Only an ASCII letter has another case.
+inline char32_t other_case(char32_t cp) {
+  if ('a' <= cp && cp <= 'z') { return cp - 'a' + 'A'; }
+  if ('A' <= cp && cp <= 'Z') { return cp - 'A' + 'a'; }
+  return cp;
+}
+
+inline std::vector<std::pair<char32_t, char32_t>>
+add_other_case(const std::vector<std::pair<char32_t, char32_t>> &ranges) {
+  auto r = ranges;
+  for (const auto &[lo, hi] : ranges) {
+    for (auto cp = lo; cp <= std::min<char32_t>(hi, 'z'); cp++) {
+      if (auto other = other_case(cp); other != cp) {
+        r.emplace_back(other, other);
+      }
+    }
+  }
+  return r;
+}
+
+inline char to_lower(char c) {
+  return 'A' <= c && c <= 'Z' ? static_cast<char>(other_case(c)) : c;
+}
+
+inline std::string to_lower(std::string s) {
+  for (auto &c : s) {
+    c = to_lower(c);
+  }
+  return s;
 }
 
 /*-----------------------------------------------------------------------------
@@ -435,13 +494,6 @@ template <typename T> T token_to_number_(std::string_view sv) {
   return n;
 }
 
-inline std::string to_lower(std::string s) {
-  for (auto &c : s) {
-    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-  }
-  return s;
-}
-
 /*-----------------------------------------------------------------------------
  *  Trie
  *---------------------------------------------------------------------------*/
@@ -459,11 +511,15 @@ public:
         std::string_view sv(s.data(), len);
         auto it = dic_.find(sv);
         if (it == dic_.end()) {
-          dic_.emplace(sv, Info{last, last, id});
-        } else if (last) {
-          it->second.match = true;
-        } else {
-          it->second.done = false;
+          it = dic_.emplace(sv, Info{true, false, 0}).first;
+        }
+        auto &info = it->second;
+        // A word listed twice keeps its first id, as in a choice.
+        if (!last) {
+          info.done = false;
+        } else if (!info.match) {
+          info.match = true;
+          info.id = id;
         }
       }
       id++;
@@ -659,6 +715,7 @@ private:
   friend class Repetition;
   friend class Holder;
   friend class PrecedenceClimbing;
+  friend class TokenBoundary;
 
   static const std::string &empty_name() {
     static const std::string name;
@@ -669,6 +726,15 @@ private:
   std::string_view sv_;
   size_t choice_count_ = 0;
   size_t choice_ = 0;
+  // Set on the scope a precedence parses its operator into: its tokens are
+  // those of the rule matches delivered here, not its token boundaries.
+  bool holds_rule_tokens_ = false;
+  // Cleared where nothing reads the values of the rule matches delivered
+  // here, which are then not delivered.
+  bool holds_rule_values_ = true;
+  // Cleared on the one scope that nothing reads at all (see
+  // Context::unread_scope): it holds no tokens either.
+  bool is_read_ = true;
   // Points at the matched rule's name (owned by the Definition, which
   // outlives the parse); assigning a pointer beats copying a string on
   // every successful rule match.
@@ -706,12 +772,27 @@ struct argument_count<R (C::*)(Args...) const>
 class Action {
 public:
   Action() = default;
-  Action(Action &&rhs) = default;
+  Action(const Action &) = default;
+  Action(Action &&) = default;
+  Action &operator=(const Action &) = default;
+  Action &operator=(Action &&) = default;
   template <typename F> Action(F fn) : fn_(make_adaptor(fn)) {}
-  template <typename F> void operator=(F fn) { fn_ = make_adaptor(fn); }
-  Action &operator=(const Action &rhs) = default;
+  template <typename F> Action &operator=(F fn) {
+    fn_ = make_adaptor(fn);
+    ast_node_type_ = nullptr;
+    return *this;
+  }
 
   operator bool() const { return bool(fn_); }
+
+  // Declares this action to be an AST action: it builds a node, held as
+  // `Node`, from the values alone (a token rule's node from its token, not
+  // reading the values), so a parse need not run it where nothing reads the
+  // node. Assigning another function clears the declaration.
+  template <typename Node> void declare_ast_action(bool /*collapse*/) {
+    ast_node_type_ = &typeid(Node);
+  }
+  const std::type_info *ast_node_type() const { return ast_node_type_; }
 
   std::any operator()(SemanticValues &vs, std::any &dt,
                       const std::any &predicate_data) const {
@@ -739,15 +820,21 @@ private:
   }
 
   Fty fn_;
+  const std::type_info *ast_node_type_ = nullptr;
 };
 
 class Predicate {
 public:
   Predicate() = default;
-  Predicate(Predicate &&rhs) = default;
+  Predicate(const Predicate &) = default;
+  Predicate(Predicate &&) = default;
+  Predicate &operator=(const Predicate &) = default;
+  Predicate &operator=(Predicate &&) = default;
   template <typename F> Predicate(F fn) : fn_(make_adaptor(fn)) {}
-  template <typename F> void operator=(F fn) { fn_ = make_adaptor(fn); }
-  Predicate &operator=(const Predicate &rhs) = default;
+  template <typename F> Predicate &operator=(F fn) {
+    fn_ = make_adaptor(fn);
+    return *this;
+  }
 
   operator bool() const { return bool(fn_); }
 
@@ -778,9 +865,12 @@ private:
 /*
  * Parse result helper
  */
-inline bool success(size_t len) { return len != static_cast<size_t>(-1); }
+// The length of a parse that did not match.
+inline constexpr size_t kFail = static_cast<size_t>(-1);
 
-inline bool fail(size_t len) { return len == static_cast<size_t>(-1); }
+inline bool success(size_t len) { return len != kFail; }
+
+inline bool fail(size_t len) { return len == kFail; }
 
 /*
  * Log
@@ -811,6 +901,79 @@ using ErrorReporter = std::function<void(const ErrorReport &report)>;
  * ErrorInfo
  */
 class Definition;
+class Holder;
+class Reference;
+class PrioritizedChoice;
+struct FirstSet;
+
+// What fails where an expression cannot start: a failure of its own, of
+// `literal` if it is a literal, or what fails where `rule`, which it refers
+// to, cannot start.
+struct StartFailure {
+  const char *literal = nullptr;
+  const Definition *rule = nullptr;
+  bool listed = true;
+};
+
+// Thrown when a parse nests more rule matches than its start rule's
+// max_depth allows; that parse catches it (see Definition::parse_core).
+struct NestingTooDeep {
+  const char *pos;
+  const Definition *rule;
+};
+
+// Mixes the bits of a key for open addressing. In 64 bits so that `h >> 32`
+// stays well-defined where size_t is 32-bit (wasm32).
+inline size_t mix_index(size_t key) {
+  auto h = static_cast<uint64_t>(key) * 0x9E3779B97F4A7C15ull;
+  return static_cast<size_t>(h ^ (h >> 32));
+}
+
+// Drops the repeats in `v` from `from` on, keeping the first of each in
+// order, and returns how many went. The items kept so far are found by `hash`,
+// so that this takes time linear in the number of items.
+template <typename T, typename Hash>
+size_t drop_repeats(std::vector<T> &v, size_t from, Hash hash) {
+  if (v.size() - from < 2) { return 0; }
+  size_t slots = 1;
+  while (slots < 2 * (v.size() - from)) {
+    slots *= 2;
+  }
+  std::vector<size_t> kept_at(slots); // 1 + where an item is kept, or 0
+  auto kept = from;
+  for (auto i = from; i < v.size(); i++) {
+    auto j = hash(v[i]) & (slots - 1);
+    while (kept_at[j] && !(v[kept_at[j] - 1] == v[i])) {
+      j = (j + 1) & (slots - 1);
+    }
+    if (!kept_at[j]) {
+      v[kept] = v[i];
+      kept_at[j] = ++kept;
+    }
+  }
+  auto dropped = v.size() - kept;
+  v.resize(kept);
+  return dropped;
+}
+
+// A call of a rule: the body it parses (a macro has one per instance), where
+// it starts, and whether whitespace is skipped there. A rule may match
+// differently where none is, so whatever stands for a call, a memo, a seed
+// or a rule being parsed, is kept by all three.
+struct RuleCall {
+  const Holder *rule = nullptr;
+  const char *pos = nullptr;
+  bool skips_no_whitespace = false;
+
+  bool operator==(const RuleCall &c) const {
+    return pos == c.pos && rule == c.rule &&
+           skips_no_whitespace == c.skips_no_whitespace;
+  }
+  bool operator<(const RuleCall &c) const {
+    return std::tie(pos, rule, skips_no_whitespace) <
+           std::tie(c.pos, c.rule, c.skips_no_whitespace);
+  }
+};
 
 struct ErrorInfo {
   const char *error_pos = nullptr;
@@ -819,29 +982,284 @@ struct ErrorInfo {
   std::string message;
   std::string label;
   const char *last_output_pos = nullptr;
-  bool keep_previous_token = false;
 
   void clear() {
     error_pos = nullptr;
-    expected_tokens.clear();
-    message_pos = nullptr;
-    message.clear();
+    clear_expected_tokens();
+    clear_message();
   }
 
-  void add(const char *error_literal, const Definition *error_rule) {
-    for (const auto &[t, r] : expected_tokens) {
-      if (t == error_literal && r == error_rule) { return; }
+  void clear_message() {
+    message_pos = nullptr;
+    message.clear();
+    label.clear();
+  }
+
+  void clear_expected_tokens() {
+    next_generation();
+    expected_tokens.clear();
+    literal_copies_.clear();
+  }
+
+  // False when a failure has gone past `pos`. Otherwise the error is at
+  // `pos` now, and what was expected before it is dropped.
+  bool advance_to(const char *pos) {
+    if (pos < error_pos) { return false; }
+    if (error_pos < pos) {
+      error_pos = pos;
+      clear_expected_tokens();
     }
-    expected_tokens.emplace_back(error_literal, error_rule);
+    return true;
+  }
+
+  // What a failure expected is noted as an event, and turned into
+  // expected_tokens only when a parse returns or a message is built: nearly
+  // all of it is noted at a position the parse then moves past, and is never
+  // read.
+  //
+  // A literal points at text the grammar owns, unless `copy_literal` is set:
+  // a back reference's literal is captured text, which is dropped when the
+  // parse backtracks past its capture, and when the parse ends.
+  void add(StartFailure failure, const Definition *rule,
+           const Definition *token_rule, bool copy_literal) {
+    if (copy_literal) { failure.literal = copy_of(failure.literal); }
+    note({Kind::failure, failure, rule, token_rule, nullptr, 0, 0, 0});
+  }
+
+  // The alternatives `begin` to `end` of `choice`, in `rule`, were skipped by
+  // their first sets.
+  void add_skipped(const PrioritizedChoice *choice, size_t begin, size_t end,
+                   const Definition *rule, const Definition *token_rule) {
+    note({Kind::skipped, {}, rule, token_rule, choice, begin, end, 0});
+  }
+
+  // What a parse whose match is memoized notes is kept with the memo, so
+  // that reusing the memo notes it again, as parsing the rule again would.
+  // It is kept from where the parse began, as a record of this generation:
+  // the events at one error position. The parse around it names what it
+  // notes by `token_rule`, if there is one.
+  void open_frame(const Definition *token_rule) {
+    frames_.push_back({events_.size(), generation_, token_rule});
+    boundary_ = events_.size();
+  }
+
+  // What the innermost memoized parse noted is kept for its memo, `key`,
+  // in place of what a parse of a memo made before with the same key kept.
+  void close_frame(const RuleCall &key) {
+    auto span = span_of(frames_.back());
+    frames_.pop_back();
+    boundary_ = events_.size();
+    if (span.begin < span.end) {
+      records_.push_back(span);
+      keep_record(key, records_.size() - 1);
+    } else if (!record_slots_.empty()) {
+      auto &slot = record_slots_[slot_of(key)];
+      if (slot.generation == generation_) { slot.record = no_record; }
+    }
+  }
+
+  // Notes again what was kept for the memo `key`, under `token_rule` if
+  // there is one.
+  void replay(const RuleCall &key, const Definition *token_rule) {
+    if (record_slots_.empty()) { return; }
+    const auto &slot = record_slots_[slot_of(key)];
+    if (slot.generation == generation_ && slot.record != no_record) {
+      note({Kind::replay, {}, nullptr, token_rule, nullptr, 0, 0, slot.record});
+    }
+  }
+
+  void resolve_expected_tokens();
+
+  // A message stands for the error at error_pos: once a failure goes past
+  // that, the message is not read, and resolving the error drops it.
+  void set_message(const char *pos, std::string msg,
+                   const std::string &lbl = "") {
+    message_pos = pos;
+    message = std::move(msg);
+    label = lbl;
+    message_error_pos_ = error_pos;
+  }
+  bool message_lies_at_or_after(const char *pos) const {
+    return has_message() && pos <= message_pos;
+  }
+
+  // Whether anything has been noted, or the error has moved on or been
+  // resolved, since mark() was taken.
+  struct Mark {
+    size_t generation;
+    size_t noted;
+  };
+  Mark mark() const { return {generation_, events_.size() + removed_}; }
+  bool noted_since(const Mark &m) const {
+    return generation_ != m.generation || events_.size() + removed_ != m.noted;
+  }
+
+  // A parse went past its max_depth at `pos`, where the rule match or the
+  // returned AST node that `label` names starts. It is reported even at or
+  // before a position a recovered error already was.
+  void set_nesting_too_deep(const char *pos, const std::string &label,
+                            size_t max_depth) {
+    set_message(pos,
+                "exceeded the maximum nesting depth of " +
+                    std::to_string(max_depth),
+                label);
+    last_output_pos = nullptr;
   }
 
   void output_log(const Log &log, const char *s, size_t n) {
     output_log(log, nullptr, s, n);
   }
+  // An error that a recovery reports is labeled with `recovery_label`.
   void output_log(const Log &log, const ErrorReporter &reporter, const char *s,
-                  size_t n);
+                  size_t n, const std::string &recovery_label = "");
 
 private:
+  // What failed in `rule`: `failure`, or the alternatives `begin` to `end`
+  // that `choice` skipped. Or `record`, noted again.
+  enum class Kind : uint8_t { failure, skipped, replay };
+  struct ExpectedEvent {
+    Kind kind;
+    StartFailure failure;
+    const Definition *rule;
+    const Definition *token_rule; // the outermost token rule around it
+    const PrioritizedChoice *choice;
+    size_t begin;
+    size_t end;
+    size_t record;
+
+    bool operator==(const ExpectedEvent &e) const {
+      return kind == e.kind && failure.literal == e.failure.literal &&
+             failure.rule == e.failure.rule && rule == e.rule &&
+             token_rule == e.token_rule && choice == e.choice &&
+             begin == e.begin && end == e.end && record == e.record;
+    }
+    size_t hash() const {
+      return mix_index(reinterpret_cast<uintptr_t>(failure.literal) ^
+                       reinterpret_cast<uintptr_t>(failure.rule) * 3 ^
+                       reinterpret_cast<uintptr_t>(rule) * 5 ^
+                       reinterpret_cast<uintptr_t>(token_rule) * 7 ^
+                       reinterpret_cast<uintptr_t>(choice) * 11 ^ begin * 13 ^
+                       record * 17);
+    }
+  };
+  std::vector<ExpectedEvent> events_;
+
+  // The memoized parses in progress, innermost last, and the records of
+  // those done: spans of events_, nested or apart. A record noted again, a
+  // replay event, comes after its span.
+  struct Frame {
+    size_t begin;
+    size_t generation;
+    const Definition *token_rule;
+  };
+  std::vector<Frame> frames_;
+  struct Record {
+    size_t begin;
+    size_t end;
+    const Definition *token_rule;
+  };
+  std::vector<Record> records_;
+  size_t generation_ = 0;
+  const char *message_error_pos_ = nullptr; // error_pos when it was given
+  bool has_message() const {
+    return message_pos && message_error_pos_ == error_pos;
+  }
+  size_t removed_ = 0; // events remove_repeats has taken out
+
+  // What a memoized parse has noted so far: from its start, or from the
+  // start of the generation if it began in an earlier one.
+  Record span_of(const Frame &frame) const {
+    return {frame.generation == generation_ ? frame.begin : 0, events_.size(),
+            frame.token_rule};
+  }
+
+  // The records by memo, in open addressing. A slot of an earlier
+  // generation is free: its record has gone.
+  static constexpr size_t no_record = static_cast<size_t>(-1);
+  struct RecordSlot {
+    RuleCall key;
+    size_t record;
+    size_t generation;
+  };
+  std::vector<RecordSlot> record_slots_;
+  size_t indexed_ = 0; // slots of this generation
+
+  // The slot of `key` in this generation, or the free one it would take.
+  size_t slot_of(const RuleCall &key) const {
+    auto mask = record_slots_.size() - 1;
+    auto i = mix_index(reinterpret_cast<uintptr_t>(key.pos) * 31 +
+                       reinterpret_cast<uintptr_t>(key.rule) +
+                       key.skips_no_whitespace) &
+             mask;
+    while (record_slots_[i].generation == generation_ &&
+           !(record_slots_[i].key == key)) {
+      i = (i + 1) & mask;
+    }
+    return i;
+  }
+
+  void keep_record(const RuleCall &key, size_t record) {
+    if ((indexed_ + 1) * 2 > record_slots_.size()) {
+      auto old = std::move(record_slots_);
+      record_slots_.assign(old.empty() ? 16 : old.size() * 2,
+                           {{}, no_record, no_record});
+      indexed_ = 0;
+      for (const auto &slot : old) {
+        if (slot.generation == generation_) {
+          keep_record(slot.key, slot.record);
+        }
+      }
+    }
+    auto &slot = record_slots_[slot_of(key)];
+    if (slot.generation != generation_) { indexed_++; }
+    slot = {key, record, generation_};
+  }
+
+  // A parse that keeps failing at one position notes the same few events
+  // over and over. Once this many, or twice what the last removal left, have
+  // piled up since a memoized parse last began or ended, their repeats go:
+  // each span holds all of them or none.
+  static constexpr size_t max_events_ = 256;
+  size_t boundary_ = 0;
+  size_t remove_repeats_at_ = max_events_;
+
+  void note(const ExpectedEvent &event) {
+    if (events_.size() - boundary_ == remove_repeats_at_) { remove_repeats(); }
+    events_.push_back(event);
+  }
+  void remove_repeats();
+
+  void next_generation() {
+    events_.clear();
+    records_.clear();
+    indexed_ = 0;
+    boundary_ = 0;
+    remove_repeats_at_ = max_events_;
+    generation_++;
+  }
+
+  void insert_failure(const char *literal, const Definition *rule,
+                      const Definition *token_rule);
+  // The rules whose start failures have been inserted, with the token rule
+  // around them: what they insert depends on nothing else.
+  using Expanded =
+      std::vector<std::pair<const Definition *, const Definition *>>;
+  void insert_start_failure(const StartFailure &failure, const Definition *rule,
+                            const Definition *token_rule, Expanded &expanded);
+
+  // Copies of the literals that the grammar does not own. Held by pointer so
+  // that their text stays put as this vector grows, and is shared with the
+  // copies of this ErrorInfo (a parse result is one).
+  std::vector<std::shared_ptr<const std::string>> literal_copies_;
+
+  const char *copy_of(const char *literal) {
+    for (const auto &copy : literal_copies_) {
+      if (*copy == literal) { return copy->c_str(); }
+    }
+    literal_copies_.push_back(std::make_shared<const std::string>(literal));
+    return literal_copies_.back()->c_str();
+  }
+
   int cast_char(char c) const { return static_cast<unsigned char>(c); }
 
   std::string heuristic_error_token(const char *s, size_t n,
@@ -860,7 +1278,7 @@ private:
       size_t count = CPPPEGLIB_HEURISTIC_ERROR_TOKEN_MAX_CHAR_COUNT;
       size_t j = 0;
       while (count > 0 && j < i) {
-        j += codepoint_length(&pos[j], i - j);
+        j += codepoint_or_byte_length(&pos[j], i - j);
         count--;
       }
 
@@ -896,12 +1314,11 @@ using TracerLeave = std::function<void(
 using TracerStartOrEnd = std::function<void(std::any &trace_data)>;
 
 // Semantic values of memoized parse results: open-addressing hash map keyed
-// by the fused (position * rule count + rule id) index. Match lengths live in
-// a dense per-index array in Context (validity is tracked by its
+// by the index of the cache tables (Context::cache_index). Match lengths live
+// in a dense per-index array in Context (validity is tracked by its
 // registered/success bitvectors), so this map only holds the entries whose
 // result carries a std::any value — a grammar without semantic actions never
-// allocates it. Keys are probed linearly in a flat array; erased slots become
-// tombstones (erase only happens during left-recursion cache invalidation).
+// allocates it. Keys are probed linearly in a flat array.
 class PackratCache {
 public:
   explicit PackratCache(size_t expected_entries) {
@@ -913,7 +1330,7 @@ public:
   bool find(size_t key, std::any &val) const {
     if (keys_.empty()) { return false; }
     auto mask = keys_.size() - 1;
-    auto i = mix(key) & mask;
+    auto i = mix_index(key) & mask;
     while (true) {
       if (keys_[i] == key) {
         val = vals_[i];
@@ -927,51 +1344,17 @@ public:
   void insert_or_assign(size_t key, const std::any &val) {
     if (keys_.empty() || (used_ + 1) * 4 > keys_.size() * 3) { grow(); }
     auto mask = keys_.size() - 1;
-    auto i = mix(key) & mask;
-    auto insert_pos = kEmpty;
-    while (true) {
-      if (keys_[i] == key) {
-        insert_pos = i;
-        break;
-      }
-      if (keys_[i] == kTombstone) {
-        if (insert_pos == kEmpty) { insert_pos = i; }
-      } else if (keys_[i] == kEmpty) {
-        if (insert_pos == kEmpty) { insert_pos = i; }
-        if (keys_[insert_pos] == kEmpty) { used_++; }
-        break;
-      }
+    auto i = mix_index(key) & mask;
+    while (keys_[i] != key && keys_[i] != kEmpty) {
       i = (i + 1) & mask;
     }
-    keys_[insert_pos] = key;
-    vals_[insert_pos] = val;
-  }
-
-  void erase(size_t key) {
-    if (keys_.empty()) { return; }
-    auto mask = keys_.size() - 1;
-    auto i = mix(key) & mask;
-    while (true) {
-      if (keys_[i] == key) {
-        keys_[i] = kTombstone;
-        vals_[i].reset();
-        return;
-      }
-      if (keys_[i] == kEmpty) { return; }
-      i = (i + 1) & mask;
-    }
+    if (keys_[i] == kEmpty) { used_++; }
+    keys_[i] = key;
+    vals_[i] = val;
   }
 
 private:
   static constexpr size_t kEmpty = static_cast<size_t>(-1);
-  static constexpr size_t kTombstone = static_cast<size_t>(-2);
-
-  static size_t mix(size_t key) {
-    // Mix in 64 bits so `h >> 32` stays well-defined where size_t is 32-bit
-    // (wasm32); on 64-bit targets this is bit-identical to the size_t mix.
-    auto h = static_cast<uint64_t>(key) * 0x9E3779B97F4A7C15ull;
-    return static_cast<size_t>(h ^ (h >> 32));
-  }
 
   void grow() {
     auto new_cap = keys_.empty() ? initial_capacity_ : keys_.size() * 2;
@@ -982,8 +1365,8 @@ private:
     used_ = 0;
     auto mask = new_cap - 1;
     for (size_t j = 0; j < old_keys.size(); j++) {
-      if (old_keys[j] == kEmpty || old_keys[j] == kTombstone) { continue; }
-      auto i = mix(old_keys[j]) & mask;
+      if (old_keys[j] == kEmpty) { continue; }
+      auto i = mix_index(old_keys[j]) & mask;
       while (keys_[i] != kEmpty) {
         i = (i + 1) & mask;
       }
@@ -996,7 +1379,69 @@ private:
   size_t initial_capacity_ = 1024;
   std::vector<size_t> keys_;
   std::vector<std::any> vals_;
-  size_t used_ = 0; // occupied + tombstone slots
+  size_t used_ = 0; // occupied slots
+};
+
+/*
+ * StartRuleAnalysis
+ */
+
+// Whatever depends on the start rule lives here, never on the shared rules.
+struct StartRuleAnalysis {
+  std::vector<Definition *> rules;
+  std::vector<Definition *> rules_by_id;
+  bool has_cut = false;
+  bool has_user = false;
+  std::vector<int32_t> packrat_index; // def_id -> cache slot or -1
+  size_t packrat_cached_count = 0;
+  // The rules that the alternatives of choices start with.
+  std::vector<const Definition *> alternative_starts;
+
+  bool indexes(const Definition &rule) const;
+};
+
+// What a rule match goes by to leave out what goes unnoticed: building a
+// value that nothing reads (Holder::parse_core), entering a rule that cannot
+// start (Reference::parse_dispatch), trying an alternative that cannot start
+// (PrioritizedChoice::parse_core), and parsing a rule again where errors are
+// muted (Context::makes_packrat_memo).
+struct RuleUse {
+  // Whether a match is only recognized: it runs no callback, forms no scope
+  // and builds no value.
+  enum class Recognized : uint8_t {
+    never,
+    where_unread, // where the scope it is delivered to holds no rule values
+    always
+  };
+  // Whether the scope of a match that is built holds rule values.
+  enum class ChildValues : uint8_t {
+    read,
+    unread,
+    passed_up // the first is the rule's own value: read where that is
+  };
+  Recognized recognized = Recognized::never;
+  ChildValues child_values = ChildValues::read;
+  bool value_always_empty = false;
+  // Whether entering the rule on a byte it cannot start with would run no
+  // callback.
+  bool skippable = false;
+  // Whether trying the rule where it cannot start can do more than its
+  // first set says: a rule it enters there gives a message, runs a predicate
+  // on an empty match or is left-recursive. Where skipping could be noticed,
+  // such a rule is entered, and an alternative that starts with one is tried,
+  // instead of skipped.
+  bool must_be_tried = true;
+  // Whether the rule is parsed only where errors are muted, so that a memo
+  // that notes nothing is reused only where nothing is noted either
+  // (Context::makes_packrat_memo).
+  bool parsed_only_where_muted = false;
+};
+
+// The RuleUse of each rule, by id, and whether some alternative starts with
+// a rule that must be tried.
+struct RuleUses {
+  std::vector<RuleUse> by_id;
+  bool some_must_be_tried = true;
 };
 
 class Context {
@@ -1007,125 +1452,247 @@ public:
 
   ErrorInfo error_info;
   bool recovered = false;
+  // Where each recovery has reported what was pending, if anything. Parsing
+  // a rule again after
+  // backtracking runs a recovery in it again where it ran, and reusing the
+  // rule's memo does not: either way, it reports nothing there again.
+  std::set<std::pair<const Ope *, const char *>> reported_recoveries;
 
   std::vector<std::unique_ptr<SemanticValues>> value_stack;
   size_t value_stack_size = 0;
 
   std::vector<Definition *> rule_stack;
+  // Where the outermost token rule on rule_stack is, if there is one: a
+  // failure inside it is reported under its name.
+  size_t outer_token_rule = static_cast<size_t>(-1);
 
-  // One frame per rule reference: the macro arguments in scope, and the
-  // instantiation they identify (0 for anything but a left-recursive macro).
-  struct ArgsFrame {
-    std::vector<std::shared_ptr<Ope>> args;
-    size_t macro_inst = 0;
-  };
-  // Popped frames stay in the vector so their args keep their capacity for
-  // the next push at the same depth (same reuse scheme as value_stack).
-  std::vector<ArgsFrame> args_stack;
-  size_t args_stack_size = 0;
+  const Definition *current_rule() const {
+    return rule_stack.empty() ? nullptr : rule_stack.back();
+  }
+  const Definition *token_rule() const {
+    return outer_token_rule < rule_stack.size() ? rule_stack[outer_token_rule]
+                                                : nullptr;
+  }
 
-  size_t in_token_boundary_count = 0;
+  // `rule` is not entered at `a_s`, where it cannot start: this notes the
+  // failures trying it would.
+  void note_untried(const Definition &rule, const char *a_s) {
+    if (collects_expected_tokens()) {
+      note_failure(a_s, {nullptr, &rule}, false);
+    }
+  }
+
+  void push_rule(Definition *rule);
+  void pop_rule() {
+    rule_stack.pop_back();
+    if (outer_token_rule == rule_stack.size()) {
+      outer_token_rule = static_cast<size_t>(-1);
+    }
+  }
 
   std::shared_ptr<Ope> whitespaceOpe;
   bool in_whitespace = false;
+
+  // No whitespace is skipped after a match in a token, a no_whitespace rule
+  // or the whitespace, so a rule may match differently there than at the
+  // same position elsewhere, and a call of it there is one of its own
+  // (RuleCall). Only a parse with whitespace sets this.
+  bool skips_no_whitespace = false;
 
   std::shared_ptr<Ope> wordOpe;
 
   std::vector<std::pair<std::string_view, std::string>> capture_entries;
 
   // False when the grammar contains no Cut or Recovery ope (determined once
-  // at id-assignment time); lets PrioritizedChoice skip all cut_stack work.
+  // at id-assignment time); lets choices and predicates skip all cut_stack
+  // work.
   const bool has_cut;
-  std::vector<bool> cut_stack;
+  // Not std::vector<bool>: GCC 12 to 14 drop its pop_back from a scope_exit
+  // on the path an exception takes.
+  std::vector<char> cut_stack;
 
   const size_t def_count;
+  const StartRuleAnalysis *const analysis;
   const bool enablePackratParsing;
   const std::vector<int32_t> *packrat_index; // def_id -> cache slot or -1
   size_t packrat_cached_count;               // number of memoized rules
   std::vector<bool> cache_registered;
   std::vector<bool> cache_success;
-  // Match length per (position, memoized rule), indexed like the bitvectors
-  // above. Left uninitialized on purpose: a slot is only read once
-  // cache_success marks it, which happens after it is written.
+  // Match length per cache_index(), like the bitvectors above. Left
+  // uninitialized on purpose: a slot is only read once cache_success marks
+  // it, which happens after it is written.
   std::unique_ptr<uint32_t[]> cache_len;
-  // Innermost active start position per rule; re-entry guard for rules that
-  // are not memoized (replaces the per-position bitvector for them).
-  std::vector<const char *> active_pos;
 
   PackratCache cache_values;
 
-  // Left recursion support
-  struct LRMemo {
-    size_t len = static_cast<size_t>(-1);
+  // What a match of a rule produced: its length, and the parts a caller may
+  // read.
+  struct RuleMatch {
+    size_t len = kFail;
     std::any val;
+    std::string_view token;
   };
 
-  // A left-recursive rule instance: the definition plus, for a macro, the
-  // instantiation it was invoked with (0 for a plain rule). Two
-  // instantiations of the same macro grow independent seeds.
-  using LRRule = std::pair<const Definition *, size_t>;
-  using LRKey = std::pair<LRRule, const char *>;
+  // Left recursion support
+  // Rules being parsed, by skips_no_whitespace. A rule with an id only needs
+  // its innermost start there, since a nested call never starts before its
+  // caller. A rule without one is kept by its calls.
+  std::vector<const char *> active_pos[2];
+  std::set<RuleCall> in_progress;
 
-  std::map<LRKey, LRMemo> lr_memo;
-
-  // Rules whose lr_memo was hit during the current parse scope.
-  // Used to track LR cycle membership.
-  std::set<LRRule> lr_refs_hit;
-
-  // Rules currently in their seeding/growing phase at a given position.
-  // Protected from having their lr_memo erased by inner growers.
-  std::set<LRKey> lr_active_seeds;
-
-  // Interned macro instantiations: (definition, resolved arguments) -> id.
-  std::map<std::vector<const void *>, size_t> macro_inst_ids;
-  size_t next_macro_inst_ = 1;
-
-  // Map a def_id to its slot in the cache tables, or -1 for guard-only
-  // rules (not memoized).
-  int32_t cache_slot(size_t def_id) const {
-    if (!packrat_index) { return static_cast<int32_t>(def_id); }
-    return def_id < packrat_index->size() ? (*packrat_index)[def_id] : -1;
+  // A packrat memo stands in for parsing the rule again, the failures it
+  // notes included. The whitespace notes no failure, so a parse in it makes
+  // no memo, though it reuses those of the tokens. Nor does a parse where
+  // errors are muted, unless the rule is parsed only where they are. (A
+  // left-recursive rule, which needs its matches to grow in linear time,
+  // keeps them otherwise: see LRMemo.)
+  bool makes_packrat_memo(const RuleUse &use) const {
+    return !in_whitespace && (!mutes_errors || use.parsed_only_where_muted);
   }
 
-  void clear_packrat_cache(const char *pos, size_t def_id) {
-    if (!enablePackratParsing) { return; }
-    auto slot = cache_slot(def_id);
-    if (slot < 0) { return; }
-    auto col = static_cast<size_t>(pos - s);
-    auto idx = packrat_cached_count * col + static_cast<size_t>(slot);
-    if (idx < cache_registered.size()) {
-      cache_registered[idx] = false;
-      cache_success[idx] = false;
+  RuleCall call_of(const Holder &rule, const char *a_s) const {
+    return {&rule, a_s, skips_no_whitespace};
+  }
+
+  // Parses what the memo of `call` will hold, and keeps what the parse notes
+  // with the memo (ErrorInfo::open_frame) if it makes one. In the parse, a
+  // failure is named by the outermost token rule in it.
+  template <typename T> void parse_memoized(const RuleCall &call, T parse) {
+    auto keeps = collects_expected_tokens();
+    auto outer = outer_token_rule;
+    if (keeps) {
+      error_info.open_frame(token_rule());
+      outer_token_rule = static_cast<size_t>(-1);
     }
-    cache_values.erase(idx);
+    parse();
+    if (keeps) {
+      outer_token_rule = outer;
+      error_info.close_frame(call);
+    }
   }
 
-  void write_packrat_cache(const char *pos, size_t def_id, size_t len,
-                           const std::any &val) {
-    if (!enablePackratParsing) { return; }
-    auto slot = cache_slot(def_id);
-    if (slot < 0) { return; }
-    auto col = pos - s;
-    auto idx = packrat_cached_count * static_cast<size_t>(col) +
-               static_cast<size_t>(slot);
-    if (idx >= cache_registered.size()) { return; }
+  static constexpr size_t no_growth = static_cast<size_t>(-1);
+
+  // Confirmed matches of left-recursive rules. One built from the seed of a
+  // rule growing around it, growing[built_from], goes when that seed changes
+  // or stops growing. A match is kept wherever it is parsed: each round of
+  // growing a rule parses the rules below it again at its position, and
+  // without their matches would grow them again. One parsed where no failure
+  // is noted (notes_failures) notes none, so it is reused only where none
+  // are noted either, and growing the rule again where they are replaces it.
+  struct LRMemo {
+    RuleMatch match;
+    size_t built_from;
+    bool notes_failures;
+  };
+  std::map<RuleCall, LRMemo> lr_memo;
+
+  // The left-recursive rules growing their seeds, innermost last. A rule
+  // parsed inside another starts at or after it, so the ones growing where
+  // the parse is are on top. A rule that reaches a seed at its own start is
+  // in its cycle, which left recursion detection marks, so only the matches
+  // of left-recursive rules are taken to be built from a seed.
+  struct Growth {
+    RuleCall call;
+    RuleMatch seed;
+    // The innermost growth around this one whose seed its parse used.
+    size_t built_from;
+    // The confirmed matches built from this seed.
+    std::vector<RuleCall> built;
+  };
+  std::vector<Growth> growing;
+
+  size_t growth_of(const RuleCall &call) const {
+    for (auto i = growing.size(); i-- > 0 && growing[i].call.pos == call.pos;) {
+      if (growing[i].call == call) { return i; }
+    }
+    return no_growth;
+  }
+
+  // What the rules growing inside growing[i] match is built from its seed.
+  void use_seed(size_t i) {
+    for (auto j = i + 1; j < growing.size(); j++) {
+      auto &built_from = growing[j].built_from;
+      if (built_from == no_growth || built_from < i) { built_from = i; }
+    }
+  }
+
+  void forget_built(size_t i) {
+    for (const auto &call : growing[i].built) {
+      lr_memo.erase(call);
+    }
+    growing[i].built.clear();
+  }
+
+  // The instances of the macros this parse calls: their bodies with the
+  // parameters replaced by the arguments, keyed by macro_inst_key. Released
+  // last made first: a later one may take an argument that an earlier one
+  // made, and releasing the earlier ones first would leave a chain of such
+  // arguments (`M(s) <- M(s / 'x')`) to be freed recursively at once.
+  struct Instance {
+    const Holder *body = nullptr;
+    // Where it is being parsed, by skips_no_whitespace, unless it is
+    // left-recursive.
+    const char *active_pos[2] = {};
+  };
+  Instance &instance(const Reference &call);
+  std::vector<std::shared_ptr<Holder>> instances;
+  std::map<std::vector<const void *>, Instance> instance_by_key;
+  std::unordered_map<const Reference *, Instance *> instance_of_call;
+
+  bool has_id(const Definition &rule) const {
+    return analysis && analysis->indexes(rule);
+  }
+
+  // Map a def_id to its slot in the cache tables, or -1 for rules that are
+  // not memoized.
+  int32_t cache_slot(size_t def_id) const {
+    if (!packrat_index) { return -1; }
+    assert(def_id < packrat_index->size());
+    return (*packrat_index)[def_id];
+  }
+
+  // A rule or a macro instance entered again where it is being parsed is on
+  // left recursion that detection missed, and fails there, so a result then
+  // depends on what is being parsed around it. No match is reused from then
+  // on.
+  bool enters_again(bool again) {
+    if (again) { packrat_index = nullptr; }
+    return again;
+  }
+  // `active` is where the innermost call in progress started, which a nested
+  // call never starts before.
+  bool enters_again(const char *active, const char *a_s) {
+    assert(!active || active <= a_s);
+    return enters_again(active == a_s);
+  }
+
+  // The cache tables have a run of entries per memoized rule, one for each
+  // position, and with whitespace a second run for the matches where none is
+  // skipped. A rule that rarely succeeds leaves the pages of its run in
+  // cache_len untouched.
+  size_t cache_size() const {
+    return packrat_cached_count * (whitespaceOpe ? 2 : 1) * (l + 1);
+  }
+
+  size_t cache_index(int32_t slot, const char *pos) const {
+    assert(!skips_no_whitespace || whitespaceOpe);
+    auto run = static_cast<size_t>(slot) +
+               (skips_no_whitespace ? packrat_cached_count : 0);
+    return run * (l + 1) + static_cast<size_t>(pos - s);
+  }
+
+  void write_packrat_cache(size_t idx, size_t len, const std::any &val) {
     if (sizeof(size_t) > sizeof(uint32_t) &&
         len > static_cast<size_t>(UINT32_MAX)) {
-      // A match too long for the 32-bit memo: forget the pre-registered
-      // failure so the rule simply re-parses at this position.
-      cache_registered[idx] = false;
+      // A match too long for the 32-bit memo is not memoized, so the rule
+      // simply re-parses at this position.
       return;
     }
     cache_registered[idx] = true;
     cache_success[idx] = true;
     cache_len[idx] = static_cast<uint32_t>(len);
-    if (val.has_value()) {
-      cache_values.insert_or_assign(idx, val);
-    } else {
-      // A regrow of a left-recursive seed may replace a value-carrying
-      // result with an empty one; drop the stale value if any was stored.
-      cache_values.erase(idx);
-    }
+    if (val.has_value()) { cache_values.insert_or_assign(idx, val); }
   }
 
   TracerEnter tracer_enter;
@@ -1134,67 +1701,131 @@ public:
   std::any trace_data;
   const bool verbose_trace;
 
-  // True when nothing in this parse can observe semantic values: no
-  // action/enter/leave/predicate on any reachable rule, no User or
-  // PrecedenceClimbing ope, no tracer, log, or error reporter. Rule
-  // invocations then skip all semantic-value bookkeeping and parse
-  // straight into the caller's scope. Decided at parse start (callbacks
-  // can be attached between parses).
-  bool recognize_only = false;
+  // The rule matches in progress, and the right operands a precedence rule
+  // is parsing. Counted only under a limit.
+  size_t depth = 0;
+  size_t max_depth = std::numeric_limits<size_t>::max();
 
-  // True when error reporting or tracing is active, i.e. when rule_stack
-  // must reflect the full chain of rules being parsed. Without them only
-  // rules whose body invokes a macro need to appear on the stack (their
-  // arguments resolve against the innermost rule's params).
-  const bool needs_rule_stack;
+  bool limits_depth() const {
+    return max_depth != std::numeric_limits<size_t>::max();
+  }
 
-  // Byte-wise tolower frozen at parse start, so case-insensitive matching
-  // avoids a locale-sensitive libc call per input byte.
-  unsigned char tolower_table[256];
+  // One level deeper until the result goes out of scope. Too deep a nesting
+  // abandons the whole parse: failing this match instead would let the parse
+  // go on by backtracking, possibly to a different result.
+  auto nest(const char *pos, const Definition &rule) {
+    if (limits_depth() && ++depth > max_depth) {
+      throw NestingTooDeep{pos, &rule};
+    }
+    return scope_exit([this]() {
+      if (limits_depth()) { depth--; }
+    });
+  }
 
   Log log;
   ErrorReporter error_reporter;
+  // Whether someone listens to errors.
+  const bool reports_errors;
+  // Nothing is reported from the operand of `!` or the expression of a
+  // recovery: what they fail to match is not what the input lacks.
+  bool mutes_errors = false;
+  bool reports_here() const { return reports_errors && !mutes_errors; }
+  auto mute_errors() {
+    return scope_exit([this, was = std::exchange(mutes_errors, true)]() {
+      mutes_errors = was;
+    });
+  }
 
-  Context(const char *path, const char *s, size_t l, size_t def_count,
-          std::shared_ptr<Ope> whitespaceOpe, std::shared_ptr<Ope> wordOpe,
-          bool enablePackratParsing, TracerEnter tracer_enter,
-          TracerLeave tracer_leave, std::any trace_data, bool verbose_trace,
-          Log log, ErrorReporter error_reporter = nullptr,
-          const std::vector<int32_t> *packrat_index = nullptr,
-          size_t packrat_cached_count = 0, bool has_cut = true)
+  // True when error reporting or tracing is active, the only readers of
+  // rule_stack.
+  const bool needs_rule_stack;
+
+  // By rule id. A rule without an entry is always entered and built.
+  const RuleUse *rule_use = nullptr;
+
+  // Whether skipping what must be tried could be noticed: errors are
+  // reported or nesting is limited. It holds for the whole parse, so that a
+  // recovery, which reports nothing, leaves the memos a parse without
+  // shortcuts would.
+  bool notices_skipping = false;
+  // Whether a choice checks each alternative for one that must be tried:
+  // skipping could be noticed, and some alternative starts with such a rule.
+  bool checks_alternatives = false;
+  bool must_be_tried(const FirstSet &fs) const;
+
+  // The body of a match that is only recognized parses into this scope.
+  SemanticValues unread_scope;
+
+  // A tracer and a User operator see the scopes as they are, so every match
+  // is built and every value delivered.
+  bool builds_everything = false;
+
+  // Whether a rule that cannot start with the next byte may fail without
+  // being entered, noting what entering it would. It is entered all the same
+  // for a tracer to see it.
+  bool skips_rules = false;
+
+  // Until the returned guard goes, neither the values nor the tokens of
+  // rule matches are delivered to `vs`: what is parsed is thrown away.
+  auto unread_in(SemanticValues &vs) {
+    auto se = scope_exit([&vs, values = vs.holds_rule_values_,
+                          tokens = vs.holds_rule_tokens_]() {
+      vs.holds_rule_values_ = values;
+      vs.holds_rule_tokens_ = tokens;
+    });
+    if (!builds_everything) {
+      vs.holds_rule_values_ = false;
+      vs.holds_rule_tokens_ = false;
+    }
+    return se;
+  }
+
+  // Parses with `parse` into a scope of its own, thrown away with what it
+  // holds.
+  template <typename T> size_t parse_thrown_away(T parse) {
+    auto &vs = push_semantic_values_scope();
+    auto se = scope_exit([&]() { pop_semantic_values_scope(); });
+    auto unread = unread_in(vs);
+    return parse(vs);
+  }
+
+  Context(const char *path, const char *s, size_t l,
+          const StartRuleAnalysis *analysis, std::shared_ptr<Ope> whitespaceOpe,
+          std::shared_ptr<Ope> wordOpe, bool enablePackratParsing,
+          TracerEnter tracer_enter, TracerLeave tracer_leave,
+          std::any trace_data, bool verbose_trace, Log log,
+          ErrorReporter error_reporter = nullptr)
       : path(path), s(s), l(l), whitespaceOpe(whitespaceOpe), wordOpe(wordOpe),
-        has_cut(has_cut), def_count(def_count),
-        enablePackratParsing(enablePackratParsing),
-        packrat_index(packrat_index),
-        packrat_cached_count(packrat_index ? packrat_cached_count : def_count),
-        cache_registered(
-            enablePackratParsing ? this->packrat_cached_count * (l + 1) : 0),
-        cache_success(
-            enablePackratParsing ? this->packrat_cached_count * (l + 1) : 0),
-        cache_len(enablePackratParsing && this->packrat_cached_count
-                      ? new uint32_t[this->packrat_cached_count * (l + 1)]
-                      : nullptr),
-        active_pos(enablePackratParsing ? def_count : 0, nullptr),
-        cache_values(enablePackratParsing ? (packrat_index ? l / 8 + 16 : l / 2)
-                                          : 0),
+        has_cut(analysis ? analysis->has_cut : true),
+        def_count(analysis ? analysis->rules_by_id.size() : 0),
+        analysis(analysis), enablePackratParsing(enablePackratParsing),
+        packrat_index(analysis && enablePackratParsing
+                          ? &analysis->packrat_index
+                          : nullptr),
+        packrat_cached_count(packrat_index ? analysis->packrat_cached_count
+                                           : 0),
+        cache_registered(cache_size()), cache_success(cache_size()),
+        cache_len(this->packrat_cached_count ? new uint32_t[cache_size()]
+                                             : nullptr),
+        cache_values(packrat_index ? l / 8 + 16 : 0),
+        active_pos{std::vector<const char *>(def_count),
+                   std::vector<const char *>(def_count)},
         tracer_enter(tracer_enter), tracer_leave(tracer_leave),
         has_tracer(tracer_enter && tracer_leave), trace_data(trace_data),
-        verbose_trace(verbose_trace),
-        needs_rule_stack(static_cast<bool>(tracer_enter) ||
-                         static_cast<bool>(tracer_leave) ||
-                         static_cast<bool>(log) ||
-                         static_cast<bool>(error_reporter)),
-        log(log), error_reporter(error_reporter) {
-
-    for (size_t i = 0; i < 256; i++) {
-      tolower_table[i] =
-          static_cast<unsigned char>(std::tolower(static_cast<int>(i)));
-    }
-
-    push_empty_args();
+        verbose_trace(verbose_trace), log(log), error_reporter(error_reporter),
+        reports_errors(log || error_reporter),
+        needs_rule_stack(tracer_enter || tracer_leave || reports_errors),
+        unread_scope(this) {
+    unread_scope.path = path;
+    unread_scope.ss = s;
+    unread_scope.holds_rule_values_ = false;
+    unread_scope.is_read_ = false;
   }
 
   ~Context() {
+    while (!instances.empty()) {
+      instances.pop_back();
+    }
     assert(!value_stack_size);
     assert(cut_stack.empty());
   }
@@ -1203,6 +1834,59 @@ public:
   Context(Context &&) = delete;
   Context operator=(const Context &) = delete;
 
+  // A context to parse on the side with: it reads the input of `c`, and
+  // reports and traces nothing.
+  static Context detached(const Context &c) {
+    return Context(nullptr, c.s, c.l, nullptr, nullptr, nullptr, false, nullptr,
+                   nullptr, nullptr, false, nullptr);
+  }
+
+  // Keeps what is parsed in its scope out of the trace, unless it is verbose.
+  struct TraceMute {
+    explicit TraceMute(Context &c) : c_(c), save_(c.ignore_trace_state) {
+      c.ignore_trace_state = !c.verbose_trace;
+    }
+    ~TraceMute() { c_.ignore_trace_state = save_; }
+    TraceMute(const TraceMute &) = delete;
+    TraceMute &operator=(const TraceMute &) = delete;
+
+  private:
+    Context &c_;
+    bool save_;
+  };
+
+  // Whether a message at `pos` is reported: a failure here is noted, and no
+  // message given for the same error lies at or past `pos`. So nothing in the
+  // whitespace gives one, as a rule there fails wherever the whitespace stops.
+  bool reports_message_at(const char *pos) const {
+    return collects_expected_tokens() &&
+           !error_info.message_lies_at_or_after(pos);
+  }
+
+  // A failure at `pos` gives the message `make` returns where the failure is
+  // the error: what it noted since `mark` is at the furthest failure, or
+  // `pos` is at or past it and becomes the error.
+  template <typename T>
+  void give_message(const char *pos, const ErrorInfo::Mark &mark, T make,
+                    const std::string &label = "") {
+    if (reports_message_at(pos) &&
+        (error_info.noted_since(mark) || error_info.advance_to(pos))) {
+      error_info.set_message(pos, make(), label);
+    }
+  }
+
+  // When the returned guard goes, a cut or a recovery made meanwhile has
+  // committed no choice entered before: a predicate's operand leaves nothing
+  // but its result. Such a cut marks the innermost choice, which the guard
+  // puts back as it was; a choice entered meanwhile has a mark of its own.
+  auto contain_cuts() {
+    const auto choices = has_cut ? cut_stack.size() : 0;
+    const auto marked = choices && cut_stack[choices - 1];
+    return scope_exit([this, choices, marked]() {
+      if (choices) { cut_stack[choices - 1] = marked; }
+    });
+  }
+
   // Per-rule packrat stats (populated when packrat_stats is non-null)
   struct PackratStats {
     size_t hits = 0;
@@ -1210,66 +1894,22 @@ public:
   };
   std::vector<PackratStats> *packrat_stats = nullptr;
 
+  // What a rule that is not left-recursive matches at a position. Entered
+  // again where it is being parsed, it fails instead of recursing forever; a
+  // memoized match is reused, and otherwise `parse` makes the match. The
+  // packrat memo holds no token, so a match whose token is needed is parsed.
   template <typename T>
-  void packrat(const char *a_s, size_t def_id, size_t &len, std::any &val,
-               T fn) {
-    if (!enablePackratParsing) {
-      fn(val);
-      return;
-    }
+  void reuse_or_parse(const char *a_s, const Definition &rule, bool rule_has_id,
+                      bool needs_token, RuleMatch &match, T parse);
 
-    auto slot = cache_slot(def_id);
-    if (slot < 0) {
-      // Guard-only rule: no memoization. Recursion at the same position is
-      // caught by the per-rule active-position guard.
-      if (active_pos[def_id] == a_s) {
-        if (packrat_stats && def_id < packrat_stats->size()) {
-          (*packrat_stats)[def_id].hits++;
-        }
-        len = static_cast<size_t>(-1);
-        return;
-      }
-      if (packrat_stats && def_id < packrat_stats->size()) {
-        (*packrat_stats)[def_id].misses++;
-      }
-      auto save = active_pos[def_id];
-      active_pos[def_id] = a_s;
-      fn(val);
-      active_pos[def_id] = save;
-      return;
-    }
-
-    auto col = a_s - s;
-    auto idx = packrat_cached_count * static_cast<size_t>(col) +
-               static_cast<size_t>(slot);
-
-    if (cache_registered[idx]) {
-      if (packrat_stats && def_id < packrat_stats->size()) {
-        (*packrat_stats)[def_id].hits++;
-      }
-      if (cache_success[idx]) {
-        len = cache_len[idx];
-        if (!cache_values.find(idx, val)) { val.reset(); }
-        return;
-      } else {
-        len = static_cast<size_t>(-1);
-        return;
-      }
-    } else {
-      // Pre-register as failure (re-entry guard + failure memoization)
-      cache_registered[idx] = true;
-      cache_success[idx] = false;
-
-      if (packrat_stats && def_id < packrat_stats->size()) {
-        (*packrat_stats)[def_id].misses++;
-      }
-
-      fn(val);
-
-      if (success(len)) { write_packrat_cache(a_s, def_id, len, val); }
-      return;
-    }
-  }
+  // What a left-recursive rule matches at a position. Entered again where it
+  // is being parsed, it gets the match found so far, its seed, and it is
+  // parsed again for as long as that makes the seed grow. Its confirmed match
+  // is reused, but one built from the seed of a rule growing around it only
+  // while that rule grows the same seed.
+  template <typename T>
+  void reuse_or_grow(const char *a_s, const Holder &rule, RuleMatch &match,
+                     T parse);
 
   // Semantic values
   SemanticValues &push_semantic_values_scope() {
@@ -1292,67 +1932,13 @@ public:
     vs.sv_ = std::string_view();
     vs.choice_count_ = 0;
     vs.choice_ = 0;
+    vs.holds_rule_values_ = true;
+    vs.holds_rule_tokens_ = false;
     if (!vs.tokens.empty()) { vs.tokens.clear(); }
     return vs;
   }
 
   void pop_semantic_values_scope() { value_stack_size--; }
-
-  // Arguments
-  // Borrow the retained vector of the frame the next push will occupy, so a
-  // caller can fill it before pushing without a fresh heap allocation.
-  std::vector<std::shared_ptr<Ope>> take_args_buffer() {
-    if (args_stack_size < args_stack.size()) {
-      auto v = std::move(args_stack[args_stack_size].args);
-      v.clear();
-      return v;
-    }
-    return {};
-  }
-
-  void push_args(std::vector<std::shared_ptr<Ope>> &&args,
-                 size_t macro_inst = 0) {
-    if (args_stack_size == args_stack.size()) {
-      args_stack.push_back({std::move(args), macro_inst});
-    } else {
-      auto &frame = args_stack[args_stack_size];
-      frame.args = std::move(args);
-      frame.macro_inst = macro_inst;
-    }
-    args_stack_size++;
-  }
-
-  // An empty argument scope keeps the frame's retained vector (just
-  // cleared), where push_args({}) would deallocate it.
-  void push_empty_args() {
-    if (args_stack_size == args_stack.size()) { args_stack.emplace_back(); }
-    auto &frame = args_stack[args_stack_size];
-    frame.args.clear();
-    frame.macro_inst = 0;
-    args_stack_size++;
-  }
-
-  void pop_args() { args_stack_size--; }
-
-  const std::vector<std::shared_ptr<Ope>> &top_args() const {
-    return args_stack[args_stack_size - 1].args;
-  }
-
-  size_t top_macro_inst() const {
-    return args_stack[args_stack_size - 1].macro_inst;
-  }
-
-  // Identify a macro invocation by what its resolved arguments denote (see
-  // macro_inst_key). `Sum(A)` inside `Sum(N)`'s own body resolves A back to
-  // the argument the outer call was given, so both invocations intern to the
-  // same id and the inner one finds the outer's seed — which is what makes
-  // growing terminate.
-  size_t intern_macro_inst(std::vector<const void *> &&key) {
-    auto [it, inserted] =
-        macro_inst_ids.emplace(std::move(key), next_macro_inst_);
-    if (inserted) { next_macro_inst_++; }
-    return it->second;
-  }
 
   // Snapshot/Rollback
   struct Snapshot {
@@ -1370,24 +1956,48 @@ public:
             vs.choice_count_, vs.choice_,     capture_entries.size()};
   }
 
+  // Mostly there is nothing to drop, and resize is an out-of-line call.
+  template <typename T> static void truncate(T &v, size_t size) {
+    if (v.size() > size) { v.resize(size); }
+  }
+
   void rollback(SemanticValues &vs, const Snapshot &snap) {
-    vs.resize(snap.sv_size);
-    vs.tags.resize(snap.sv_tags_size);
-    vs.tokens.resize(snap.sv_tokens_size);
+    truncate(vs, snap.sv_size);
+    truncate(vs.tags, snap.sv_tags_size);
+    truncate(vs.tokens, snap.sv_tokens_size);
     vs.sv_ = snap.sv_sv;
     vs.choice_count_ = snap.choice_count;
     vs.choice_ = snap.choice;
-    capture_entries.resize(snap.capture_size);
+    truncate(capture_entries, snap.capture_size);
   }
 
   // Skip trailing whitespace with trace suppression.
   // Returns whitespace length, or -1 on failure.
-  // No-op (returns 0) if inside a token boundary or no whitespaceOpe.
+  // No-op (returns 0) where skips_no_whitespace or without whitespaceOpe.
   size_t skip_whitespace(const char *a_s, size_t n, SemanticValues &vs,
                          std::any &dt);
 
+  // Parses `ope` where no whitespace is skipped.
+  size_t parse_without_whitespace(const Ope &ope, const char *a_s, size_t n,
+                                  SemanticValues &vs, std::any &dt);
+
   // Error
-  void set_error_pos(const char *a_s, const char *literal = nullptr);
+  // Where a failure is noted if errors are reported, which does not depend on
+  // whether they are, so that the same rules are entered either way. What
+  // skipping whitespace fails to match is not what the input lacks.
+  bool notes_failures() const { return !mutes_errors && !in_whitespace; }
+  bool collects_expected_tokens() const {
+    return reports_errors && notes_failures();
+  }
+  void set_error_pos(const char *a_s, const char *literal = nullptr,
+                     bool copy_literal = false) {
+    if (collects_expected_tokens()) {
+      note_failure(a_s, {literal, nullptr}, literal && copy_literal);
+    }
+  }
+  // Out of line, so that set_error_pos is small enough to be inlined into
+  // the failures of a parse that collects nothing.
+  void note_failure(const char *a_s, StartFailure failure, bool copy_literal);
 
   // Trace
   void trace_enter(const Ope &ope, const char *a_s, size_t n,
@@ -1452,23 +2062,10 @@ public:
 
   bool is_token_boundary = false;
   bool is_choice_like = false;
-};
 
-// Keyword-guarded identifier data, heap-allocated only for matching Sequences.
-// Avoids bloating all Sequence objects with bitsets and keyword sets.
-struct KeywordGuardData {
-  std::bitset<256> identifier_first;        // first char of identifier
-  std::bitset<256> identifier_rest;         // subsequent chars of identifier
-  std::vector<std::string> exact_keywords;  // single-word keywords (lowercase)
-  std::vector<std::string> prefix_keywords; // first word of compound keywords
-  size_t min_keyword_len = 0;
-  size_t max_keyword_len = 0;
-
-  static bool matches_any(const std::vector<std::string> &keywords,
-                          std::string_view input) {
-    return std::any_of(keywords.begin(), keywords.end(),
-                       [&](const auto &kw) { return kw == input; });
-  }
+private:
+  size_t parse_traced(const char *s, size_t n, SemanticValues &vs, Context &c,
+                      std::any &dt) const;
 };
 
 class Sequence : public Ope {
@@ -1481,14 +2078,6 @@ public:
 
   size_t parse_core(const char *s, size_t n, SemanticValues &vs, Context &c,
                     std::any &dt) const override {
-    // Keyword-guarded identifier fast path:
-    // Fuses !ReservedKeyword <identifier> into scan-then-lookup
-    if (kw_guard_) {
-      if (auto result = parse_keyword_guarded(s, n, vs, c, dt)) {
-        return *result;
-      }
-      // nullopt means prefix keyword match — fall through to normal path
-    }
     size_t i = 0;
     for (const auto &ope : opes_) {
       auto len = ope->parse(s + i, n - i, vs, c, dt);
@@ -1501,73 +2090,47 @@ public:
   void accept(Visitor &v) override;
 
   std::vector<std::shared_ptr<Ope>> opes_;
-
-private:
-  friend struct SetupFirstSets;
-  std::unique_ptr<KeywordGuardData> kw_guard_;
-
-  // Returns parse result, or nullopt to fall through to normal path
-  std::optional<size_t> parse_keyword_guarded(const char *s, size_t n,
-                                              SemanticValues &vs, Context &c,
-                                              std::any &dt) const {
-    const auto &kw = *kw_guard_;
-    if (n < 1 || !kw.identifier_first.test(static_cast<unsigned char>(*s))) {
-      c.set_error_pos(s);
-      return static_cast<size_t>(-1);
-    }
-    // Scan identifier using bitset
-    size_t id_len = 1;
-    while (id_len < n &&
-           kw.identifier_rest.test(static_cast<unsigned char>(s[id_len]))) {
-      id_len++;
-    }
-    // Skip keyword matching if identifier length is out of range
-    if (id_len >= kw.min_keyword_len && id_len <= kw.max_keyword_len) {
-      char lower_buf[64];
-      std::unique_ptr<char[]> lower_heap;
-      char *lower = lower_buf;
-      if (id_len > sizeof(lower_buf)) {
-        lower_heap.reset(new char[id_len]);
-        lower = lower_heap.get();
-      }
-      std::transform(s, s + id_len, lower, [&c](unsigned char ch) {
-        return static_cast<char>(c.tolower_table[ch]);
-      });
-      std::string_view lower_sv(lower, id_len);
-
-      if (KeywordGuardData::matches_any(kw.exact_keywords, lower_sv)) {
-        c.set_error_pos(s);
-        return static_cast<size_t>(-1);
-      }
-      if (KeywordGuardData::matches_any(kw.prefix_keywords, lower_sv)) {
-        return std::nullopt;
-      }
-    }
-    // Success: emit token and consume trailing whitespace
-    if (!c.recognize_only) {
-      vs.tokens.emplace_back(std::string_view(s, id_len));
-    }
-    auto wl = c.skip_whitespace(s + id_len, n - id_len, vs, dt);
-    if (fail(wl)) { return wl; }
-    return id_len + wl;
-  }
 };
 
-struct FirstSet {
-  // First-Set: set of possible first bytes for an expression.
-  // Used by PrioritizedChoice to skip alternatives that cannot match.
-  std::bitset<256> chars;    // byte values that can appear as the first byte
-  bool can_be_empty = false; // true if the expression can match empty string
-  bool any_char = false;     // true if any character can appear (cannot filter)
-  const char *first_literal = nullptr; // first literal for error reporting
-  const Definition *first_rule =
-      nullptr; // first token rule for error reporting
+// Whether a parse skips the alternatives of a choice and the rules that
+// cannot start with the next byte, and matches a repeated character class in
+// one go. The test suite turns these shortcuts off to check that they go
+// unnoticed.
+#ifdef CPPPEGLIB_TEST
+inline bool &takes_shortcuts() {
+  static thread_local bool takes = true;
+  return takes;
+}
+#else
+constexpr bool takes_shortcuts() { return true; }
+#endif
 
+// The bytes a match of an expression can start with. On any other byte, the
+// expression does the same: it matches empty or fails, and either way notes
+// `failures`, as a parse that tried it would. An expression for which that
+// cannot be said can start with any byte. What trying a rule there does that
+// depends on the parse, such as giving a message, is left to
+// RuleUse::must_be_tried. Used to skip what cannot match without trying it.
+//
+// An expression that matches empty on other bytes can match empty, but not
+// the other way round: `&'a'` can, and fails on any byte but 'a'.
+struct FirstSet {
+  std::bitset<256> chars;
+  bool matches_empty_on_other_bytes = false;
+  bool any_char = false;
+  std::vector<StartFailure> failures;
+
+  bool can_start_with(unsigned char byte) const {
+    return any_char || matches_empty_on_other_bytes || chars.test(byte);
+  }
+
+  // Merges where `other` can start, not what it notes.
   void merge(const FirstSet &other) {
     chars |= other.chars;
-    if (other.can_be_empty) { can_be_empty = true; }
+    if (other.matches_empty_on_other_bytes) {
+      matches_empty_on_other_bytes = true;
+    }
     if (other.any_char) { any_char = true; }
-    // Note: first_literal/first_rule are NOT merged — per-alternative
   }
 };
 
@@ -1578,96 +2141,173 @@ public:
       : opes_{static_cast<std::shared_ptr<Ope>>(args)...},
         for_label_(for_label) {
     is_choice_like = true;
+    list_alternatives();
   }
   PrioritizedChoice(const std::vector<std::shared_ptr<Ope>> &opes)
       : opes_(opes) {
     is_choice_like = true;
+    list_alternatives();
   }
-  PrioritizedChoice(std::vector<std::shared_ptr<Ope>> &&opes)
-      : opes_(std::move(opes)) {
+  PrioritizedChoice(std::vector<std::shared_ptr<Ope>> &&opes,
+                    bool for_label = false)
+      : opes_(std::move(opes)), for_label_(for_label) {
+    is_choice_like = true;
+    list_alternatives();
+  }
+  // `like` with these alternatives in place of its own, which start as its
+  // own do.
+  PrioritizedChoice(std::vector<std::shared_ptr<Ope>> &&opes,
+                    const PrioritizedChoice &like)
+      : opes_(std::move(opes)), for_label_(like.for_label_),
+        first_sets_(like.first_sets_), lists_(like.lists_),
+        list_begin_(like.list_begin_) {
     is_choice_like = true;
   }
 
   size_t parse_core(const char *s, size_t n, SemanticValues &vs, Context &c,
                     std::any &dt) const override {
-    size_t len = static_cast<size_t>(-1);
+    size_t len = kFail;
 
+    // A label choice has no flag of its own: a cut in its alternative, or its
+    // recovery, commits the choice around it. It clears that flag to tell a
+    // cut in the alternative from one before it, so it puts back a cut made
+    // before it.
     const auto track_cut = c.has_cut && !for_label_;
+    const auto cut_before =
+        !track_cut && c.has_cut && !c.cut_stack.empty() && c.cut_stack.back();
     if (track_cut) { c.cut_stack.push_back(false); }
     auto se = scope_exit([&]() {
-      if (track_cut) { c.cut_stack.pop_back(); }
+      if (track_cut) {
+        c.cut_stack.pop_back();
+      } else if (cut_before) {
+        c.cut_stack.back() = true;
+      }
     });
 
-    size_t id = 0;
-    for (const auto &ope : opes_) {
-      // First-Set filtering: skip if next byte cannot start this alternative
-      if (n > 0 && id < first_sets_.size()) {
-        const auto &fs = first_sets_[id];
-        if (!fs.any_char && !fs.can_be_empty &&
-            !fs.chars.test(static_cast<unsigned char>(*s))) {
-          if ((c.log || c.error_reporter) &&
-              (fs.first_literal || fs.first_rule)) {
-            if (c.error_info.error_pos <= s) {
-              if (c.error_info.error_pos < s || !(id > 0)) {
-                c.error_info.error_pos = s;
-                c.error_info.expected_tokens.clear();
-              }
-              if (fs.first_literal) {
-                c.error_info.add(fs.first_literal, nullptr);
-              } else {
-                c.error_info.add(nullptr, fs.first_rule);
-              }
-            }
-          }
-          id++;
-          continue;
-        }
-      }
+    const auto reports = c.collects_expected_tokens();
+    const auto skips = n > 0 && first_sets_ && takes_shortcuts();
+    const auto checks = skips && c.checks_alternatives;
+    const auto byte = static_cast<unsigned char>(n > 0 ? *s : 0);
+    const auto list = skips && !checks ? 1 + byte : 0;
+    size_t skipped_from = 0;
+
+    const auto *ids = lists_.data();
+    const auto end = list_begin_[list + 1];
+    for (auto i = list_begin_[list]; i < end; i++) {
+      const size_t id = ids[i];
+      if (checks && !is_tried(id, byte, c)) { continue; }
+
+      if (reports) { note_skipped(skipped_from, id, s, c); }
+      skipped_from = id + 1;
 
       if (c.has_cut && !c.cut_stack.empty()) { c.cut_stack.back() = false; }
 
       auto snap = c.snapshot(vs);
-      c.error_info.keep_previous_token = id > 0;
-
-      len = ope->parse(s, n, vs, c, dt);
+      len = opes_[id]->parse(s, n, vs, c, dt);
 
       if (success(len)) {
         vs.choice_count_ = opes_.size();
         vs.choice_ = id;
-        break;
+        return len;
       }
 
       c.rollback(vs, snap);
 
-      if (c.has_cut && !c.cut_stack.empty() && c.cut_stack.back()) { break; }
-
-      id++;
+      if (c.has_cut && !c.cut_stack.empty() && c.cut_stack.back()) {
+        return len;
+      }
     }
 
-    c.error_info.keep_previous_token = false;
+    if (reports) { note_skipped(skipped_from, opes_.size(), s, c); }
+
     return len;
+  }
+
+  const std::vector<FirstSet> &first_sets() const {
+    static const std::vector<FirstSet> none;
+    return first_sets_ ? *first_sets_ : none;
   }
 
   void accept(Visitor &v) override;
 
   size_t size() const { return opes_.size(); }
 
-  std::vector<std::shared_ptr<Ope>> opes_;
+  const std::vector<std::shared_ptr<Ope>> opes_;
   bool for_label_ = false;
-  std::vector<FirstSet> first_sets_;
+
+private:
+  friend struct SetupFirstSets;
+
+  void set_first_sets(std::vector<FirstSet> first_sets) {
+    first_sets_ =
+        std::make_shared<const std::vector<FirstSet>>(std::move(first_sets));
+    list_alternatives();
+  }
+
+  // The alternatives to try are read from a list. List 0 has them all. With
+  // first sets there is also a list for each byte, of the ones that can
+  // start with it.
+  void list_alternatives() {
+    lists_.clear();
+    list_begin_.clear();
+    lists_.reserve(opes_.size());
+    const size_t list_count = first_sets_ ? 1 + 256 : 1;
+    list_begin_.reserve(list_count + 1);
+
+    auto add_list = [&](auto is_listed) {
+      list_begin_.push_back(static_cast<uint32_t>(lists_.size()));
+      for (size_t id = 0; id < opes_.size(); id++) {
+        if (is_listed(id)) { lists_.push_back(static_cast<uint32_t>(id)); }
+      }
+    };
+
+    add_list([](size_t) { return true; });
+    if (first_sets_) {
+      for (size_t byte = 0; byte < 256; byte++) {
+        add_list([&](size_t id) {
+          return (*first_sets_)[id].can_start_with(
+              static_cast<unsigned char>(byte));
+        });
+      }
+    }
+    list_begin_.push_back(static_cast<uint32_t>(lists_.size()));
+    lists_.shrink_to_fit();
+  }
+
+  bool is_tried(size_t id, unsigned char byte, const Context &c) const {
+    const auto &fs = (*first_sets_)[id];
+    return fs.can_start_with(byte) || c.must_be_tried(fs);
+  }
+
+  // An error report names what the skipped alternatives expected. Trying
+  // any of them would have noted a failure here: what does not match empty
+  // there fails at a literal, a class or a dictionary.
+  void note_skipped(size_t begin, size_t end, const char *s, Context &c) const {
+    if (begin < end && c.error_info.advance_to(s)) {
+      c.error_info.add_skipped(this, begin, end, c.current_rule(),
+                               c.token_rule());
+    }
+  }
+
+  // Shared with the choices made like this one.
+  std::shared_ptr<const std::vector<FirstSet>> first_sets_;
+  std::vector<uint32_t> lists_;
+  // Where each list starts in lists_, then where the last one ends.
+  std::vector<uint32_t> list_begin_;
 };
 
 class Repetition : public Ope {
 public:
+  // `{n,m}` with m below n is taken as `{n}`.
   Repetition(const std::shared_ptr<Ope> &ope, size_t min, size_t max)
-      : ope_(ope), min_(min), max_(max) {}
+      : ope_(ope), min_(min), max_(std::max(min, max)) {}
 
   size_t parse_core(const char *s, size_t n, SemanticValues &vs, Context &c,
                     std::any &dt) const override {
     // ISpan fast path: tight loop for ASCII CharacterClass repetition.
     // Safe because each ASCII match is exactly 1 byte, so byte count == match
     // count.
-    if (span_bitset_) {
+    if (span_bitset_ && takes_shortcuts()) {
       const auto &bitset = *span_bitset_;
       size_t i = 0;
       if (max_ == std::numeric_limits<size_t>::max()) {
@@ -1681,10 +2321,10 @@ public:
           i++;
         }
       }
-      if (i < min_) {
-        c.set_error_pos(s + i);
-        return static_cast<size_t>(-1);
-      }
+      // As matching the class once more would, unless the repetition stopped
+      // at its maximum.
+      if (i < max_) { c.set_error_pos(s + i); }
+      if (i < min_) { return kFail; }
       return i;
     }
 
@@ -1706,6 +2346,11 @@ public:
       }
       i += len;
       count++;
+      // A match that consumes nothing would usually match the same way again
+      // forever, so it ends the repetition. Loading a grammar checks for such
+      // a repetition, but the check is not exhaustive, and a grammar built
+      // with combinators is never checked.
+      if (len == 0 && max_ == std::numeric_limits<size_t>::max()) { break; }
     }
     return i;
   }
@@ -1744,7 +2389,12 @@ public:
   size_t parse_core(const char *s, size_t n, SemanticValues &vs, Context &c,
                     std::any &dt) const override {
     auto snap = c.snapshot(vs);
-    auto len = ope_->parse(s, n, vs, c, dt);
+    size_t len;
+    {
+      auto unread = c.unread_in(vs);
+      auto cuts = c.contain_cuts();
+      len = ope_->parse(s, n, vs, c, dt);
+    }
     c.rollback(vs, snap); // Always rollback — predicates consume nothing
     if (success(len)) {
       return 0;
@@ -1765,11 +2415,17 @@ public:
   size_t parse_core(const char *s, size_t n, SemanticValues &vs, Context &c,
                     std::any &dt) const override {
     auto snap = c.snapshot(vs);
-    auto len = ope_->parse(s, n, vs, c, dt);
+    size_t len;
+    {
+      auto unread = c.unread_in(vs);
+      auto muted = c.mute_errors();
+      auto cuts = c.contain_cuts();
+      len = ope_->parse(s, n, vs, c, dt);
+    }
     c.rollback(vs, snap); // Always rollback — predicates consume nothing
     if (success(len)) {
       c.set_error_pos(s);
-      return static_cast<size_t>(-1);
+      return kFail;
     } else {
       return 0;
     }
@@ -1780,7 +2436,7 @@ public:
   std::shared_ptr<Ope> ope_;
 };
 
-class Dictionary : public Ope, public std::enable_shared_from_this<Dictionary> {
+class Dictionary : public Ope {
 public:
   Dictionary(const std::vector<std::string> &v, bool ignore_case)
       : trie_(v, ignore_case) {
@@ -1795,8 +2451,7 @@ public:
   Trie trie_;
 };
 
-class LiteralString : public Ope,
-                      public std::enable_shared_from_this<LiteralString> {
+class LiteralString : public Ope {
 public:
   LiteralString(std::string &&s, bool ignore_case)
       : lit_(std::move(s)), ignore_case_(ignore_case),
@@ -1820,8 +2475,7 @@ public:
   mutable bool is_word_;
 };
 
-class CharacterClass : public Ope,
-                       public std::enable_shared_from_this<CharacterClass> {
+class CharacterClass : public Ope {
 public:
   CharacterClass(const std::string &s, bool negated, bool ignore_case)
       : negated_(negated), ignore_case_(ignore_case) {
@@ -1852,36 +2506,16 @@ public:
 
   size_t parse_core(const char *s, size_t n, SemanticValues & /*vs*/,
                     Context &c, std::any & /*dt*/) const override {
-    if (n < 1) {
-      c.set_error_pos(s);
-      return static_cast<size_t>(-1);
-    }
-
     char32_t cp = 0;
     auto len = decode_codepoint(s, n, cp);
+    if (len && matches(cp)) { return len; }
 
-    for (const auto &range : ranges_) {
-      if (in_range(range, cp)) {
-        if (negated_) {
-          c.set_error_pos(s);
-          return static_cast<size_t>(-1);
-        } else {
-          return len;
-        }
-      }
-    }
-
-    if (negated_) {
-      return len;
-    } else {
-      c.set_error_pos(s);
-      return static_cast<size_t>(-1);
-    }
+    c.set_error_pos(s);
+    return kFail;
   }
 
   void accept(Visitor &v) override;
 
-  friend struct ComputeFirstSet;
   friend struct GrammarBlob;
   friend struct OpeSignature;
 
@@ -1889,14 +2523,16 @@ public:
   const std::bitset<256> &ascii_bitset() const { return ascii_bitset_; }
 
 private:
-  bool in_range(const std::pair<char32_t, char32_t> &range, char32_t cp) const {
-    if (ignore_case_) {
-      auto cpl = std::tolower(cp);
-      return std::tolower(range.first) <= cpl &&
-             cpl <= std::tolower(range.second);
-    } else {
+  bool in_ranges(char32_t cp) const {
+    return std::any_of(ranges_.begin(), ranges_.end(), [cp](const auto &range) {
       return range.first <= cp && cp <= range.second;
-    }
+    });
+  }
+
+  // With `i`, a letter is listed when either of its cases is in the ranges.
+  bool matches(char32_t cp) const {
+    auto listed = in_ranges(cp) || (ignore_case_ && in_ranges(other_case(cp)));
+    return listed != negated_;
   }
 
   void setup_ascii_bitset() {
@@ -1905,15 +2541,8 @@ private:
       if (lo > 0x7F || hi > 0x7F) { return; }
     }
     is_ascii_only_ = true;
-    for (const auto &[lo, hi] : ranges_) {
-      for (auto cp = lo; cp <= hi; cp++) {
-        auto ch = static_cast<unsigned char>(cp);
-        ascii_bitset_.set(ch);
-        if (ignore_case_) {
-          ascii_bitset_.set(static_cast<unsigned char>(std::toupper(ch)));
-          ascii_bitset_.set(static_cast<unsigned char>(std::tolower(ch)));
-        }
-      }
+    for (char32_t cp = 0; cp <= 0x7F; cp++) {
+      if (matches(cp)) { ascii_bitset_.set(cp); }
     }
   }
 
@@ -1924,23 +2553,18 @@ private:
   bool is_ascii_only_ = false;
 };
 
-class Character : public Ope, public std::enable_shared_from_this<Character> {
+class Character : public Ope {
 public:
   Character(char32_t ch) : ch_(ch) {}
 
   size_t parse_core(const char *s, size_t n, SemanticValues & /*vs*/,
                     Context &c, std::any & /*dt*/) const override {
-    if (n < 1) {
-      c.set_error_pos(s);
-      return static_cast<size_t>(-1);
-    }
-
     char32_t cp = 0;
     auto len = decode_codepoint(s, n, cp);
 
-    if (cp != ch_) {
+    if (!len || cp != ch_) {
       c.set_error_pos(s);
-      return static_cast<size_t>(-1);
+      return kFail;
     }
     return len;
   }
@@ -1950,15 +2574,14 @@ public:
   char32_t ch_;
 };
 
-class AnyCharacter : public Ope,
-                     public std::enable_shared_from_this<AnyCharacter> {
+class AnyCharacter : public Ope {
 public:
   size_t parse_core(const char *s, size_t n, SemanticValues & /*vs*/,
                     Context &c, std::any & /*dt*/) const override {
     auto len = codepoint_length(s, n);
     if (len < 1) {
       c.set_error_pos(s);
-      return static_cast<size_t>(-1);
+      return kFail;
     }
     return len;
   }
@@ -2023,9 +2646,8 @@ public:
 
   size_t parse_core(const char *s, size_t n, SemanticValues & /*vs*/,
                     Context &c, std::any &dt) const override {
-    auto &chvs = c.push_semantic_values_scope();
-    auto se = scope_exit([&]() { c.pop_semantic_values_scope(); });
-    return ope_->parse(s, n, chvs, c, dt);
+    return c.parse_thrown_away(
+        [&](SemanticValues &vs) { return ope_->parse(s, n, vs, c, dt); });
   }
 
   void accept(Visitor &v) override;
@@ -2095,7 +2717,7 @@ private:
 
 using Grammar = std::unordered_map<std::string, Definition>;
 
-class Reference : public Ope, public std::enable_shared_from_this<Reference> {
+class Reference : public Ope {
 public:
   Reference(const Grammar &grammar, const std::string &name, const char *s,
             bool is_macro, const std::vector<std::shared_ptr<Ope>> &args)
@@ -2106,8 +2728,6 @@ public:
                     std::any &dt) const override;
 
   void accept(Visitor &v) override;
-
-  std::shared_ptr<Ope> get_core_operator() const;
 
   const Grammar &grammar_;
   const std::string name_;
@@ -2133,7 +2753,7 @@ public:
     if (c.in_whitespace) { return 0; }
     c.in_whitespace = true;
     auto se = scope_exit([&]() { c.in_whitespace = false; });
-    return ope_->parse(s, n, vs, c, dt);
+    return c.parse_without_whitespace(*ope_, s, n, vs, dt);
   }
 
   void accept(Visitor &v) override;
@@ -2157,49 +2777,75 @@ public:
 
 class PrecedenceClimbing : public Ope {
 public:
-  using BinOpeInfo = std::map<std::string_view, std::pair<size_t, char>>;
+  // Keyed by the operator's text. The keys own it: the grammar text they
+  // were read from may be gone by the time of a parse.
+  using BinOpeInfo =
+      std::map<std::string, std::pair<size_t, char>, std::less<>>;
 
   PrecedenceClimbing(const std::shared_ptr<Ope> &atom,
                      const std::shared_ptr<Ope> &binop, const BinOpeInfo &info,
                      const Definition &rule)
-      : atom_(atom), binop_(binop), info_(info), rule_(rule) {}
-
-  size_t parse_core(const char *s, size_t n, SemanticValues &vs, Context &c,
-                    std::any &dt) const override {
-    return parse_expression(s, n, vs, c, dt, 0);
-  }
-
-  void accept(Visitor &v) override;
-
-  std::shared_ptr<Ope> atom_;
-  std::shared_ptr<Ope> binop_;
-  BinOpeInfo info_;
-  // Owned backing storage for info_ keys when this node is built by
-  // GrammarBlob::deserialize. Grammars parsed from source leave this empty and
-  // point info_ keys into the retained grammar text instead.
-  std::vector<std::string> info_keys_;
-  const Definition &rule_;
-
-private:
-  size_t parse_expression(const char *s, size_t n, SemanticValues &vs,
-                          Context &c, std::any &dt, size_t min_prec) const;
-
-  Definition &get_reference_for_binop(Context &c) const;
-};
-
-class Recovery : public Ope {
-public:
-  Recovery(const std::shared_ptr<Ope> &ope) : ope_(ope) {}
+      : atom_(atom), binop_(binop), info_(info), rule_(rule),
+        repetition_(std::make_shared<Sequence>(
+            atom, Repetition::zom(std::make_shared<Sequence>(binop, atom)))) {}
 
   size_t parse_core(const char *s, size_t n, SemanticValues &vs, Context &c,
                     std::any &dt) const override;
 
   void accept(Visitor &v) override;
 
-  std::shared_ptr<Ope> ope_;
+  const std::shared_ptr<Ope> atom_;
+  const std::shared_ptr<Ope> binop_;
+  BinOpeInfo info_;
+  const Definition &rule_;
+  // `atom (binop atom)*`, the repetition this parses, which is what the
+  // analyses of a grammar look at.
+  const std::shared_ptr<Ope> repetition_;
+
+private:
+  // Sets operand_missing when an operator is left without its right
+  // operand: every enclosing level would read it again and stop there too.
+  size_t parse_expression(const char *s, size_t n, SemanticValues &vs,
+                          Context &c, std::any &dt, size_t min_prec,
+                          bool &operand_missing) const;
+
+  template <typename F>
+  static size_t parse_in_scope(SemanticValues &vs, Context &c, F parse);
+
+  // Hands the values of `from` over to `vs`, whether none or several, with
+  // their tags.
+  static void append_values(SemanticValues &vs, SemanticValues &from) {
+    for (auto &v : from) {
+      vs.emplace_back(std::move(v));
+    }
+    vs.tags.insert(vs.tags.end(), from.tags.begin(), from.tags.end());
+  }
 };
 
-class Cut : public Ope, public std::enable_shared_from_this<Cut> {
+// `%recover(ope)`, and `^label` for `%recover(label)`: where the expression
+// it follows fails, it reports the error, with the message of the rule `ope`
+// refers to if any, and skips what `ope` matches.
+class Recovery : public Ope {
+public:
+  Recovery(const std::shared_ptr<Ope> &ope)
+      : ope_(ope), label_(dynamic_cast<const Reference *>(ope.get())) {}
+
+  size_t parse_core(const char *s, size_t n, SemanticValues &vs, Context &c,
+                    std::any &dt) const override;
+
+  void accept(Visitor &v) override;
+
+  // The rule a `^label` names, which gives the message, if `ope_` refers to
+  // one.
+  const Definition *label() const { return label_ ? label_->rule_ : nullptr; }
+
+  std::shared_ptr<Ope> ope_;
+
+private:
+  const Reference *label_;
+};
+
+class Cut : public Ope {
 public:
   size_t parse_core(const char * /*s*/, size_t /*n*/, SemanticValues & /*vs*/,
                     Context &c, std::any & /*dt*/) const override {
@@ -2258,11 +2904,11 @@ inline std::shared_ptr<Ope> dic(const std::vector<std::string> &v,
 }
 
 inline std::shared_ptr<Ope> lit(std::string &&s) {
-  return std::make_shared<LiteralString>(s, false);
+  return std::make_shared<LiteralString>(std::move(s), false);
 }
 
 inline std::shared_ptr<Ope> liti(std::string &&s) {
-  return std::make_shared<LiteralString>(s, true);
+  return std::make_shared<LiteralString>(std::move(s), true);
 }
 
 inline std::shared_ptr<Ope> cls(const std::string &s) {
@@ -2326,7 +2972,7 @@ inline std::shared_ptr<Ope> wsp(const std::shared_ptr<Ope> &ope) {
 }
 
 inline std::shared_ptr<Ope> bkr(std::string &&name) {
-  return std::make_shared<BackReference>(name);
+  return std::make_shared<BackReference>(std::move(name));
 }
 
 inline std::shared_ptr<Ope> pre(const std::shared_ptr<Ope> &atom,
@@ -2345,31 +2991,36 @@ inline std::shared_ptr<Ope> cut() { return std::make_shared<Cut>(); }
 /*
  * Visitor
  */
+/*
+ * Every operator type, in the order of Ope::Visitor's overloads.
+ */
+// clang-format off
+#define PEGLIB_OPE_TYPES(X) \
+  X(Sequence) X(PrioritizedChoice) X(Repetition) \
+  X(AndPredicate) X(NotPredicate) X(Dictionary) \
+  X(LiteralString) X(CharacterClass) X(Character) \
+  X(AnyCharacter) X(CaptureScope) X(Capture) \
+  X(TokenBoundary) X(Ignore) X(User) \
+  X(WeakHolder) X(Holder) X(Reference) \
+  X(Whitespace) X(BackReference) X(PrecedenceClimbing) \
+  X(Recovery) X(Cut)
+// clang-format on
+
 struct Ope::Visitor {
   virtual ~Visitor() {}
-  virtual void visit(Sequence &) {}
-  virtual void visit(PrioritizedChoice &) {}
-  virtual void visit(Repetition &) {}
-  virtual void visit(AndPredicate &) {}
-  virtual void visit(NotPredicate &) {}
-  virtual void visit(Dictionary &) {}
-  virtual void visit(LiteralString &) {}
-  virtual void visit(CharacterClass &) {}
-  virtual void visit(Character &) {}
-  virtual void visit(AnyCharacter &) {}
-  virtual void visit(CaptureScope &) {}
-  virtual void visit(Capture &) {}
-  virtual void visit(TokenBoundary &) {}
-  virtual void visit(Ignore &) {}
-  virtual void visit(User &) {}
-  virtual void visit(WeakHolder &) {}
-  virtual void visit(Holder &) {}
-  virtual void visit(Reference &) {}
-  virtual void visit(Whitespace &) {}
-  virtual void visit(BackReference &) {}
-  virtual void visit(PrecedenceClimbing &) {}
-  virtual void visit(Recovery &) {}
-  virtual void visit(Cut &) {}
+#define PEGLIB_VISIT(T)                                                        \
+  virtual void visit(T &) {}
+  PEGLIB_OPE_TYPES(PEGLIB_VISIT)
+#undef PEGLIB_VISIT
+};
+
+// A visitor that must handle every operator type: one that leaves an
+// overload out is abstract, so it fails to build instead of skipping the type.
+struct StrictVisitor : public Ope::Visitor {
+  using Ope::Visitor::visit;
+#define PEGLIB_VISIT(T) void visit(T &) override = 0;
+  PEGLIB_OPE_TYPES(PEGLIB_VISIT)
+#undef PEGLIB_VISIT
 };
 
 struct TraversalVisitor : public Ope::Visitor {
@@ -2391,47 +3042,57 @@ struct TraversalVisitor : public Ope::Visitor {
   void visit(Capture &ope) override { ope.ope_->accept(*this); }
   void visit(TokenBoundary &ope) override { ope.ope_->accept(*this); }
   void visit(Ignore &ope) override { ope.ope_->accept(*this); }
-  void visit(WeakHolder &ope) override { ope.weak_.lock()->accept(*this); }
+  // A rule made with the combinators refers to itself through a WeakHolder,
+  // with no Reference to stop at, so it is not walked into again inside
+  // itself. An analysis whose result depends on what such a rule matches
+  // treats it as it does a Reference instead.
+  void visit(WeakHolder &ope) override {
+    auto holder = ope.weak_.lock();
+    if (!holder || std::find(rules_in_walk_.begin(), rules_in_walk_.end(),
+                             holder.get()) != rules_in_walk_.end()) {
+      return;
+    }
+    rules_in_walk_.push_back(holder.get());
+    holder->accept(*this);
+    rules_in_walk_.pop_back();
+  }
   void visit(Holder &ope) override { ope.ope_->accept(*this); }
   void visit(Whitespace &ope) override { ope.ope_->accept(*this); }
   void visit(Recovery &ope) override { ope.ope_->accept(*this); }
-  void visit(PrecedenceClimbing &ope) override { ope.atom_->accept(*this); }
+  void visit(PrecedenceClimbing &ope) override {
+    ope.repetition_->accept(*this);
+  }
+
+  // A walk started inside another goes on from the rules that one is in.
+  void walk_within(const TraversalVisitor &outer) {
+    rules_in_walk_ = outer.rules_in_walk_;
+  }
+
+private:
+  std::vector<const Ope *> rules_in_walk_;
 };
 
 struct TraceOpeName : public Ope::Visitor {
   using Ope::Visitor::visit;
 
-  void visit(Sequence &) override { name_ = "Sequence"; }
-  void visit(PrioritizedChoice &) override { name_ = "PrioritizedChoice"; }
-  void visit(Repetition &) override { name_ = "Repetition"; }
-  void visit(AndPredicate &) override { name_ = "AndPredicate"; }
-  void visit(NotPredicate &) override { name_ = "NotPredicate"; }
-  void visit(Dictionary &) override { name_ = "Dictionary"; }
-  void visit(LiteralString &) override { name_ = "LiteralString"; }
-  void visit(CharacterClass &) override { name_ = "CharacterClass"; }
-  void visit(Character &) override { name_ = "Character"; }
-  void visit(AnyCharacter &) override { name_ = "AnyCharacter"; }
-  void visit(CaptureScope &) override { name_ = "CaptureScope"; }
-  void visit(Capture &) override { name_ = "Capture"; }
-  void visit(TokenBoundary &) override { name_ = "TokenBoundary"; }
-  void visit(Ignore &) override { name_ = "Ignore"; }
-  void visit(User &) override { name_ = "User"; }
-  void visit(WeakHolder &) override { name_ = "WeakHolder"; }
-  void visit(Holder &ope) override { name_ = ope.trace_name().data(); }
-  void visit(Reference &) override { name_ = "Reference"; }
-  void visit(Whitespace &) override { name_ = "Whitespace"; }
-  void visit(BackReference &) override { name_ = "BackReference"; }
-  void visit(PrecedenceClimbing &) override { name_ = "PrecedenceClimbing"; }
-  void visit(Recovery &) override { name_ = "Recovery"; }
-  void visit(Cut &) override { name_ = "Cut"; }
+#define PEGLIB_VISIT(T)                                                        \
+  void visit(T &ope) override { name_ = name_of(ope, #T); }
+  PEGLIB_OPE_TYPES(PEGLIB_VISIT)
+#undef PEGLIB_VISIT
 
-  static std::string get(Ope &ope) {
+  static std::string get(const Ope &ope) {
     TraceOpeName vis;
-    ope.accept(vis);
+    const_cast<Ope &>(ope).accept(vis);
     return vis.name_;
   }
 
 private:
+  // A rule is traced by its name, every other operator by its type.
+  static const char *name_of(Ope &, const char *type) { return type; }
+  static const char *name_of(Holder &ope, const char *) {
+    return ope.trace_name().data();
+  }
+
   const char *name_ = nullptr;
 };
 
@@ -2440,7 +3101,6 @@ struct AssignIDToDefinition : public TraversalVisitor {
 
   void visit(Holder &ope) override;
   void visit(Reference &ope) override;
-  void visit(PrecedenceClimbing &ope) override;
   void visit(Cut &) override { has_cut = true; }
   void visit(Recovery &ope) override {
     // Recovery also raises the cut flag on success, so it counts as a cut
@@ -2448,15 +3108,20 @@ struct AssignIDToDefinition : public TraversalVisitor {
     has_cut = true;
     TraversalVisitor::visit(ope);
   }
-  void visit(User &) override { has_opaque_ope = true; }
+  void visit(User &) override { has_user = true; }
+  void visit(PrioritizedChoice &ope) override {
+    for (const auto &fs : ope.first_sets()) {
+      for (const auto &f : fs.failures) {
+        if (f.rule) { alternative_starts.insert(f.rule); }
+      }
+    }
+    TraversalVisitor::visit(ope);
+  }
 
   std::unordered_map<void *, size_t> ids;
-  Definition *current_def = nullptr; // rule whose body is being walked
-  bool has_cut = false;              // grammar contains a Cut or Recovery ope
-  // Grammar contains an ope whose semantic-value use cannot be seen from
-  // Definition callbacks alone (User callbacks, PrecedenceClimbing's
-  // in-parse action swapping); disqualifies recognizer mode.
-  bool has_opaque_ope = false;
+  bool has_cut = false; // grammar contains a Cut or Recovery ope
+  bool has_user = false;
+  std::unordered_set<const Definition *> alternative_starts;
 };
 
 struct IsLiteralToken : public Ope::Visitor {
@@ -2490,6 +3155,8 @@ struct TokenChecker : public TraversalVisitor {
   void visit(NotPredicate &) override {}
   void visit(WeakHolder &) override { has_rule_ = true; }
   void visit(Reference &ope) override;
+  // The operator is a rule of its own, and the atom stands for the match.
+  void visit(PrecedenceClimbing &ope) override { ope.atom_->accept(*this); }
 
   static bool is_token(Ope &ope) {
     if (IsLiteralToken::check(ope)) { return true; }
@@ -2504,29 +3171,10 @@ private:
   bool has_rule_ = false;
 };
 
-struct FindLiteralToken : public Ope::Visitor {
-  using Ope::Visitor::visit;
-
-  void visit(LiteralString &ope) override { token_ = ope.lit_.data(); }
-  void visit(TokenBoundary &ope) override { ope.ope_->accept(*this); }
-  void visit(Ignore &ope) override { ope.ope_->accept(*this); }
-  void visit(Reference &ope) override;
-  void visit(Recovery &ope) override { ope.ope_->accept(*this); }
-
-  static const char *token(Ope &ope) {
-    FindLiteralToken vis;
-    ope.accept(vis);
-    return vis.token_;
-  }
-
-private:
-  const char *token_ = nullptr;
-};
-
 struct DetectLeftRecursion : public TraversalVisitor {
   using TraversalVisitor::visit;
 
-  DetectLeftRecursion(const std::string &name) : name_(name) {}
+  explicit DetectLeftRecursion(const Definition &rule) : rule_(&rule) {}
 
   void visit(Sequence &ope) override {
     for (const auto &op : ope.opes_) {
@@ -2539,18 +3187,23 @@ struct DetectLeftRecursion : public TraversalVisitor {
       }
     }
   }
+  // A choice consumes input only if each of its alternatives does, and a
+  // repetition only if it must repeat something that does.
   void visit(PrioritizedChoice &ope) override {
+    auto all_done = true;
     for (const auto &op : ope.opes_) {
       op->accept(*this);
       if (error_s) {
         done_ = true;
-        break;
+        return;
       }
+      all_done = all_done && done_;
     }
+    done_ = all_done;
   }
   void visit(Repetition &ope) override {
     ope.ope_->accept(*this);
-    done_ = ope.min_ > 0;
+    done_ = done_ && ope.min_ > 0;
   }
   void visit(AndPredicate &ope) override {
     ope.ope_->accept(*this);
@@ -2567,8 +3220,14 @@ struct DetectLeftRecursion : public TraversalVisitor {
   void visit(AnyCharacter &) override { done_ = true; }
   void visit(User &) override { done_ = true; }
   void visit(Reference &ope) override;
+  void visit(WeakHolder &ope) override;
   void visit(BackReference &) override { done_ = true; }
-  void visit(Cut &) override { done_ = true; }
+  void visit(Cut &) override { done_ = false; }
+  // See ComputeCanBeEmpty.
+  void visit(Recovery &ope) override {
+    ope.ope_->accept(*this);
+    if (!error_s) { done_ = true; }
+  }
 
   const char *error_s = nullptr;
 
@@ -2580,62 +3239,97 @@ struct DetectLeftRecursion : public TraversalVisitor {
   };
   ResolvedArg resolve_macro_arg(size_t iarg) const;
   void visit_in_defining_scope(const ResolvedArg &arg);
+  void visit_argument(const ResolvedArg &arg);
 
   // A macro's body depends on its arguments, so "already visited" has to be
-  // per instantiation, not per name: in `A <- W('z') / W(A)`, visiting W with
-  // 'z' says nothing about W with A. Instantiations are identified by their
-  // resolved arguments, the same way as at parse time.
+  // per instantiation, not per rule: in `A <- W('z') / W(A)`, visiting W with
+  // 'z' says nothing about W with A. An instantiation is identified by its
+  // arguments, a bare parameter resolved to what it was given. An argument
+  // that wraps a parameter, as `x 'a'` in `M(x) <- N(x 'a')`, stands as
+  // written, so calls the parse tells apart can share one here: told apart,
+  // instantiations could grow without bound.
   size_t intern_macro_inst(const Reference &ope);
 
   // A macro that instantiates itself with a growing argument
-  // (`M(s) <- M(s / 'x')`) has no finite set of instantiations. Stop
-  // descending instead of looping forever; the rule is then reported as
-  // non-left-recursive, which is what this analysis did for every macro
-  // before it became instantiation-aware. The bound is on nesting depth in
-  // general, not self-recursion specifically, so it also caps any other
-  // chain of nested macro calls -- generously, for real grammars.
+  // (`M(s) <- M(s / 'x')`) has no finite set of instantiations. Past this
+  // depth the walk stops descending, and a cycle it then misses fails where
+  // the parse enters it again. (A parse of such a growing macro makes
+  // instantiations without end, the limit the README states.) The bound is
+  // on nesting depth in general, so it caps any chain of nested macro calls,
+  // generously for real grammars.
   static const size_t max_macro_inst_depth = 32;
 
 private:
-  std::string name_;
+  const Definition *rule_;
   std::set<std::pair<const Definition *, size_t>> refs_;
   std::map<std::vector<const void *>, size_t> macro_inst_ids_;
+  std::map<std::vector<const void *>, bool> args_done_;
   size_t next_macro_inst_ = 1;
   bool done_ = false;
   std::vector<const std::vector<std::shared_ptr<Ope>> *> macro_args_stack_;
 };
 
+// The rules an operator walks into, each once: a rule made with the
+// combinators, which no Reference leads to, is walked into through its
+// Holder. A rule comes after those it walks into, unless they reach it.
+struct CollectWalkedRules : public TraversalVisitor {
+  using TraversalVisitor::visit;
+  std::vector<Definition *> rules;
+
+  void visit(Holder &ope) override {
+    if (seen_.insert(ope.outer_).second) {
+      ope.ope_->accept(*this);
+      rules.push_back(ope.outer_);
+    }
+  }
+
+private:
+  std::unordered_set<const Definition *> seen_;
+};
+
 struct ComputeCanBeEmpty : public TraversalVisitor {
   using TraversalVisitor::visit;
 
-  bool result = false;
-
   void visit(Sequence &ope) override {
-    result = std::all_of(ope.opes_.begin(), ope.opes_.end(), [](auto &op) {
-      ComputeCanBeEmpty vis;
-      op->accept(vis);
-      return vis.result;
-    });
+    result_ = std::all_of(ope.opes_.begin(), ope.opes_.end(),
+                          [](auto &op) { return check(*op); });
   }
   void visit(PrioritizedChoice &ope) override {
-    result = std::any_of(ope.opes_.begin(), ope.opes_.end(), [](auto &op) {
-      ComputeCanBeEmpty vis;
-      op->accept(vis);
-      return vis.result;
-    });
+    result_ = std::any_of(ope.opes_.begin(), ope.opes_.end(),
+                          [](auto &op) { return check(*op); });
   }
-  void visit(Repetition &ope) override { result = ope.min_ == 0; }
-  void visit(AndPredicate &) override { result = true; }
-  void visit(NotPredicate &) override { result = true; }
-  void visit(Dictionary &) override { result = false; }
-  void visit(LiteralString &ope) override { result = ope.lit_.empty(); }
-  void visit(CharacterClass &) override { result = false; }
-  void visit(Character &) override { result = false; }
-  void visit(AnyCharacter &) override { result = false; }
-  void visit(User &) override { result = false; }
+  void visit(Repetition &ope) override {
+    if (ope.min_ == 0) {
+      result_ = true;
+    } else {
+      ope.ope_->accept(*this);
+    }
+  }
+  void visit(AndPredicate &) override { result_ = true; }
+  void visit(NotPredicate &) override { result_ = true; }
+  void visit(Dictionary &) override { result_ = false; }
+  void visit(LiteralString &ope) override { result_ = ope.lit_.empty(); }
+  void visit(CharacterClass &) override { result_ = false; }
+  void visit(Character &) override { result_ = false; }
+  void visit(AnyCharacter &) override { result_ = false; }
+  void visit(User &) override { result_ = false; }
+  void visit(Holder &ope) override;
   void visit(Reference &ope) override;
-  void visit(BackReference &) override { result = false; }
-  void visit(Cut &) override { result = false; }
+  void visit(BackReference &) override { result_ = false; }
+  void visit(Cut &) override { result_ = true; }
+  // A recovery only matches after an error, and a repetition ends on an
+  // empty match, so the checks made when a grammar is loaded take it to
+  // consume input.
+  void visit(Recovery &) override { result_ = false; }
+
+  static bool check(Ope &ope) {
+    ComputeCanBeEmpty vis;
+    ope.accept(vis);
+    return vis.result_;
+  }
+
+private:
+  bool result_ = false;
 };
 
 // Structural signature of an Ope. Two alternatives whose first k elements
@@ -2736,95 +3430,92 @@ private:
   }
 };
 
-struct HasEmptyElement : public TraversalVisitor {
+// Goes down an operand that can match empty to what makes it: the last
+// element of a sequence, the first alternative of a choice that can, and
+// into a rule unless it is already on the way. Ends at the innermost named
+// rule on the way, where it is referred to.
+struct FindEmptyElement : public TraversalVisitor {
   using TraversalVisitor::visit;
 
-  HasEmptyElement(std::vector<std::pair<const char *, std::string>> &refs,
-                  std::unordered_map<std::string, bool> &has_error_cache)
-      : refs_(refs), has_error_cache_(has_error_cache) {}
+  FindEmptyElement(const Definition *rule,
+                   std::pair<const char *, std::string> rule_ref)
+      : rule_ref(std::move(rule_ref)), rules_on_way_{rule} {}
 
-  void visit(Sequence &ope) override;
+  void visit(Sequence &ope) override {
+    if (!ope.opes_.empty()) { ope.opes_.back()->accept(*this); }
+  }
   void visit(PrioritizedChoice &ope) override {
     for (const auto &op : ope.opes_) {
-      op->accept(*this);
-      if (is_empty) { return; }
+      if (ComputeCanBeEmpty::check(*op)) {
+        op->accept(*this);
+        return;
+      }
     }
   }
   void visit(Repetition &ope) override {
-    if (ope.min_ == 0) {
-      set_error();
-    } else {
-      ope.ope_->accept(*this);
-    }
+    if (ope.min_ > 0) { ope.ope_->accept(*this); }
   }
-  void visit(AndPredicate &) override { set_error(); }
-  void visit(NotPredicate &) override { set_error(); }
-  void visit(LiteralString &ope) override {
-    if (ope.lit_.empty()) { set_error(); }
-  }
+  void visit(AndPredicate &) override {}
+  void visit(NotPredicate &) override {}
   void visit(Reference &ope) override;
 
-  bool is_empty = false;
-  const char *error_s = nullptr;
-  std::string error_name;
+  std::pair<const char *, std::string> rule_ref;
 
 private:
-  void set_error() {
-    is_empty = true;
-    tie(error_s, error_name) = refs_.back();
-  }
-  std::vector<std::pair<const char *, std::string>> &refs_;
-  std::unordered_map<std::string, bool> &has_error_cache_;
+  std::vector<const Definition *> rules_on_way_;
 };
 
+// Finds, in a rule and the rules it reaches, each walked once, the first
+// unbounded repetition whose operand can match empty. Whether it can is
+// worked out for every rule beforehand, so it is the same wherever the
+// repetition is reached from.
 struct DetectInfiniteLoop : public TraversalVisitor {
   using TraversalVisitor::visit;
 
-  DetectInfiniteLoop(const char *s, const std::string &name,
-                     std::vector<std::pair<const char *, std::string>> &refs,
-                     std::unordered_map<std::string, bool> &has_error_cache)
-      : refs_(refs), has_error_cache_(has_error_cache) {
-    refs_.emplace_back(s, name);
-  }
+  DetectInfiniteLoop(const char *s, const std::string &name)
+      : rule_ref_(s, name) {}
 
-  DetectInfiniteLoop(std::vector<std::pair<const char *, std::string>> &refs,
-                     std::unordered_map<std::string, bool> &has_error_cache)
-      : refs_(refs), has_error_cache_(has_error_cache) {}
-
-  void visit(Sequence &ope) override {
-    for (const auto &op : ope.opes_) {
-      op->accept(*this);
-      if (has_error) { return; }
-    }
-  }
-  void visit(PrioritizedChoice &ope) override {
-    for (const auto &op : ope.opes_) {
-      op->accept(*this);
-      if (has_error) { return; }
-    }
-  }
+  void visit(Sequence &ope) override { walk_until_error(ope.opes_); }
+  void visit(PrioritizedChoice &ope) override { walk_until_error(ope.opes_); }
   void visit(Repetition &ope) override {
-    if (ope.max_ == std::numeric_limits<size_t>::max()) {
-      HasEmptyElement vis(refs_, has_error_cache_);
+    if (ope.max_ == std::numeric_limits<size_t>::max() &&
+        ComputeCanBeEmpty::check(*ope.ope_)) {
+      FindEmptyElement vis(rule_, rule_ref_);
+      vis.walk_within(*this);
       ope.ope_->accept(vis);
-      if (vis.is_empty) {
-        has_error = true;
-        error_s = vis.error_s;
-        error_name = vis.error_name;
-      }
-    } else {
-      ope.ope_->accept(*this);
+      has_error = true;
+      std::tie(error_s, error_name) = vis.rule_ref;
+      return;
     }
+    ope.ope_->accept(*this);
   }
   void visit(Reference &ope) override;
+  // Walks each rule once, whether reached through a Reference or, made with
+  // the combinators, through a WeakHolder.
+  void visit(Holder &ope) override {
+    if (!walked_.insert(ope.outer_).second) { return; }
+    auto save = std::exchange(rule_, ope.outer_);
+    ope.ope_->accept(*this);
+    rule_ = save;
+  }
 
   bool has_error = false;
   const char *error_s = nullptr;
   std::string error_name;
 
 private:
-  std::vector<std::pair<const char *, std::string>> &refs_;
-  std::unordered_map<std::string, bool> &has_error_cache_;
+  void walk_until_error(const std::vector<std::shared_ptr<Ope>> &opes) {
+    for (const auto &op : opes) {
+      if (has_error) { return; }
+      op->accept(*this);
+    }
+  }
+
+  std::unordered_set<const Definition *> walked_;
+  const Definition *rule_ = nullptr;
+  // Where the innermost named rule being walked is referred to, also inside
+  // the rules made with the combinators that it reaches.
+  std::pair<const char *, std::string> rule_ref_;
 };
 
 struct ReferenceChecker : public TraversalVisitor {
@@ -2858,88 +3549,66 @@ private:
   const std::vector<std::string> &params_;
 };
 
-struct FindReference : public Ope::Visitor {
+struct ReplaceParameters : public Ope::Visitor {
   using Ope::Visitor::visit;
 
-  FindReference(const std::vector<std::shared_ptr<Ope>> &args,
-                const std::vector<std::string> &params)
-      : args_(args), params_(params) {}
+  explicit ReplaceParameters(const std::vector<std::shared_ptr<Ope>> &args)
+      : args_(args) {}
+
+  // `ope` with the parameters in it replaced by the arguments, or `ope`
+  // itself when it names none.
+  std::shared_ptr<Ope> resolve(const std::shared_ptr<Ope> &ope) {
+    resolved_ = nullptr;
+    ope->accept(*this);
+    return resolved_ ? std::move(resolved_) : ope;
+  }
 
   void visit(Sequence &ope) override {
-    std::vector<std::shared_ptr<Ope>> opes;
-    for (const auto &o : ope.opes_) {
-      o->accept(*this);
-      opes.emplace_back(std::move(found_ope));
-    }
-    found_ope = std::make_shared<Sequence>(opes);
+    auto opes = resolve_all(ope.opes_);
+    if (opes) { resolved_ = std::make_shared<Sequence>(std::move(*opes)); }
   }
   void visit(PrioritizedChoice &ope) override {
-    std::vector<std::shared_ptr<Ope>> opes;
-    for (const auto &o : ope.opes_) {
-      o->accept(*this);
-      opes.emplace_back(std::move(found_ope));
+    auto opes = resolve_all(ope.opes_);
+    if (opes) {
+      resolved_ = std::make_shared<PrioritizedChoice>(std::move(*opes), ope);
     }
-    found_ope = std::make_shared<PrioritizedChoice>(opes);
   }
   void visit(Repetition &ope) override {
-    ope.ope_->accept(*this);
-    found_ope = rep(found_ope, ope.min_, ope.max_);
+    rewrap(ope.ope_, [&](auto o) { return rep(o, ope.min_, ope.max_); });
   }
-  void visit(AndPredicate &ope) override {
-    ope.ope_->accept(*this);
-    found_ope = apd(found_ope);
-  }
-  void visit(NotPredicate &ope) override {
-    ope.ope_->accept(*this);
-    found_ope = npd(found_ope);
-  }
-  void visit(Dictionary &ope) override { found_ope = ope.shared_from_this(); }
-  void visit(LiteralString &ope) override {
-    found_ope = ope.shared_from_this();
-  }
-  void visit(CharacterClass &ope) override {
-    found_ope = ope.shared_from_this();
-  }
-  void visit(Character &ope) override { found_ope = ope.shared_from_this(); }
-  void visit(AnyCharacter &ope) override { found_ope = ope.shared_from_this(); }
-  void visit(CaptureScope &ope) override {
-    ope.ope_->accept(*this);
-    found_ope = csc(found_ope);
-  }
+  void visit(AndPredicate &ope) override { rewrap(ope.ope_, apd); }
+  void visit(NotPredicate &ope) override { rewrap(ope.ope_, npd); }
+  void visit(CaptureScope &ope) override { rewrap(ope.ope_, csc); }
   void visit(Capture &ope) override {
-    ope.ope_->accept(*this);
-    found_ope = cap(found_ope, ope.match_action_);
+    rewrap(ope.ope_, [&](auto o) { return cap(o, ope.match_action_); });
   }
-  void visit(TokenBoundary &ope) override {
-    ope.ope_->accept(*this);
-    found_ope = tok(found_ope);
-  }
-  void visit(Ignore &ope) override {
-    ope.ope_->accept(*this);
-    found_ope = ign(found_ope);
-  }
-  void visit(WeakHolder &ope) override { ope.weak_.lock()->accept(*this); }
-  void visit(Holder &ope) override { ope.ope_->accept(*this); }
+  void visit(TokenBoundary &ope) override { rewrap(ope.ope_, tok); }
+  void visit(Ignore &ope) override { rewrap(ope.ope_, ign); }
   void visit(Reference &ope) override;
-  void visit(Whitespace &ope) override {
-    ope.ope_->accept(*this);
-    found_ope = wsp(found_ope);
-  }
-  void visit(PrecedenceClimbing &ope) override {
-    ope.atom_->accept(*this);
-    found_ope = csc(found_ope);
-  }
-  void visit(Recovery &ope) override {
-    ope.ope_->accept(*this);
-    found_ope = rec(found_ope);
-  }
-  void visit(Cut &ope) override { found_ope = ope.shared_from_this(); }
-
-  std::shared_ptr<Ope> found_ope;
+  void visit(Recovery &ope) override { rewrap(ope.ope_, rec); }
+  void visit(PrecedenceClimbing &ope) override;
 
 private:
+  template <typename Make>
+  void rewrap(const std::shared_ptr<Ope> &inner, Make make) {
+    auto o = resolve(inner);
+    if (o != inner) { resolved_ = make(o); }
+  }
+
+  std::optional<std::vector<std::shared_ptr<Ope>>>
+  resolve_all(const std::vector<std::shared_ptr<Ope>> &opes) {
+    std::optional<std::vector<std::shared_ptr<Ope>>> rebuilt;
+    for (size_t i = 0; i < opes.size(); i++) {
+      auto o = resolve(opes[i]);
+      if (o == opes[i]) { continue; }
+      if (!rebuilt) { rebuilt.emplace(opes); }
+      (*rebuilt)[i] = std::move(o);
+    }
+    return rebuilt;
+  }
+
+  std::shared_ptr<Ope> resolved_;
   const std::vector<std::shared_ptr<Ope>> &args_;
-  const std::vector<std::string> &params_;
 };
 
 /*
@@ -2950,84 +3619,67 @@ struct ComputeFirstSet : public TraversalVisitor {
 
   void visit(Sequence &ope) override {
     for (const auto &op : ope.opes_) {
-      FirstSet element_fs;
-      auto save = result_;
-      result_ = FirstSet{};
-      op->accept(*this);
-      element_fs = result_;
-      result_ = save;
-      result_.chars |= element_fs.chars;
-      if (element_fs.any_char) { result_.any_char = true; }
-      if (!result_.first_literal) {
-        result_.first_literal = element_fs.first_literal;
-      }
-      if (!result_.first_rule) { result_.first_rule = element_fs.first_rule; }
-      if (!element_fs.can_be_empty) { return; }
-      // This element can be empty, continue to next
+      if (!add_start_of(*op)) { return; }
     }
-    result_.can_be_empty = true;
+    result_.matches_empty_on_other_bytes = true;
   }
+  // Where no alternative can start, the first one that matches empty there
+  // matches, and the ones after it are not tried. Their bytes are kept all the
+  // same: an alternative that is empty only through left recursion fails while
+  // its seed is grown.
   void visit(PrioritizedChoice &ope) override {
-    auto save = result_;
+    std::optional<size_t> noted;
     for (const auto &op : ope.opes_) {
-      result_ = FirstSet{};
-      op->accept(*this);
-      save.merge(result_);
+      if (add_start_of(*op) && !noted) {
+        result_.matches_empty_on_other_bytes = true;
+        noted = result_.failures.size();
+      }
     }
-    result_ = save;
+    if (noted) { result_.failures.resize(*noted); }
   }
+  // A repetition up to no times does not try its operand.
   void visit(Repetition &ope) override {
-    ope.ope_->accept(*this);
-    if (ope.min_ == 0) { result_.can_be_empty = true; }
+    if (ope.max_ > 0) { ope.ope_->accept(*this); }
+    if (ope.min_ == 0) { result_.matches_empty_on_other_bytes = true; }
   }
-  void visit(AndPredicate &) override { result_.can_be_empty = true; }
-  void visit(NotPredicate &) override { result_.can_be_empty = true; }
+  // Where its operand cannot start, the operand fails and this matches
+  // empty. An operand that matches empty there makes this fail there
+  // instead, which is left to trying it.
+  void visit(NotPredicate &ope) override {
+    auto first = result_.failures.size();
+    if (add_start_of(*ope.ope_)) { result_.any_char = true; }
+    for (auto i = first; i < result_.failures.size(); i++) {
+      result_.failures[i].listed = false;
+    }
+    result_.matches_empty_on_other_bytes = true;
+  }
   void visit(Dictionary &ope) override {
     for (const auto &[key, info] : ope.trie_.dic_) {
       if (!key.empty()) {
         auto ch = static_cast<unsigned char>(key[0]);
         result_.chars.set(ch);
-        if (ope.trie_.ignore_case_) {
-          result_.chars.set(static_cast<unsigned char>(std::toupper(ch)));
-          result_.chars.set(static_cast<unsigned char>(std::tolower(ch)));
-        }
+        if (ope.trie_.ignore_case_) { result_.chars.set(other_case(ch)); }
       }
     }
+    result_.failures.emplace_back();
   }
   void visit(LiteralString &ope) override {
     if (ope.lit_.empty()) {
-      result_.can_be_empty = true;
+      result_.matches_empty_on_other_bytes = true;
+      add_whitespace();
     } else {
       auto ch = static_cast<unsigned char>(ope.lit_[0]);
       result_.chars.set(ch);
-      if (ope.ignore_case_) {
-        result_.chars.set(static_cast<unsigned char>(std::toupper(ch)));
-        result_.chars.set(static_cast<unsigned char>(std::tolower(ch)));
-      }
-      if (!result_.first_literal) { result_.first_literal = ope.lit_.c_str(); }
+      if (ope.ignore_case_) { result_.chars.set(other_case(ch)); }
+      result_.failures.push_back({ope.lit_.c_str(), nullptr});
     }
   }
   void visit(CharacterClass &ope) override {
-    for (const auto &range : ope.ranges_) {
-      auto cp1 = range.first;
-      auto cp2 = range.second;
-      if (cp1 > 0x7F || cp2 > 0x7F) {
-        // Non-ASCII range: conservative fallback
-        result_.any_char = true;
-        return;
-      }
-      for (auto cp = cp1; cp <= cp2; cp++) {
-        auto ch = static_cast<unsigned char>(cp);
-        result_.chars.set(ch);
-        if (ope.ignore_case_) {
-          result_.chars.set(static_cast<unsigned char>(std::toupper(ch)));
-          result_.chars.set(static_cast<unsigned char>(std::tolower(ch)));
-        }
-      }
-    }
-    if (ope.negated_) {
-      result_.chars.flip();
-      result_.any_char = true; // negated class can match non-ASCII
+    if (ope.is_ascii_only()) {
+      result_.chars |= ope.ascii_bitset();
+      result_.failures.emplace_back();
+    } else {
+      result_.any_char = true;
     }
   }
   void visit(Character &ope) override {
@@ -3035,20 +3687,34 @@ struct ComputeFirstSet : public TraversalVisitor {
       result_.any_char = true;
     } else {
       result_.chars.set(static_cast<unsigned char>(ope.ch_));
+      result_.failures.emplace_back();
     }
   }
   void visit(AnyCharacter &) override { result_.any_char = true; }
+  void visit(TokenBoundary &ope) override {
+    ope.ope_->accept(*this);
+    if (result_.matches_empty_on_other_bytes) { add_whitespace(); }
+  }
   void visit(User &) override { result_.any_char = true; }
   void visit(Reference &ope) override;
+  void visit(WeakHolder &ope) override;
   void visit(BackReference &) override { result_.any_char = true; }
-  void visit(Cut &) override { result_.can_be_empty = true; }
+  // A recovery gives its label's message wherever it is tried.
+  void visit(Recovery &) override { result_.any_char = true; }
+  // A cut before the first byte stops the enclosing choice even when the
+  // expression then fails, so the next byte cannot tell to skip it.
+  void visit(Cut &) override {
+    result_.matches_empty_on_other_bytes = true;
+    result_.any_char = true;
+  }
 
   // Per-rule cache shared across a SetupFirstSets traversal. Without it,
   // every alternative of every PrioritizedChoice re-walks referenced
   // rules — O(refs^depth) work for grammars with many cross-references.
-  // Only cycle-free rule computations are cached; results computed under
-  // a cycle (left recursion) would be incomplete and unsafe to reuse from
-  // a different call context.
+  // A rule met again in its own walk (left recursion) adds its bytes where
+  // it is first walked into, so a result is cached only if every rule met
+  // again in its walk is the rule or one walked into below it: one met
+  // higher up adds its bytes there, and the result lacks them.
   using FirstSetCache = std::unordered_map<const Definition *, FirstSet>;
 
   explicit ComputeFirstSet(FirstSetCache &cache) : cache_(cache) {}
@@ -3056,25 +3722,45 @@ struct ComputeFirstSet : public TraversalVisitor {
   FirstSet result_;
 
 private:
+  // Adds where `ope` can start, and what it notes where it cannot. Returns
+  // whether it matches empty there.
+  bool add_start_of(Ope &ope) {
+    auto save = std::exchange(result_.matches_empty_on_other_bytes, false);
+    ope.accept(*this);
+    return std::exchange(result_.matches_empty_on_other_bytes, save);
+  }
+
+  // A literal, a token boundary and a no_whitespace rule skip whitespace
+  // after their match. After an empty one, the whitespace can come first,
+  // and it is that of the rule the parse starts from, which need not be the
+  // grammar's.
+  void add_whitespace() { result_.any_char = true; }
+
+  // Puts `rule` on the walk and returns its depth there, unless it is being
+  // worked out further up: it adds its bytes there, and what is worked out
+  // below it lacks them.
+  std::optional<size_t> walk_into(const Definition &rule);
+
   FirstSetCache &cache_;
-  std::unordered_set<const Definition *> refs_;
-  size_t cycle_count_ = 0;
+  // The rules being worked out, each at its depth in the walk.
+  std::vector<const Definition *> refs_;
+  // The least depth of a rule met again since the innermost walk into a
+  // referenced rule began.
+  size_t least_depth_met_ = std::numeric_limits<size_t>::max();
 };
 
 struct SetupFirstSets : public TraversalVisitor {
   using TraversalVisitor::visit;
 
-  void visit(Sequence &ope) override;
-  void setup_keyword_guarded_identifier(Sequence &ope);
-
   void visit(PrioritizedChoice &ope) override {
-    ope.first_sets_.clear();
-    ope.first_sets_.reserve(ope.opes_.size());
+    std::vector<FirstSet> first_sets;
+    first_sets.reserve(ope.opes_.size());
     for (const auto &op : ope.opes_) {
       ComputeFirstSet cfs(first_set_cache_);
       op->accept(cfs);
-      ope.first_sets_.push_back(cfs.result_);
+      first_sets.push_back(std::move(cfs.result_));
     }
+    ope.set_first_sets(std::move(first_sets));
     for (const auto &op : ope.opes_) {
       op->accept(*this);
     }
@@ -3096,13 +3782,15 @@ private:
 /*
  * Keywords
  */
-static const char *WHITESPACE_DEFINITION_NAME = "%whitespace";
-static const char *WORD_DEFINITION_NAME = "%word";
-static const char *RECOVER_DEFINITION_NAME = "%recover";
+inline constexpr const char *WHITESPACE_DEFINITION_NAME = "%whitespace";
+inline constexpr const char *WORD_DEFINITION_NAME = "%word";
+inline constexpr const char *RECOVER_DEFINITION_NAME = "%recover";
 
 /*
  * Definition
  */
+struct CollectRuleRefs;
+
 class Definition {
 public:
   struct Result {
@@ -3114,7 +3802,16 @@ public:
 
   Definition() : holder_(std::make_shared<Holder>(this)) {}
 
-  Definition(const Definition &rhs) : name(rhs.name), holder_(rhs.holder_) {
+  // A rule is referred to by address, so it cannot be copied: a copy would
+  // share the holder and leave it pointing at whichever of the two goes away
+  // first. Take a reference instead (`auto &rule = parser["A"]`). Moving one
+  // hands the holder over, for a rule built and returned by value.
+  Definition(const Definition &) = delete;
+  Definition &operator=(const Definition &) = delete;
+  Definition &operator=(Definition &&) = delete;
+
+  Definition(Definition &&rhs)
+      : name(std::move(rhs.name)), holder_(std::move(rhs.holder_)) {
     holder_->outer_ = this;
   }
 
@@ -3204,54 +3901,50 @@ public:
 #if defined(__cpp_lib_char8_t)
   Result parse(const char8_t *s, size_t n, const char *path = nullptr,
                Log log = nullptr) const {
-    return parse(reinterpret_cast<const char *>(s), n, path, log);
+    return parse(u8(s), n, path, log);
   }
 
   Result parse(const char8_t *s, const char *path = nullptr,
                Log log = nullptr) const {
-    return parse(reinterpret_cast<const char *>(s), path, log);
+    return parse(u8(s), path, log);
   }
 
   Result parse(const char8_t *s, size_t n, std::any &dt,
                const char *path = nullptr, Log log = nullptr) const {
-    return parse(reinterpret_cast<const char *>(s), n, dt, path, log);
+    return parse(u8(s), n, dt, path, log);
   }
 
   Result parse(const char8_t *s, std::any &dt, const char *path = nullptr,
                Log log = nullptr) const {
-    return parse(reinterpret_cast<const char *>(s), dt, path, log);
+    return parse(u8(s), dt, path, log);
   }
 
   template <typename T>
   Result parse_and_get_value(const char8_t *s, size_t n, T &val,
                              const char *path = nullptr,
                              Log log = nullptr) const {
-    return parse_and_get_value(reinterpret_cast<const char *>(s), n, val, path,
-                               log);
+    return parse_and_get_value(u8(s), n, val, path, log);
   }
 
   template <typename T>
   Result parse_and_get_value(const char8_t *s, T &val,
                              const char *path = nullptr,
                              Log log = nullptr) const {
-    return parse_and_get_value(reinterpret_cast<const char *>(s), val, path,
-                               log);
+    return parse_and_get_value(u8(s), val, path, log);
   }
 
   template <typename T>
   Result parse_and_get_value(const char8_t *s, size_t n, std::any &dt, T &val,
                              const char *path = nullptr,
                              Log log = nullptr) const {
-    return parse_and_get_value(reinterpret_cast<const char *>(s), n, dt, val,
-                               path, log);
+    return parse_and_get_value(u8(s), n, dt, val, path, log);
   }
 
   template <typename T>
   Result parse_and_get_value(const char8_t *s, std::any &dt, T &val,
                              const char *path = nullptr,
                              Log log = nullptr) const {
-    return parse_and_get_value(reinterpret_cast<const char *>(s), dt, val, path,
-                               log);
+    return parse_and_get_value(u8(s), dt, val, path, log);
   }
 #endif
 
@@ -3278,6 +3971,15 @@ public:
     return is_token_;
   }
 
+  const std::string &node_name() const {
+    return ast_name.empty() ? name : ast_name;
+  }
+
+  unsigned int tag() const {
+    std::call_once(tag_init_, [this]() { tag_ = str2tag(name); });
+    return tag_;
+  }
+
   std::string name;
   const char *s_ = nullptr;
   std::pair<size_t, size_t> line_ = {1, 1};
@@ -3300,10 +4002,11 @@ public:
   bool disable_action = false;
   bool is_left_recursive = false;
   bool can_be_empty = false;
-  // Body contains a macro invocation, whose arguments resolve against the
-  // innermost rule on rule_stack; computed by AssignIDToDefinition. The
-  // conservative default keeps the stack maintained until then.
-  bool has_macro_ref = true;
+  // The bytes a match of this rule can start with: any, unless it fails on
+  // other bytes and they are known (set up with the first sets).
+  std::bitset<256> start_bytes = std::bitset<256>().set();
+  // The first set of the rule's operator.
+  FirstSet first_set;
 
   TracerEnter tracer_enter;
   TracerLeave tracer_leave;
@@ -3317,38 +4020,69 @@ public:
                               // (like a token boundary, without capturing)
   std::string ast_name; // When non-empty, AST nodes produced by this rule carry
                         // this name/tag instead of the rule's own name
+  // Fixed by add_ast_action when it attaches the AST action, which gives its
+  // nodes this name and tag.
+  std::string ast_node_name;
+  unsigned int ast_node_tag = 0;
 
   bool eoi_check = true;
+
+  // The deepest that rule matches may nest in a parse from this rule.
+  size_t max_depth = std::numeric_limits<size_t>::max();
 
   // Per-rule packrat stats (optional, for profiling)
   mutable bool collect_packrat_stats = false;
   mutable std::vector<Context::PackratStats> packrat_stats_;
 
 private:
+  friend class Context;
   friend class Reference;
   friend class ParserGenerator;
 
-  Definition &operator=(const Definition &rhs);
-  Definition &operator=(Definition &&rhs);
+  const StartRuleAnalysis &analysis() const {
+    std::call_once(analysis_init_, [&]() { analyze(); });
+    return analysis_;
+  }
 
-  void initialize_definition_ids() const {
-    std::call_once(definition_ids_init_, [&]() {
-      AssignIDToDefinition vis;
-      holder_->accept(vis);
-      if (whitespaceOpe) { whitespaceOpe->accept(vis); }
-      if (wordOpe) { wordOpe->accept(vis); }
-      definition_ids_.swap(vis.ids);
-      has_cut_ = vis.has_cut;
-      has_opaque_ope_ = vis.has_opaque_ope;
+  void analyze() const;
+  void number_new_rules() const;
+  void decide_parsed_only_where_muted(std::vector<RuleUse> &uses) const;
+  void select_packrat_rules() const;
+  std::shared_ptr<const RuleUses> rule_uses(bool builds_everything) const;
+  bool update_rule_use_inputs(bool builds_everything) const;
+  std::vector<RuleUse> analyze_rule_uses() const;
+  void decide_value_use(const std::vector<CollectRuleRefs> &refs,
+                        const CollectRuleRefs &whitespace,
+                        std::vector<RuleUse> &uses) const;
+  void decide_skippable(std::vector<RuleUse> &uses) const;
+  void decide_must_be_tried(RuleUses &uses) const;
+
+  // Whether a rule in `rules` is flagged. One that this start rule does not
+  // index is taken to be.
+  template <typename Rules>
+  bool any_flagged(const std::vector<bool> &flag, const Rules &rules) const {
+    return std::any_of(rules.begin(), rules.end(), [&](const auto *r) {
+      return !analysis_.indexes(*r) || flag[r->id];
     });
   }
 
-  void initialize_packrat_filter() const;
+  // A flag spreads to the rules that refer to a flagged rule.
+  template <typename RulesOf>
+  void spread(std::vector<bool> &flag, RulesOf rules_of) const {
+    for (auto again = true; again;) {
+      again = false;
+      for (auto *rule : analysis_.rules_by_id) {
+        if (rule && !flag[rule->id] && any_flagged(flag, rules_of(rule->id))) {
+          flag[rule->id] = again = true;
+        }
+      }
+    }
+  }
 
   Result parse_core(const char *s, size_t n, SemanticValues &vs, std::any &dt,
                     const char *path, Log log,
                     ErrorReporter error_reporter = nullptr) const {
-    initialize_definition_ids();
+    const auto &analysis = this->analysis();
 
     std::shared_ptr<Ope> ope = holder_;
 
@@ -3358,139 +4092,122 @@ private:
       if (tracer_end) { tracer_end(trace_data); }
     });
 
-    const std::vector<int32_t> *packrat_index = nullptr;
-    size_t packrat_cached_count = 0;
-    if (enablePackratParsing) {
-      initialize_packrat_filter();
-      if (!packrat_index_.empty()) {
-        packrat_index = &packrat_index_;
-        packrat_cached_count = packrat_cached_count_;
-      } else {
-        packrat_cached_count = definition_ids_.size();
-      }
-    }
+    if (enablePackratParsing) { select_packrat_rules(); }
 
-    Context c(path, s, n, definition_ids_.size(), whitespaceOpe, wordOpe,
+    Context c(path, s, n, &analysis, whitespaceOpe, wordOpe,
               enablePackratParsing, tracer_enter, tracer_leave, trace_data,
-              verbose_trace, log, error_reporter, packrat_index,
-              packrat_cached_count, has_cut_);
+              verbose_trace, log, error_reporter);
 
     if (collect_packrat_stats) {
-      packrat_stats_.resize(definition_ids_.size());
+      packrat_stats_.resize(analysis.rules_by_id.size());
       c.packrat_stats = &packrat_stats_;
     }
 
-    // Recognizer mode: nothing in this parse observes semantic values, so
-    // rule invocations skip the semantic-value machinery entirely. The
-    // callback scan runs per parse; actions can be attached between parses.
-    if (!has_opaque_ope_ && !c.has_tracer && !c.needs_rule_stack) {
-      auto recognize_only = true;
-      for (const auto &entry : definition_ids_) {
-        auto def = static_cast<Definition *>(entry.first);
-        if (def->action || def->enter || def->leave || def->predicate) {
-          recognize_only = false;
-          break;
-        }
+    c.builds_everything = c.has_tracer || analysis.has_user;
+    auto uses = rule_uses(c.builds_everything);
+    c.rule_use = uses->by_id.data();
+
+    c.max_depth = max_depth;
+    c.skips_rules = !c.has_tracer && takes_shortcuts();
+    c.notices_skipping = c.reports_errors || c.limits_depth();
+    c.checks_alternatives = c.notices_skipping && uses->some_must_be_tried;
+
+    auto result = [&](bool ret, size_t len) {
+      c.error_info.resolve_expected_tokens();
+      return Result{ret, c.recovered, len, c.error_info};
+    };
+
+    try {
+      size_t i = 0;
+
+      if (whitespaceOpe) {
+        Context::TraceMute mute(c);
+
+        auto len = whitespaceOpe->parse(s, n, vs, c, dt);
+        if (fail(len)) { return result(false, i); }
+
+        i = len;
       }
-      c.recognize_only = recognize_only;
-    }
 
-    size_t i = 0;
-
-    if (whitespaceOpe) {
-      auto save_ignore_trace_state = c.ignore_trace_state;
-      c.ignore_trace_state = !c.verbose_trace;
-      auto se =
-          scope_exit([&]() { c.ignore_trace_state = save_ignore_trace_state; });
-
-      auto len = whitespaceOpe->parse(s, n, vs, c, dt);
-      if (fail(len)) { return Result{false, c.recovered, i, c.error_info}; }
-
-      i = len;
-    }
-
-    auto len = ope->parse(s + i, n - i, vs, c, dt);
-    auto ret = success(len);
-    if (ret) {
-      i += len;
-      if (eoi_check) {
-        if (i < n) {
-          if (c.error_info.error_pos - c.s < s + i - c.s) {
-            c.error_info.message_pos = s + i;
-            c.error_info.message = "expected end of input";
+      auto len = ope->parse(s + i, n - i, vs, c, dt);
+      auto ret = success(len);
+      if (ret) {
+        i += len;
+        if (eoi_check) {
+          if (i < n) {
+            if (c.error_info.error_pos < s + i) {
+              c.error_info.set_message(s + i, "expected end of input");
+            }
+            ret = false;
           }
-          ret = false;
         }
       }
+      return result(ret, i);
+    } catch (const NestingTooDeep &e) {
+      c.error_info.set_nesting_too_deep(e.pos, e.rule->name, max_depth);
+      return result(false, 0);
     }
-    return Result{ret, c.recovered, i, c.error_info};
   }
 
   std::shared_ptr<Holder> holder_;
   mutable std::once_flag is_token_init_;
   mutable bool is_token_ = false;
-  mutable std::once_flag assign_id_to_definition_init_;
-  mutable std::once_flag definition_ids_init_;
-  mutable std::unordered_map<void *, size_t> definition_ids_;
-  mutable bool has_cut_ = false;
-  mutable bool has_opaque_ope_ = false;
-  mutable std::once_flag packrat_filter_init_;
-  mutable std::vector<int32_t> packrat_index_; // def_id -> cache slot or -1
-  mutable size_t packrat_cached_count_ = 0;
+  mutable std::once_flag tag_init_;
+  mutable unsigned int tag_ = 0;
+  mutable bool has_id_ = false;
+  mutable std::once_flag analysis_init_;
+  mutable std::once_flag packrat_rules_init_;
+  mutable StartRuleAnalysis analysis_;
+
+  // What rule_uses_ was made from: what it is made for, and of each rule
+  // the type of its AST node and the callbacks it has.
+  struct RuleUseInputs {
+    bool builds_everything = false;
+    bool packrat = false;
+    std::vector<std::pair<const std::type_info *, uint8_t>> rules;
+  };
+  mutable std::mutex rule_uses_mutex_;
+  mutable RuleUseInputs rule_use_inputs_;
+  mutable std::shared_ptr<const RuleUses> rule_uses_;
 };
+
+inline bool StartRuleAnalysis::indexes(const Definition &rule) const {
+  return rule.id < rules_by_id.size() && rules_by_id[rule.id] == &rule;
+}
 
 /*
  * Implementations
  */
 
+inline bool starts_word(const Context &c, const char *s, size_t n) {
+  SemanticValues dummy_vs;
+  auto dummy_c = Context::detached(c);
+  std::any dummy_dt;
+  return success(c.wordOpe->parse(s, n, dummy_vs, dummy_c, dummy_dt));
+}
+
 inline size_t parse_literal(const char *s, size_t n, SemanticValues &vs,
                             Context &c, std::any &dt, const std::string &lit,
                             std::once_flag &init_is_word, bool &is_word,
-                            bool ignore_case, const std::string &lower_lit) {
+                            bool ignore_case, const std::string &lower_lit,
+                            bool copy_lit) {
   size_t i = 0;
   for (; i < lit.size(); i++) {
     if (i >= n ||
-        (ignore_case
-             ? (static_cast<char>(
-                    c.tolower_table[static_cast<unsigned char>(s[i])]) !=
-                lower_lit[i])
-             : (s[i] != lit[i]))) {
-      c.set_error_pos(s, lit.data());
-      return static_cast<size_t>(-1);
+        (ignore_case ? to_lower(s[i]) != lower_lit[i] : s[i] != lit[i])) {
+      c.set_error_pos(s, lit.data(), copy_lit);
+      return kFail;
     }
   }
 
   // Word check
   if (c.wordOpe) {
-    auto save_ignore_trace_state = c.ignore_trace_state;
-    c.ignore_trace_state = !c.verbose_trace;
-    auto se =
-        scope_exit([&]() { c.ignore_trace_state = save_ignore_trace_state; });
+    std::call_once(init_is_word,
+                   [&]() { is_word = starts_word(c, lit.data(), lit.size()); });
 
-    std::call_once(init_is_word, [&]() {
-      SemanticValues dummy_vs;
-      Context dummy_c(nullptr, c.s, c.l, 0, nullptr, nullptr, false, nullptr,
-                      nullptr, nullptr, false, nullptr);
-      std::any dummy_dt;
-
-      auto len =
-          c.wordOpe->parse(lit.data(), lit.size(), dummy_vs, dummy_c, dummy_dt);
-      is_word = success(len);
-    });
-
-    if (is_word) {
-      SemanticValues dummy_vs;
-      Context dummy_c(nullptr, c.s, c.l, 0, nullptr, nullptr, false, nullptr,
-                      nullptr, nullptr, false, nullptr);
-      std::any dummy_dt;
-
-      NotPredicate ope(c.wordOpe);
-      auto len = ope.parse(s + i, n - i, dummy_vs, dummy_c, dummy_dt);
-      if (fail(len)) {
-        c.set_error_pos(s, lit.data());
-        return len;
-      }
-      i += len;
+    if (is_word && starts_word(c, s + i, n - i)) {
+      c.set_error_pos(s, lit.data(), copy_lit);
+      return kFail;
     }
   }
 
@@ -3507,137 +4224,238 @@ inline std::pair<size_t, size_t> SemanticValues::line_info() const {
   return c_->line_info(sv_.data());
 }
 
-inline void ErrorInfo::output_log(const Log &log, const ErrorReporter &reporter,
-                                  const char *s, size_t n) {
-  if (message_pos) {
-    if (message_pos > last_output_pos) {
-      last_output_pos = message_pos;
-      auto line = line_info(s, message_pos);
-      std::string msg;
-      auto unexpected_token = heuristic_error_token(s, n, message_pos);
-      if (!unexpected_token.empty()) {
-        msg = replace_all(message, "%t", unexpected_token);
+// A failure is listed under the outermost token rule it is in, or else its
+// own rule.
+inline void ErrorInfo::insert_failure(const char *literal,
+                                      const Definition *rule,
+                                      const Definition *token_rule) {
+  const auto *error_rule = token_rule ? token_rule : rule;
+  if (literal || error_rule) {
+    expected_tokens.emplace_back(literal, error_rule);
+  }
+}
 
-        auto unexpected_char = unexpected_token.substr(
-            0,
-            codepoint_length(unexpected_token.data(), unexpected_token.size()));
+// Trying a rule notes its own start failures inside it, under itself if it is
+// the outermost token rule.
+inline void ErrorInfo::insert_start_failure(const StartFailure &failure,
+                                            const Definition *rule,
+                                            const Definition *token_rule,
+                                            Expanded &expanded) {
+  if (!failure.listed) { return; }
+  if (!failure.rule) {
+    insert_failure(failure.literal, rule, token_rule);
+    return;
+  }
+  const auto *inner = failure.rule;
+  auto inner_token_rule = !token_rule && inner->is_token() ? inner : token_rule;
+  auto key = std::pair(inner, inner_token_rule);
+  if (std::find(expanded.begin(), expanded.end(), key) != expanded.end()) {
+    return;
+  }
+  expanded.push_back(key);
+  for (const auto &f : inner->first_set.failures) {
+    insert_start_failure(f, inner, inner_token_rule, expanded);
+  }
+}
 
-        msg = replace_all(msg, "%c", unexpected_char);
-      } else {
-        msg = message;
-      }
-      if (reporter) {
-        ErrorReport report;
-        report.line = line.first;
-        report.col = line.second;
-        report.position = static_cast<size_t>(message_pos - s);
-        report.unexpected_token = unexpected_token;
-        report.message = msg;
-        report.label = label;
-        reporter(report);
-      }
-      if (log) { log(line.first, line.second, msg, label); }
-    }
-  } else if (error_pos) {
-    if (error_pos > last_output_pos) {
-      last_output_pos = error_pos;
-      auto line = line_info(s, error_pos);
+// Out of line, so that note() is small enough to be inlined.
+CPPPEGLIB_NOINLINE inline void ErrorInfo::remove_repeats() {
+  removed_ += drop_repeats(events_, boundary_,
+                           [](const ExpectedEvent &e) { return e.hash(); });
+  remove_repeats_at_ = std::max(max_events_, 2 * (events_.size() - boundary_));
+}
 
-      ErrorReport report;
-      report.line = line.first;
-      report.col = line.second;
-      report.position = static_cast<size_t>(error_pos - s);
+// The events of a memoized parse are named by the outermost token rule in
+// it, and the parse around it names them by its own, if it has one: they are
+// read under the outermost name given from outside.
+inline void ErrorInfo::resolve_expected_tokens() {
+  if (!has_message()) { clear_message(); }
 
-      std::string msg;
-      if (expected_tokens.empty()) {
-        msg = "syntax error.";
-      } else {
-        msg = "syntax error";
-
-        // unexpected token
-        if (auto unexpected_token = heuristic_error_token(s, n, error_pos);
-            !unexpected_token.empty()) {
-          msg += ", unexpected '";
-          msg += unexpected_token;
-          msg += "'";
-          report.unexpected_token = unexpected_token;
-        }
-
-        auto first_item = true;
-        size_t i = 0;
-        while (i < expected_tokens.size()) {
-          auto [error_literal, error_rule] = expected_tokens[i];
-
-          // Skip rules start with '_'
-          if (!(error_rule && error_rule->name[0] == '_')) {
-            msg += (first_item ? ", expecting " : ", ");
-            if (error_literal) {
-              msg += "'";
-              msg += error_literal;
-              msg += "'";
-              report.expected_literals.emplace_back(error_literal);
-            } else {
-              msg += "<" + error_rule->name + ">";
-              if (label.empty()) { label = error_rule->name; }
-              report.expected_rules.emplace_back(error_rule->name);
-            }
-            first_item = false;
-          }
-
-          i++;
-        }
-        msg += ".";
-      }
-      if (reporter) {
-        report.label = label;
-        reporter(report);
-      }
-      if (log) { log(line.first, line.second, msg, label); }
+  // The spans of the memoized parses, nested. One still in progress spans to
+  // the end, and of two with the same span the one done later is around.
+  struct Span : Record {
+    std::vector<size_t> inner;
+  };
+  std::vector<Span> spans;
+  for (const auto &f : frames_) {
+    if (auto span = span_of(f); span.begin < span.end) {
+      spans.push_back({span, {}});
     }
   }
+  std::vector<size_t> span_of_record(records_.size());
+  for (auto i = records_.size(); i-- > 0;) {
+    span_of_record[i] = spans.size();
+    spans.push_back({records_[i], {}});
+  }
+  std::vector<size_t> order;
+  for (size_t i = 0; i < spans.size(); i++) {
+    order.push_back(i);
+  }
+  std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+    return spans[a].begin != spans[b].begin ? spans[a].begin < spans[b].begin
+                                            : spans[a].end > spans[b].end;
+  });
+  std::vector<size_t> outermost, around;
+  for (auto i : order) {
+    while (!around.empty() && spans[around.back()].end <= spans[i].begin) {
+      around.pop_back();
+    }
+    (around.empty() ? outermost : spans[around.back()].inner).push_back(i);
+    around.push_back(i);
+  }
+
+  Expanded expanded;
+  // A span read again under the same token rule adds nothing.
+  std::vector<std::vector<const Definition *>> read_under(spans.size());
+  auto read = [&](auto &self, const std::vector<size_t> &inner, size_t begin,
+                  size_t end, const Definition *token_rule) -> void {
+    auto read_span = [&](size_t i, const Definition *t) {
+      auto &done = read_under[i];
+      if (std::find(done.begin(), done.end(), t) != done.end()) { return; }
+      done.push_back(t);
+      self(self, spans[i].inner, spans[i].begin, spans[i].end, t);
+    };
+    auto next = inner.begin();
+    for (auto i = begin; i < end;) {
+      if (next != inner.end() && spans[*next].begin == i) {
+        auto inner_span = *next++;
+        read_span(inner_span,
+                  token_rule ? token_rule : spans[inner_span].token_rule);
+        i = spans[inner_span].end;
+        continue;
+      }
+      const auto &e = events_[i++];
+      auto t = token_rule ? token_rule : e.token_rule;
+      switch (e.kind) {
+      case Kind::failure:
+        insert_start_failure(e.failure, e.rule, t, expanded);
+        break;
+      case Kind::skipped:
+        for (auto id = e.begin; id < e.end; id++) {
+          for (const auto &f : e.choice->first_sets()[id].failures) {
+            insert_start_failure(f, e.rule, t, expanded);
+          }
+        }
+        break;
+      case Kind::replay: read_span(span_of_record[e.record], t); break;
+      }
+    }
+  };
+  // What an earlier resolve left has no repeats.
+  auto resolved = expected_tokens.size();
+  read(read, outermost, 0, events_.size(), nullptr);
+  if (expected_tokens.size() != resolved) {
+    drop_repeats(expected_tokens, 0, [](const auto &token) {
+      return mix_index(reinterpret_cast<uintptr_t>(token.first) * 31 +
+                       reinterpret_cast<uintptr_t>(token.second));
+    });
+  }
+  next_generation();
+}
+
+inline void ErrorInfo::output_log(const Log &log, const ErrorReporter &reporter,
+                                  const char *s, size_t n,
+                                  const std::string &recovery_label) {
+  resolve_expected_tokens();
+  auto pos = message_pos ? message_pos : error_pos;
+  if (!pos || pos <= last_output_pos) { return; }
+  last_output_pos = pos;
+
+  auto line = line_info(s, pos);
+  ErrorReport report;
+  report.line = line.first;
+  report.col = line.second;
+  report.position = static_cast<size_t>(pos - s);
+
+  auto unexpected_token = heuristic_error_token(s, n, pos);
+  std::string msg;
+  if (message_pos) {
+    if (!unexpected_token.empty()) {
+      msg = replace_all(message, "%t", unexpected_token);
+
+      auto unexpected_char = unexpected_token.substr(
+          0, codepoint_or_byte_length(unexpected_token.data(),
+                                      unexpected_token.size()));
+
+      msg = replace_all(msg, "%c", unexpected_char);
+    } else {
+      msg = message;
+    }
+    report.unexpected_token = unexpected_token;
+    report.message = msg;
+    report.label = label;
+  } else if (expected_tokens.empty()) {
+    msg = "syntax error.";
+  } else {
+    msg = "syntax error";
+
+    if (!unexpected_token.empty()) {
+      msg += ", unexpected '";
+      msg += unexpected_token;
+      msg += "'";
+      report.unexpected_token = unexpected_token;
+    }
+
+    // A literal is listed by its text, which can come from more than one
+    // place in the grammar. Nothing is listed under a rule that starts with
+    // '_'.
+    std::vector<std::pair<std::string_view, const Definition *>> listed;
+    listed.reserve(expected_tokens.size());
+    for (const auto &[literal, rule] : expected_tokens) {
+      if (rule && rule->name[0] == '_') { continue; }
+      listed.emplace_back(literal ? literal : "", literal ? nullptr : rule);
+    }
+    drop_repeats(listed, 0, [](const auto &item) {
+      return std::hash<std::string_view>()(item.first) ^
+             mix_index(reinterpret_cast<uintptr_t>(item.second));
+    });
+    for (const auto &[text, rule] : listed) {
+      msg += report.expected_literals.empty() && report.expected_rules.empty()
+                 ? ", expecting "
+                 : ", ";
+      if (rule) {
+        msg += "<" + rule->name + ">";
+        report.expected_rules.emplace_back(rule->name);
+      } else {
+        msg += "'";
+        msg += text;
+        msg += "'";
+        report.expected_literals.emplace_back(text);
+      }
+    }
+    msg += ".";
+    if (!report.expected_rules.empty()) {
+      report.label = report.expected_rules.front();
+    }
+  }
+
+  if (!recovery_label.empty()) { report.label = recovery_label; }
+  if (reporter) { reporter(report); }
+  if (log) { log(line.first, line.second, msg, report.label); }
 }
 
 inline size_t Context::skip_whitespace(const char *a_s, size_t n,
                                        SemanticValues &vs, std::any &dt) {
-  if (in_token_boundary_count || !whitespaceOpe) { return 0; }
-  auto save = ignore_trace_state;
-  ignore_trace_state = !verbose_trace;
-  auto se = scope_exit([&]() { ignore_trace_state = save; });
+  if (skips_no_whitespace || !whitespaceOpe) { return 0; }
+  TraceMute mute(*this);
   return whitespaceOpe->parse(a_s, n, vs, *this, dt);
 }
 
-inline void Context::set_error_pos(const char *a_s, const char *literal) {
-  if (log || error_reporter) {
-    if (error_info.error_pos <= a_s) {
-      if (error_info.error_pos < a_s || !error_info.keep_previous_token) {
-        error_info.error_pos = a_s;
-        error_info.expected_tokens.clear();
-      }
+inline size_t Context::parse_without_whitespace(const Ope &ope, const char *a_s,
+                                                size_t n, SemanticValues &vs,
+                                                std::any &dt) {
+  auto saved = std::exchange(skips_no_whitespace, whitespaceOpe != nullptr);
+  auto se = scope_exit([&]() { skips_no_whitespace = saved; });
+  return ope.parse(a_s, n, vs, *this, dt);
+}
 
-      const char *error_literal = nullptr;
-      const Definition *error_rule = nullptr;
-
-      if (literal) {
-        error_literal = literal;
-      } else if (!rule_stack.empty()) {
-        auto rule = rule_stack.back();
-        auto ope = rule->get_core_operator();
-        if (auto token = FindLiteralToken::token(*ope);
-            token && token[0] != '\0') {
-          error_literal = token;
-        }
-      }
-
-      for (auto r : rule_stack) {
-        error_rule = r;
-        if (r->is_token()) { break; }
-      }
-
-      if (error_literal || error_rule) {
-        error_info.add(error_literal, error_rule);
-      }
-    }
+// Reads is_token_ as it is: the start rule's analysis has asked every rule
+// it reaches whether it is a token, so that this need not on every push.
+inline void Context::push_rule(Definition *rule) {
+  if (outer_token_rule == static_cast<size_t>(-1) && rule->is_token_) {
+    outer_token_rule = rule_stack.size();
   }
+  rule_stack.push_back(rule);
 }
 
 inline void Context::trace_enter(const Ope &ope, const char *a_s, size_t n,
@@ -3663,13 +4481,21 @@ inline bool Context::is_traceable(const Ope &ope) const {
 
 inline size_t Ope::parse(const char *s, size_t n, SemanticValues &vs,
                          Context &c, std::any &dt) const {
-  if (c.is_traceable(*this)) {
-    c.trace_enter(*this, s, n, vs, dt);
-    auto len = parse_core(s, n, vs, c, dt);
-    c.trace_leave(*this, s, n, vs, dt, len);
-    return len;
-  }
+  if (c.has_tracer) { return parse_traced(s, n, vs, c, dt); }
   return parse_core(s, n, vs, c, dt);
+}
+
+// Out of line, so that Ope::parse is small enough to be inlined into its
+// callers.
+CPPPEGLIB_NOINLINE inline size_t Ope::parse_traced(const char *s, size_t n,
+                                                   SemanticValues &vs,
+                                                   Context &c,
+                                                   std::any &dt) const {
+  if (!c.is_traceable(*this)) { return parse_core(s, n, vs, c, dt); }
+  c.trace_enter(*this, s, n, vs, dt);
+  auto len = parse_core(s, n, vs, c, dt);
+  c.trace_leave(*this, s, n, vs, dt, len);
+  return len;
 }
 
 inline size_t Dictionary::parse_core(const char *s, size_t n,
@@ -3680,33 +4506,16 @@ inline size_t Dictionary::parse_core(const char *s, size_t n,
 
   if (i == 0) {
     c.set_error_pos(s);
-    return static_cast<size_t>(-1);
+    return kFail;
   }
 
   vs.choice_count_ = trie_.items_count();
   vs.choice_ = id;
 
   // Word check
-  if (c.wordOpe) {
-    auto save_ignore_trace_state = c.ignore_trace_state;
-    c.ignore_trace_state = !c.verbose_trace;
-    auto se =
-        scope_exit([&]() { c.ignore_trace_state = save_ignore_trace_state; });
-
-    {
-      SemanticValues dummy_vs;
-      Context dummy_c(nullptr, c.s, c.l, 0, nullptr, nullptr, false, nullptr,
-                      nullptr, nullptr, false, nullptr);
-      std::any dummy_dt;
-
-      NotPredicate ope(c.wordOpe);
-      auto len = ope.parse(s + i, n - i, dummy_vs, dummy_c, dummy_dt);
-      if (fail(len)) {
-        c.set_error_pos(s);
-        return len;
-      }
-      i += len;
-    }
+  if (c.wordOpe && starts_word(c, s + i, n - i)) {
+    c.set_error_pos(s);
+    return kFail;
   }
 
   // Skip whitespace
@@ -3721,26 +4530,20 @@ inline size_t LiteralString::parse_core(const char *s, size_t n,
                                         SemanticValues &vs, Context &c,
                                         std::any &dt) const {
   return parse_literal(s, n, vs, c, dt, lit_, init_is_word_, is_word_,
-                       ignore_case_, lower_lit_);
+                       ignore_case_, lower_lit_, false);
 }
 
 inline size_t TokenBoundary::parse_core(const char *s, size_t n,
                                         SemanticValues &vs, Context &c,
                                         std::any &dt) const {
-  auto save_ignore_trace_state = c.ignore_trace_state;
-  c.ignore_trace_state = !c.verbose_trace;
-  auto se =
-      scope_exit([&]() { c.ignore_trace_state = save_ignore_trace_state; });
+  Context::TraceMute mute(c);
 
-  size_t len;
-  {
-    c.in_token_boundary_count++;
-    auto se = scope_exit([&]() { c.in_token_boundary_count--; });
-    len = ope_->parse(s, n, vs, c, dt);
-  }
+  auto len = c.parse_without_whitespace(*ope_, s, n, vs, dt);
 
   if (success(len)) {
-    if (!c.recognize_only) { vs.tokens.emplace_back(std::string_view(s, len)); }
+    if (vs.is_read_ && !vs.holds_rule_tokens_) {
+      vs.tokens.emplace_back(std::string_view(s, len));
+    }
 
     auto wl = c.skip_whitespace(s + len, n - len, vs, dt);
     if (fail(wl)) { return wl; }
@@ -3790,22 +4593,15 @@ inline std::string resolve_capture_placeholders(const std::string &msg,
 }
 
 // Parses the rule's operator into the given scope, maintaining the rule
-// stack and honouring no_whitespace. The rule stack feeds error reports,
-// user tracers, and the resolution of macro arguments written in this
-// rule's body; a rule that serves none of those skips the bookkeeping.
+// stack and honouring no_whitespace.
 inline size_t Holder::parse_ope_body(const char *s, size_t n,
                                      SemanticValues &vs, Context &c,
                                      std::any &dt) const {
-  const auto push_rule = c.needs_rule_stack || outer_->has_macro_ref;
-  if (push_rule) { c.rule_stack.push_back(outer_); }
+  if (c.needs_rule_stack) { c.push_rule(outer_); }
 
   size_t len;
   if (outer_->no_whitespace) {
-    {
-      c.in_token_boundary_count++;
-      auto se = scope_exit([&]() { c.in_token_boundary_count--; });
-      len = ope_->parse(s, n, vs, c, dt);
-    }
+    len = c.parse_without_whitespace(*ope_, s, n, vs, dt);
     if (success(len)) {
       auto wl = c.skip_whitespace(s + len, n - len, vs, dt);
       if (fail(wl)) {
@@ -3818,8 +4614,24 @@ inline size_t Holder::parse_ope_body(const char *s, size_t n,
     len = ope_->parse(s, n, vs, c, dt);
   }
 
-  if (push_rule) { c.rule_stack.pop_back(); }
+  if (c.needs_rule_stack) { c.pop_rule(); }
   return len;
+}
+
+CPPPEGLIB_NOINLINE inline void Context::note_failure(const char *a_s,
+                                                     StartFailure failure,
+                                                     bool copy_literal) {
+  if (error_info.advance_to(a_s)) {
+    error_info.add(failure, current_rule(), token_rule(), copy_literal);
+  }
+}
+
+inline bool Context::must_be_tried(const FirstSet &fs) const {
+  return std::any_of(
+      fs.failures.begin(), fs.failures.end(), [&](const auto &f) {
+        return f.rule &&
+               (!has_id(*f.rule) || rule_use[f.rule->id].must_be_tried);
+      });
 }
 
 inline size_t Holder::parse_core(const char *s, size_t n, SemanticValues &vs,
@@ -3828,58 +4640,68 @@ inline size_t Holder::parse_core(const char *s, size_t n, SemanticValues &vs,
     throw std::logic_error("Uninitialized definition ope was used...");
   }
 
+  auto nesting = c.nest(s, *outer_);
+
   // Macro reference. A left-recursive macro cannot take this path: it needs
-  // the seed-growing below, which in turn needs its own semantic value scope
-  // to memoise. Such a macro forms a scope like a plain rule does.
+  // its seed grown (Context::reuse_or_grow), which in turn needs its own
+  // semantic value scope to memoise. Such a macro forms a scope like a plain
+  // rule does.
+  // An ignored one is parsed into a scope that is thrown away, as `~` does.
   if (outer_->is_macro && !outer_->is_left_recursive) {
-    c.rule_stack.push_back(outer_);
-    auto len = ope_->parse(s, n, vs, c, dt);
-    c.rule_stack.pop_back();
-    return len;
-  }
-
-  size_t len;
-  std::any val;
-
-  // Recognizer fast path: no semantic-value scope, no reduce, no value
-  // emplace; the rule body parses straight into the caller's scope.
-  // Left-recursive rules keep the full seed-growing machinery below.
-  if (c.recognize_only && !outer_->is_left_recursive) {
-    auto do_recognize = [&](std::any &) {
-      len = parse_ope_body(s, n, vs, c, dt);
-    };
-
-    if (c.enablePackratParsing) {
-      c.packrat(s, outer_->id, len, val, do_recognize);
-    } else {
-      // Same re-entry guard as the general no-packrat path below.
-      auto guard_key = Context::LRKey({outer_, c.top_macro_inst()}, s);
-      if (c.lr_memo.count(guard_key)) {
-        len = static_cast<size_t>(-1);
-      } else {
-        c.lr_memo[guard_key] = {static_cast<size_t>(-1), {}};
-        do_recognize(val);
-        c.lr_memo.erase(guard_key);
-      }
+    if (!outer_->ignoreSemanticValue) {
+      return parse_ope_body(s, n, vs, c, dt);
     }
-    return len;
+    return c.parse_thrown_away([&](SemanticValues &chvs) {
+      return parse_ope_body(s, n, chvs, c, dt);
+    });
   }
 
-  // Shared parse body: invokes enter/leave callbacks, parses the rule's
+  auto has_id = c.has_id(*outer_);
+  const auto use = has_id ? c.rule_use[outer_->id] : RuleUse();
+
+  Context::RuleMatch match;
+
+  // A match that nothing observes, and whose value and token nothing reads,
+  // is only recognized. A value that is always empty is delivered as such.
+  if (!vs.holds_rule_tokens_ &&
+      (use.recognized == RuleUse::Recognized::always ||
+       (use.recognized == RuleUse::Recognized::where_unread &&
+        !vs.holds_rule_values_))) {
+    // A left-recursive rule is observed (Definition::decide_value_use): its
+    // seed is grown in reuse_or_grow.
+    assert(!outer_->is_left_recursive);
+    c.reuse_or_parse(s, *outer_, has_id, false, match,
+                     [&](Context::RuleMatch &m) {
+                       m.len = parse_ope_body(s, n, c.unread_scope, c, dt);
+                     });
+    if (success(match.len) && vs.holds_rule_values_ &&
+        !outer_->ignoreSemanticValue) {
+      // A value that might not be empty is read nowhere.
+      assert(use.value_always_empty);
+      vs.emplace_back();
+      vs.tags.emplace_back(outer_->tag());
+    }
+    return match.len;
+  }
+
+  // Builds a match: invokes enter/leave callbacks, parses the rule's
   // operator, handles actions/predicates/errors, and calls reduce.
-  // Writes into parse_len / parse_val (parse_val only on success).
-  auto do_parse = [&](size_t &parse_len, std::any &parse_val) {
+  // Writes into m (its value and token only on success). A left-recursive
+  // rule runs it once more for every growth of its seed.
+  auto do_parse = [&](Context::RuleMatch &m) {
     if (outer_->enter) { outer_->enter(c, s, n, dt); }
     auto &chvs = c.push_semantic_values_scope();
-    auto se = scope_exit([&]() {
-      c.pop_semantic_values_scope();
-      if (outer_->leave) { outer_->leave(c, s, n, parse_len, parse_val, dt); }
-    });
+    auto se = scope_exit([&]() { c.pop_semantic_values_scope(); });
+    chvs.holds_rule_values_ =
+        use.child_values == RuleUse::ChildValues::read ||
+        (use.child_values == RuleUse::ChildValues::passed_up &&
+         vs.holds_rule_values_);
 
-    parse_len = parse_ope_body(s, n, chvs, c, dt);
+    const auto mark = c.error_info.mark();
+    m.len = parse_ope_body(s, n, chvs, c, dt);
 
-    if (success(parse_len)) {
-      chvs.sv_ = std::string_view(s, parse_len);
+    if (success(m.len)) {
+      chvs.sv_ = std::string_view(s, m.len);
       chvs.name_ = &outer_->name;
 
       auto ope_ptr = ope_.get();
@@ -3890,166 +4712,67 @@ inline size_t Holder::parse_core(const char *s, size_t n, SemanticValues &vs,
         chvs.choice_count_ = 0;
         chvs.choice_ = 0;
       }
+      m.token = chvs.token();
 
       if (outer_->predicate) {
         std::string msg;
         std::any predicate_data;
         if (!outer_->predicate(chvs, dt, msg, predicate_data)) {
-          if ((c.log || c.error_reporter) && !msg.empty() &&
-              c.error_info.message_pos < s) {
-            c.error_info.message_pos = s;
-            c.error_info.message = msg;
-            c.error_info.label = outer_->name;
+          if (!msg.empty()) {
+            c.give_message(
+                s, mark, [&] { return std::move(msg); }, outer_->name);
           }
-          parse_len = static_cast<size_t>(-1);
+          m.len = kFail;
         } else if (!c.recovered) {
-          parse_val = reduce(chvs, dt, predicate_data);
+          m.val = reduce(chvs, dt, predicate_data);
         }
       } else if (!c.recovered) {
         std::any predicate_data;
-        parse_val = reduce(chvs, dt, predicate_data);
+        m.val = reduce(chvs, dt, predicate_data);
       }
     } else {
-      if ((c.log || c.error_reporter) && !outer_->error_message.empty() &&
-          c.error_info.message_pos < s) {
-        c.error_info.message_pos = s;
-        c.error_info.message =
-            resolve_capture_placeholders(outer_->error_message, c);
-        c.error_info.label = outer_->name;
+      if (!outer_->error_message.empty()) {
+        c.give_message(
+            s, mark,
+            [&] {
+              return resolve_capture_placeholders(outer_->error_message, c);
+            },
+            outer_->name);
       }
     }
+
+    // Not from the scope_exit: an exception leaves no result to report.
+    if (outer_->leave) { outer_->leave(c, s, n, m.len, m.val, dt); }
   };
 
   if (outer_->is_left_recursive) {
-    // A macro grows one seed per instantiation: Sum(D) and Sum(L) are
-    // different rules as far as the memo is concerned.
-    auto lr_rule = Context::LRRule(outer_, c.top_macro_inst());
-    auto lr_key = Context::LRKey(lr_rule, s);
-
-    // Check LR memo first
-    auto it = c.lr_memo.find(lr_key);
-    if (it != c.lr_memo.end()) {
-      if (success(it->second.len)) {
-        len = it->second.len;
-        val = it->second.val;
-      } else {
-        len = static_cast<size_t>(-1);
-      }
-      // Record that this rule's lr_memo was accessed.
-      // Any LR rule currently seeding will know we're in its cycle.
-      c.lr_refs_hit.insert(lr_rule);
-    } else {
-      // Seed with FAIL
-      c.lr_memo[lr_key] = {static_cast<size_t>(-1), {}};
-
-      // Mark as active seed (protects our lr_memo from inner growers)
-      c.lr_active_seeds.insert(lr_key);
-      auto seed_guard = scope_exit([&]() { c.lr_active_seeds.erase(lr_key); });
-
-      // Track which LR rules are referenced during our parse
-      // to identify cycle members
-      auto saved_refs = std::move(c.lr_refs_hit);
-      c.lr_refs_hit.clear();
-
-      // Initial parse (self-references will hit the FAIL seed)
-      size_t initial_len;
-      std::any initial_val;
-      do_parse(initial_len, initial_val);
-
-      // Rules whose lr_memo was hit during our parse are in our cycle.
-      // If we detected cycle members, we ourselves are also part of
-      // the cycle, so add self — this lets parent seeders see us as
-      // a transitive cycle member.
-      auto cycle_rules = c.lr_refs_hit;
-      if (!cycle_rules.empty()) { cycle_rules.insert(lr_rule); }
-
-      // Restore parent's refs and propagate cycle info upward
-      c.lr_refs_hit = std::move(saved_refs);
-      c.lr_refs_hit.insert(cycle_rules.begin(), cycle_rules.end());
-
-      if (!success(initial_len)) {
-        // Keep FAIL in lr_memo so we don't re-seed
-        len = static_cast<size_t>(-1);
-      } else {
-        // Got initial seed, now grow
-        len = initial_len;
-        val = std::move(initial_val);
-        c.lr_memo[lr_key] = {len, val};
-
-        while (true) {
-          // Clear this rule's packrat cache. A macro is never written there
-          // (that cache is keyed by rule id alone, which cannot tell two
-          // instantiations apart), so there is nothing to clear for one.
-          if (!outer_->is_macro) { c.clear_packrat_cache(s, outer_->id); }
-
-          // Clear lr_memo for cycle-dependent rules at this position,
-          // but NOT for rules currently in their own seeding phase
-          // (lr_active_seeds) — those are outer growers we must not
-          // interfere with.
-          for (auto memo_it = c.lr_memo.begin(); memo_it != c.lr_memo.end();) {
-            if (memo_it->first.second == s && memo_it->first.first != lr_rule &&
-                cycle_rules.count(memo_it->first.first) &&
-                !c.lr_active_seeds.count(memo_it->first)) {
-              memo_it = c.lr_memo.erase(memo_it);
-            } else {
-              ++memo_it;
-            }
-          }
-
-          size_t new_len;
-          std::any new_val;
-          do_parse(new_len, new_val);
-
-          if (!success(new_len) || new_len <= len) {
-            break; // No improvement, done growing
-          }
-
-          len = new_len;
-          val = std::move(new_val);
-          c.lr_memo[lr_key] = {len, val};
-        }
-      }
-
-      // Write final result to packrat cache (lr_memo entry is kept as
-      // the primary lookup for LR rules at this position)
-      if (success(len) && !outer_->is_macro) {
-        c.write_packrat_cache(s, outer_->id, len, val);
-      }
-    }
+    c.reuse_or_grow(s, *this, match, do_parse);
   } else {
-    if (c.enablePackratParsing) {
-      // Packrat cache acts as re-entry guard (pre-registered as
-      // failure before fn is called).
-      c.packrat(s, outer_->id, len, val,
-                [&](std::any &a_val) { do_parse(len, a_val); });
-    } else {
-      // Without packrat, use lr_memo as re-entry guard to prevent
-      // stack overflow from undetected left recursion.
-      auto guard_key = Context::LRKey({outer_, c.top_macro_inst()}, s);
-      if (c.lr_memo.count(guard_key)) {
-        len = static_cast<size_t>(-1);
-      } else {
-        c.lr_memo[guard_key] = {static_cast<size_t>(-1), {}};
-        do_parse(len, val);
-        c.lr_memo.erase(guard_key);
-      }
-    }
+    c.reuse_or_parse(s, *outer_, has_id, vs.holds_rule_tokens_, match,
+                     do_parse);
   }
 
-  if (success(len)) {
-    if (!outer_->ignoreSemanticValue && !c.recognize_only) {
-      vs.emplace_back(std::move(val));
-      vs.tags.emplace_back(str2tag(outer_->name));
+  if (success(match.len)) {
+    if (!outer_->ignoreSemanticValue && vs.holds_rule_values_) {
+      vs.emplace_back(std::move(match.val));
+      vs.tags.emplace_back(outer_->tag());
     }
+    if (vs.holds_rule_tokens_) { vs.tokens.push_back(match.token); }
   }
 
-  return len;
+  return match.len;
 }
 
 inline std::any Holder::reduce(SemanticValues &vs, std::any &dt,
                                const std::any &predicate_data) const {
   if (outer_->action && !outer_->disable_action) {
-    return outer_->action(vs, dt, predicate_data);
+    auto val = outer_->action(vs, dt, predicate_data);
+    // Release the values now instead of when this scope is next used: the
+    // AST node an action just returned is then held only by the caller, which
+    // lets a collapsing parent take it over in place.
+    vs.clear();
+    vs.tags.clear();
+    return val;
   } else if (vs.empty()) {
     return std::any();
   } else {
@@ -4067,7 +4790,8 @@ inline const std::string &Holder::trace_name() const {
 
 // Key a macro instantiation by what each argument denotes rather than by the
 // node that spells it: `M(N)` written at two call sites builds two Reference
-// nodes for the same rule N, and those are the same instantiation.
+// nodes for the same rule N, and those are the same instantiation. Any other
+// argument, a macro call among them, is the node itself.
 inline std::vector<const void *>
 macro_inst_key(const Definition *def,
                const std::vector<std::shared_ptr<Ope>> &args) {
@@ -4076,10 +4800,28 @@ macro_inst_key(const Definition *def,
   key.push_back(def);
   for (const auto &arg : args) {
     auto ref = dynamic_cast<Reference *>(arg.get());
-    key.push_back(ref && ref->rule_ ? static_cast<const void *>(ref->rule_)
-                                    : static_cast<const void *>(arg.get()));
+    key.push_back(ref && ref->rule_ && !ref->is_macro_
+                      ? static_cast<const void *>(ref->rule_)
+                      : static_cast<const void *>(arg.get()));
   }
   return key;
+}
+
+// A parameter passes its caller's argument on as it is, so a call that
+// passes a parameter on finds its own instance again.
+inline Context::Instance &Context::instance(const Reference &call) {
+  auto &inst = instance_of_call[&call];
+  if (!inst) {
+    inst = &instance_by_key[macro_inst_key(call.rule_, call.args_)];
+    if (!inst->body) {
+      auto made = std::make_shared<Holder>(call.rule_);
+      made->ope_ = ReplaceParameters(call.args_)
+                       .resolve(call.rule_->get_core_operator());
+      instances.push_back(made);
+      inst->body = made.get();
+    }
+  }
+  return *inst;
 }
 
 inline size_t Reference::parse_core(const char *s, size_t n, SemanticValues &vs,
@@ -4101,50 +4843,38 @@ inline size_t Reference::parse_core(const char *s, size_t n, SemanticValues &vs,
 inline size_t Reference::parse_dispatch(const char *s, size_t n,
                                         SemanticValues &vs, Context &c,
                                         std::any &dt) const {
-  if (rule_) {
-    // Reference rule
-    if (rule_->is_macro) {
-      // Macro
-      FindReference vis(c.top_args(), c.rule_stack.back()->params);
-
-      // Collect arguments (into the retained buffer of the frame the push
-      // below will occupy, so no allocation happens on a warm path)
-      auto args = c.take_args_buffer();
-      for (const auto &arg : args_) {
-        arg->accept(vis);
-        args.emplace_back(std::move(vis.found_ope));
-      }
-
-      auto inst = rule_->is_left_recursive
-                      ? c.intern_macro_inst(macro_inst_key(rule_, args))
-                      : 0;
-      c.push_args(std::move(args), inst);
-      auto se = scope_exit([&]() { c.pop_args(); });
-      return rule_->holder_->parse(s, n, vs, c, dt);
-    } else {
-      // Definition. The empty argument scope only exists to shadow the
-      // caller's frame for readers inside the callee: a macro invocation in
-      // its body (FindReference/top_args, tracked by has_macro_ref) and the
-      // top_macro_inst reads in the left-recursion machinery and the
-      // no-packrat re-entry guard. A callee with no such reader parses
-      // directly on the caller's frame.
-      if (!rule_->has_macro_ref && !rule_->is_left_recursive &&
-          c.enablePackratParsing) {
-        return rule_->holder_->parse(s, n, vs, c, dt);
-      }
-      c.push_empty_args();
-      auto se2 = scope_exit([&]() { c.pop_args(); });
-      return rule_->holder_->parse(s, n, vs, c, dt);
-    }
-  } else {
-    // Reference parameter in macro
-    const auto &args = c.top_args();
-    return args[iarg_]->parse(s, n, vs, c, dt);
+  // An instance has its parameters replaced, and only instances are parsed.
+  if (!rule_) {
+    throw std::logic_error("A macro parameter was parsed outside its macro...");
   }
-}
 
-inline std::shared_ptr<Ope> Reference::get_core_operator() const {
-  return rule_->holder_;
+  if (rule_->is_macro) {
+    auto &inst = c.instance(*this);
+    if (rule_->is_left_recursive) { return inst.body->parse(s, n, vs, c, dt); }
+    // Left recursion that detection missed enters it again where it is being
+    // parsed. It fails there, as a rule does (Context::reuse_or_parse).
+    auto &active = inst.active_pos[c.skips_no_whitespace];
+    if (c.enters_again(active, s)) { return kFail; }
+    // No scope_exit: an exception abandons the Context.
+    auto save = std::exchange(active, s);
+    auto len = inst.body->parse(s, n, vs, c, dt);
+    active = save;
+    return len;
+  }
+
+  // A rule that cannot start with the next byte fails without being entered,
+  // as a choice skips an alternative that cannot. Where that could be
+  // noticed, it notes what entering it would, unless it must be tried.
+  if (c.skips_rules && n > 0 &&
+      !rule_->start_bytes.test(static_cast<unsigned char>(*s)) &&
+      c.has_id(*rule_) && c.rule_use[rule_->id].skippable) {
+    if (!c.notices_skipping) { return kFail; }
+    if (!c.rule_use[rule_->id].must_be_tried) {
+      c.note_untried(*rule_, s);
+      return kFail;
+    }
+  }
+  return rule_->holder_->parse(s, n, vs, c, dt);
 }
 
 inline size_t BackReference::parse_core(const char *s, size_t n,
@@ -4157,64 +4887,79 @@ inline size_t BackReference::parse_core(const char *s, size_t n,
       std::once_flag init_is_word;
       auto is_word = false;
       static const std::string empty;
+      // The captured text does not outlive its capture.
       return parse_literal(s, n, vs, c, dt, lit, init_is_word, is_word, false,
-                           empty);
+                           empty, true);
     }
   }
 
-  c.error_info.message_pos = s;
-  c.error_info.message = "undefined back reference '$" + name_ + "'...";
-  return static_cast<size_t>(-1);
+  c.give_message(s, c.error_info.mark(), [&] {
+    return "undefined back reference '$" + name_ + "'...";
+  });
+  return kFail;
 }
 
-inline Definition &
-PrecedenceClimbing::get_reference_for_binop(Context &c) const {
-  if (rule_.is_macro) {
-    // Reference parameter in macro
-    const auto &args = c.top_args();
-    auto iarg = dynamic_cast<Reference &>(*binop_).iarg_;
-    auto arg = args[iarg];
-    return *dynamic_cast<Reference &>(*arg).rule_;
+inline size_t PrecedenceClimbing::parse_core(const char *s, size_t n,
+                                             SemanticValues &vs, Context &c,
+                                             std::any &dt) const {
+  auto operand_missing = false;
+  if (!rule_.is_macro || rule_.is_left_recursive) {
+    return parse_expression(s, n, vs, c, dt, 0, operand_missing);
   }
 
-  return *dynamic_cast<Reference &>(*binop_).rule_;
+  // A macro's body parses on its caller's values, unless it is left-recursive
+  // (see Holder::parse_core). Fold the operands in a scope of their own, so
+  // that the caller's values stay out of the actions and the fold.
+  return parse_in_scope(vs, c, [&](SemanticValues &chvs) {
+    return parse_expression(s, n, chvs, c, dt, 0, operand_missing);
+  });
 }
 
-inline size_t PrecedenceClimbing::parse_expression(const char *s, size_t n,
-                                                   SemanticValues &vs,
-                                                   Context &c, std::any &dt,
-                                                   size_t min_prec) const {
+// Parses into a scope of its own and, on a match, hands what it produced
+// over to `vs`: all its values with their tags, and its tokens.
+template <typename F>
+inline size_t PrecedenceClimbing::parse_in_scope(SemanticValues &vs, Context &c,
+                                                 F parse) {
+  auto &chvs = c.push_semantic_values_scope();
+  auto se = scope_exit([&]() { c.pop_semantic_values_scope(); });
+  auto len = parse(chvs);
+  if (success(len)) {
+    if (vs.holds_rule_values_) { append_values(vs, chvs); }
+    if (vs.is_read_) {
+      vs.tokens.insert(vs.tokens.end(), chvs.tokens.begin(), chvs.tokens.end());
+    }
+  }
+  return len;
+}
+
+inline size_t PrecedenceClimbing::parse_expression(
+    const char *s, size_t n, SemanticValues &vs, Context &c, std::any &dt,
+    size_t min_prec, bool &operand_missing) const {
   auto len = atom_->parse(s, n, vs, c, dt);
   if (fail(len)) { return len; }
 
-  std::string tok;
-  auto &rule = get_reference_for_binop(c);
-  auto action = std::move(rule.action);
-
-  rule.action = [&](SemanticValues &vs2, std::any &dt2,
-                    const std::any &predicate_data2) {
-    tok = vs2.token();
-    if (action) {
-      return action(vs2, dt2, predicate_data2);
-    } else if (!vs2.empty()) {
-      return vs2[0];
-    }
-    return std::any();
-  };
-  auto action_se = scope_exit([&]() { rule.action = std::move(action); });
-
   auto i = len;
   while (i < n) {
-    std::vector<std::any> save_values(vs.begin(), vs.end());
-    auto save_tokens = vs.tokens;
+    // An operator that goes unused leaves nothing behind, captures included,
+    // as in the repetition `atom (binop atom)*` this parses.
+    auto snap = c.snapshot(vs);
+    auto used = false;
+    auto se_rollback = scope_exit([&]() {
+      if (!used) { c.rollback(vs, snap); }
+    });
 
-    auto chvs = c.push_semantic_values_scope();
-    auto chlen = binop_->parse(s + i, n - i, chvs, c, dt);
-    c.pop_semantic_values_scope();
+    // Popped once parsed, but read until the right operand takes its place.
+    auto &chvs = c.push_semantic_values_scope();
+    chvs.holds_rule_tokens_ = true;
+    size_t op_len;
+    {
+      auto se = scope_exit([&]() { c.pop_semantic_values_scope(); });
+      op_len = binop_->parse(s + i, n - i, chvs, c, dt);
+    }
 
-    if (fail(chlen)) { break; }
+    if (fail(op_len) || chvs.tokens.empty()) { break; }
 
-    auto it = info_.find(tok);
+    auto it = info_.find(chvs.tokens.front());
     if (it == info_.end()) { break; }
 
     auto level = std::get<0>(it->second);
@@ -4222,36 +4967,60 @@ inline size_t PrecedenceClimbing::parse_expression(const char *s, size_t n,
 
     if (level < min_prec) { break; }
 
-    vs.emplace_back(std::move(chvs[0]));
-    i += chlen;
+    append_values(vs, chvs);
+    i += op_len;
 
     auto next_min_prec = level;
     if (assoc == 'L') { next_min_prec = level + 1; }
 
-    chvs = c.push_semantic_values_scope();
-    chlen = parse_expression(s + i, n - i, chvs, c, dt, next_min_prec);
-    c.pop_semantic_values_scope();
+    // The right operand folds its own operators, so it parses in a scope of
+    // its own. It nests the way a rule match does, so it counts as one: a
+    // chain of right-associative operators is as deep as it is long.
+    auto rhs_len = parse_in_scope(vs, c, [&](SemanticValues &rhs) {
+      auto nesting = c.nest(s + i, rule_);
+      return parse_expression(s + i, n - i, rhs, c, dt, next_min_prec,
+                              operand_missing);
+    });
 
-    if (fail(chlen)) {
-      vs.assign(save_values.begin(), save_values.end());
-      vs.tokens = save_tokens;
-      i = chlen;
+    // Without a right operand the operator goes unused, as the repetition
+    // stops before it.
+    if (fail(rhs_len)) {
+      i -= op_len;
+      operand_missing = true;
       break;
     }
+    i += rhs_len;
 
-    vs.emplace_back(std::move(chvs[0]));
-    i += chlen;
-
+    // The result stands for the operands folded into it. What an action
+    // returns is this rule's value and carries its tag, as Holder::parse_core
+    // tags a rule's value; without an action the first value stands for the
+    // fold with its own tag, as Holder::reduce hands it over. After a
+    // recovered error no value is built, as for a rule.
     std::any val;
-    if (rule_.action) {
-      vs.sv_ = std::string_view(s, i);
-      static const std::any empty_predicate_data;
-      val = rule_.action(vs, dt, empty_predicate_data);
-    } else if (!vs.empty()) {
-      val = vs[0];
+    auto tag = rule_.tag();
+    if (!c.recovered) {
+      if (rule_.action) {
+        // As Holder::parse_core sets them for a rule whose body is no choice
+        vs.sv_ = std::string_view(s, i);
+        vs.name_ = &rule_.name;
+        vs.choice_count_ = 0;
+        vs.choice_ = 0;
+        static const std::any empty_predicate_data;
+        val = rule_.action(vs, dt, empty_predicate_data);
+      } else if (!vs.empty()) {
+        val = std::move(vs[0]);
+        tag = vs.tags[0];
+      }
     }
     vs.clear();
+    vs.tags.clear();
     vs.emplace_back(std::move(val));
+    vs.tags.emplace_back(tag);
+    used = true;
+
+    // Like a repetition (see Repetition::parse_core), a round that consumes
+    // nothing ends the loop.
+    if (operand_missing || (op_len == 0 && rhs_len == 0)) { break; }
   }
 
   return i;
@@ -4260,111 +5029,66 @@ inline size_t PrecedenceClimbing::parse_expression(const char *s, size_t n,
 inline size_t Recovery::parse_core(const char *s, size_t n,
                                    SemanticValues & /*vs*/, Context &c,
                                    std::any & /*dt*/) const {
-  const auto &rule = dynamic_cast<Reference &>(*ope_);
+  const auto *label = this->label();
+  const auto reports =
+      c.reports_here() && !c.reported_recoveries.count({this, s});
 
   // Custom error message
-  if (c.log || c.error_reporter) {
-    auto label = dynamic_cast<Reference *>(rule.args_[0].get());
-    if (label && !label->rule_->error_message.empty()) {
-      c.error_info.message_pos = s;
-      c.error_info.message =
-          resolve_capture_placeholders(label->rule_->error_message, c);
-      c.error_info.label = label->rule_->name;
-    }
+  if (reports && label && !label->error_message.empty()) {
+    c.error_info.set_message(
+        s, resolve_capture_placeholders(label->error_message, c), label->name);
   }
 
   // Recovery
-  auto len = static_cast<size_t>(-1);
+  auto len = kFail;
   {
-    auto save_log = c.log;
-    auto save_reporter = c.error_reporter;
-    c.log = nullptr;
-    c.error_reporter = nullptr;
-    auto se = scope_exit([&]() {
-      c.log = save_log;
-      c.error_reporter = save_reporter;
-    });
+    auto muted = c.mute_errors();
+    Context::TraceMute mute(c);
 
-    SemanticValues dummy_vs;
     std::any dummy_dt;
-
-    len = rule.parse(s, n, dummy_vs, c, dummy_dt);
+    len = c.parse_thrown_away(
+        [&](SemanticValues &vs) { return ope_->parse(s, n, vs, c, dummy_dt); });
   }
 
-  if (success(len)) {
+  // Where errors are muted, nothing was reported to recover from.
+  if (success(len) && !c.mutes_errors) {
     c.recovered = true;
 
-    if (c.log || c.error_reporter) {
-      c.error_info.output_log(c.log, c.error_reporter, c.s, c.l);
+    if (reports) {
+      c.error_info.output_log(c.log, c.error_reporter, c.s, c.l,
+                              label ? label->name : std::string());
       c.error_info.clear();
+      c.reported_recoveries.emplace(this, s);
     }
   }
 
   // Cut
-  if (!c.cut_stack.empty()) {
-    c.cut_stack.back() = true;
-
-    if (c.cut_stack.size() == 1) {
-      // TODO: Remove unneeded entries in packrat memoise table
-    }
-  }
+  if (!c.cut_stack.empty()) { c.cut_stack.back() = true; }
 
   return len;
 }
 
-inline void Sequence::accept(Visitor &v) { v.visit(*this); }
-inline void PrioritizedChoice::accept(Visitor &v) { v.visit(*this); }
-inline void Repetition::accept(Visitor &v) { v.visit(*this); }
-inline void AndPredicate::accept(Visitor &v) { v.visit(*this); }
-inline void NotPredicate::accept(Visitor &v) { v.visit(*this); }
-inline void Dictionary::accept(Visitor &v) { v.visit(*this); }
-inline void LiteralString::accept(Visitor &v) { v.visit(*this); }
-inline void CharacterClass::accept(Visitor &v) { v.visit(*this); }
-inline void Character::accept(Visitor &v) { v.visit(*this); }
-inline void AnyCharacter::accept(Visitor &v) { v.visit(*this); }
-inline void CaptureScope::accept(Visitor &v) { v.visit(*this); }
-inline void Capture::accept(Visitor &v) { v.visit(*this); }
-inline void TokenBoundary::accept(Visitor &v) { v.visit(*this); }
-inline void Ignore::accept(Visitor &v) { v.visit(*this); }
-inline void User::accept(Visitor &v) { v.visit(*this); }
-inline void WeakHolder::accept(Visitor &v) { v.visit(*this); }
-inline void Holder::accept(Visitor &v) { v.visit(*this); }
-inline void Reference::accept(Visitor &v) { v.visit(*this); }
-inline void Whitespace::accept(Visitor &v) { v.visit(*this); }
-inline void BackReference::accept(Visitor &v) { v.visit(*this); }
-inline void PrecedenceClimbing::accept(Visitor &v) { v.visit(*this); }
-inline void Recovery::accept(Visitor &v) { v.visit(*this); }
-inline void Cut::accept(Visitor &v) { v.visit(*this); }
+#define PEGLIB_ACCEPT(T)                                                       \
+  inline void T::accept(Visitor &v) { v.visit(*this); }
+PEGLIB_OPE_TYPES(PEGLIB_ACCEPT)
+#undef PEGLIB_ACCEPT
+#undef PEGLIB_OPE_TYPES
 
 inline void AssignIDToDefinition::visit(Holder &ope) {
   auto p = static_cast<void *>(ope.outer_);
   if (ids.count(p)) { return; }
-  auto id = ids.size();
-  ids[p] = id;
-  ope.outer_->id = id;
-  ope.outer_->has_macro_ref = false; // set below when the body walk finds one
-  auto save = current_def;
-  current_def = ope.outer_;
+  auto order = ids.size();
+  ids[p] = order;
   ope.ope_->accept(*this);
-  current_def = save;
 }
 
 inline void AssignIDToDefinition::visit(Reference &ope) {
   if (ope.rule_) {
-    if (ope.rule_->is_macro && current_def) {
-      current_def->has_macro_ref = true;
-    }
     for (const auto &arg : ope.args_) {
       arg->accept(*this);
     }
     ope.rule_->accept(*this);
   }
-}
-
-inline void AssignIDToDefinition::visit(PrecedenceClimbing &ope) {
-  has_opaque_ope = true;
-  ope.atom_->accept(*this);
-  ope.binop_->accept(*this);
 }
 
 inline void TokenChecker::visit(Reference &ope) {
@@ -4377,17 +5101,14 @@ inline void TokenChecker::visit(Reference &ope) {
   }
 }
 
-inline void FindLiteralToken::visit(Reference &ope) {
-  if (ope.is_macro_) {
-    ope.rule_->accept(*this);
-    for (const auto &arg : ope.args_) {
-      arg->accept(*this);
-    }
-  }
+// A rule that a combinator embeds, without a Reference. Going into it would
+// never end for a rule that reaches itself at its own start.
+inline void ComputeCanBeEmpty::visit(Holder &ope) {
+  result_ = ope.outer_->can_be_empty;
 }
 
 inline void ComputeCanBeEmpty::visit(Reference &ope) {
-  result = ope.rule_ && ope.rule_->can_be_empty;
+  result_ = ope.rule_ && ope.rule_->can_be_empty;
 }
 
 inline void DetectLeftRecursion::visit(Reference &ope) {
@@ -4397,10 +5118,10 @@ inline void DetectLeftRecursion::visit(Reference &ope) {
                    ? resolve_macro_arg(ope.iarg_)
                    : ResolvedArg{};
 
-  if (ope.name_ == name_) {
+  if (ope.rule_ == rule_) {
     error_s = ope.s_;
   } else if (param.ope) {
-    visit_in_defining_scope(param);
+    visit_argument(param);
     if (done_ == false) { return; }
   } else if (ope.is_macro_ &&
              macro_args_stack_.size() >= max_macro_inst_depth) {
@@ -4420,15 +5141,25 @@ inline void DetectLeftRecursion::visit(Reference &ope) {
     if (param.ope) {
       // ComputeCanBeEmpty never consults the frame stack, so the scope it
       // runs in cannot matter.
-      ComputeCanBeEmpty cbe;
-      param.ope->accept(cbe);
-      done_ = !cbe.result;
+      done_ = !ComputeCanBeEmpty::check(*param.ope);
     } else {
       done_ = true;
     }
   } else {
     done_ = !(ope.rule_ && ope.rule_->can_be_empty);
   }
+}
+
+// A rule that a combinator embeds, as a rule referred to without arguments.
+inline void DetectLeftRecursion::visit(WeakHolder &ope) {
+  auto holder = std::dynamic_pointer_cast<Holder>(ope.weak_.lock());
+  if (!holder) { return; }
+  const auto &rule = *holder->outer_;
+  if (refs_.emplace(&rule, 0).second) {
+    holder->accept(*this);
+    if (done_ == false) { return; }
+  }
+  done_ = !rule.can_be_empty;
 }
 
 inline size_t DetectLeftRecursion::intern_macro_inst(const Reference &ope) {
@@ -4448,6 +5179,30 @@ inline size_t DetectLeftRecursion::intern_macro_inst(const Reference &ope) {
                                                 next_macro_inst_);
   if (inserted) { next_macro_inst_++; }
   return it->second;
+}
+
+// An argument written in a macro body can name the parameters of that macro,
+// and would be walked again for every use of them, at every level. Read again
+// in the same scope, it is not walked again: the first walk's result stands.
+// Walked again, it would stop at the rules the first walk went through, and
+// could take what the first walk found can match empty to consume input. An
+// argument written outside a macro body names no parameter, and walking it
+// again costs less than keeping its result.
+inline void DetectLeftRecursion::visit_argument(const ResolvedArg &arg) {
+  if (arg.depth == 0) {
+    visit_in_defining_scope(arg);
+    return;
+  }
+  std::vector<const void *> key(macro_args_stack_.begin(),
+                                macro_args_stack_.begin() + arg.depth);
+  key.push_back(arg.ope.get());
+  auto [it, first] = args_done_.emplace(std::move(key), false);
+  if (first) {
+    visit_in_defining_scope(arg);
+    it->second = done_;
+  } else {
+    done_ = it->second;
+  }
 }
 
 inline void
@@ -4478,105 +5233,50 @@ DetectLeftRecursion::resolve_macro_arg(size_t iarg) const {
   return {};
 }
 
-inline void HasEmptyElement::visit(Sequence &ope) {
-  auto save_is_empty = false;
-  const char *save_error_s = nullptr;
-  std::string save_error_name;
-
-  auto it = ope.opes_.begin();
-  while (it != ope.opes_.end()) {
-    (*it)->accept(*this);
-    if (!is_empty) {
-      ++it;
-      while (it != ope.opes_.end()) {
-        DetectInfiniteLoop vis(refs_, has_error_cache_);
-        (*it)->accept(vis);
-        if (vis.has_error) {
-          is_empty = true;
-          error_s = vis.error_s;
-          error_name = vis.error_name;
-        }
-        ++it;
-      }
-      return;
-    }
-
-    save_is_empty = is_empty;
-    save_error_s = error_s;
-    save_error_name = error_name;
-
-    is_empty = false;
-    error_name.clear();
-    ++it;
+inline void FindEmptyElement::visit(Reference &ope) {
+  if (!ope.rule_ || std::find(rules_on_way_.begin(), rules_on_way_.end(),
+                              ope.rule_) != rules_on_way_.end()) {
+    return;
   }
-
-  is_empty = save_is_empty;
-  error_s = save_error_s;
-  error_name = save_error_name;
-}
-
-inline void HasEmptyElement::visit(Reference &ope) {
-  auto it = std::find_if(refs_.begin(), refs_.end(),
-                         [&](const std::pair<const char *, std::string> &ref) {
-                           return ope.name_ == ref.second;
-                         });
-  if (it != refs_.end()) { return; }
-
-  if (ope.rule_) {
-    refs_.emplace_back(ope.s_, ope.name_);
-    ope.rule_->accept(*this);
-    refs_.pop_back();
-  }
+  assert(ope.rule_->can_be_empty);
+  rules_on_way_.push_back(ope.rule_);
+  rule_ref = {ope.s_, ope.name_};
+  ope.rule_->accept(*this);
 }
 
 inline void DetectInfiniteLoop::visit(Reference &ope) {
-  auto it = std::find_if(refs_.begin(), refs_.end(),
-                         [&](const std::pair<const char *, std::string> &ref) {
-                           return ope.name_ == ref.second;
-                         });
-  if (it != refs_.end()) { return; }
-
   if (ope.rule_) {
-    auto it = has_error_cache_.find(ope.name_);
-    if (it != has_error_cache_.end()) {
-      has_error = it->second;
-    } else {
-      refs_.emplace_back(ope.s_, ope.name_);
-      ope.rule_->accept(*this);
-      refs_.pop_back();
-      has_error_cache_[ope.name_] = has_error;
-    }
+    auto save = std::exchange(rule_ref_, {ope.s_, ope.name_});
+    ope.rule_->accept(*this);
+    rule_ref_ = std::move(save);
   }
-
-  if (ope.is_macro_) {
-    for (const auto &arg : ope.args_) {
-      arg->accept(*this);
-    }
-  }
+  if (ope.is_macro_) { walk_until_error(ope.args_); }
 }
 
 inline void ReferenceChecker::visit(Reference &ope) {
-  auto it = std::find(params_.begin(), params_.end(), ope.name_);
-  if (it != params_.end()) { return; }
-
-  if (!grammar_.count(ope.name_)) {
-    error_s[ope.name_] = ope.s_;
-    error_message[ope.name_] = "'" + ope.name_ + "' is not defined.";
-  } else {
-    if (!referenced.count(ope.name_)) { referenced.insert(ope.name_); }
-    const auto &rule = grammar_.at(ope.name_);
-    if (rule.is_macro) {
-      if (!ope.is_macro_ || ope.args_.size() != rule.params.size()) {
-        error_s[ope.name_] = ope.s_;
-        error_message[ope.name_] = "incorrect number of arguments.";
-      }
-    } else if (ope.is_macro_) {
+  // A parameter stands for what it was given, which takes no arguments.
+  const Definition *rule = nullptr;
+  if (std::find(params_.begin(), params_.end(), ope.name_) == params_.end()) {
+    if (!grammar_.count(ope.name_)) {
       error_s[ope.name_] = ope.s_;
-      error_message[ope.name_] = "'" + ope.name_ + "' is not macro.";
+      error_message[ope.name_] = "'" + ope.name_ + "' is not defined.";
+      return;
     }
-    for (const auto &arg : ope.args_) {
-      arg->accept(*this);
+    referenced.insert(ope.name_);
+    rule = &grammar_.at(ope.name_);
+  }
+
+  if (rule && rule->is_macro) {
+    if (!ope.is_macro_ || ope.args_.size() != rule->params.size()) {
+      error_s[ope.name_] = ope.s_;
+      error_message[ope.name_] = "incorrect number of arguments.";
     }
+  } else if (ope.is_macro_) {
+    error_s[ope.name_] = ope.s_;
+    error_message[ope.name_] = "'" + ope.name_ + "' is not macro.";
+  }
+  for (const auto &arg : ope.args_) {
+    arg->accept(*this);
   }
 }
 
@@ -4586,6 +5286,7 @@ inline void ComputeFirstSet::visit(Reference &ope) {
     result_.any_char = true;
     return;
   }
+  result_.failures.push_back({nullptr, ope.rule_});
 
   auto it = cache_.find(ope.rule_);
   FirstSet computed;
@@ -4593,37 +5294,59 @@ inline void ComputeFirstSet::visit(Reference &ope) {
   if (it != cache_.end()) {
     rule_fs = &it->second;
   } else {
-    if (!refs_.insert(ope.rule_).second) {
-      cycle_count_++; // cycle / left recursion
-      return;
-    }
+    auto depth = walk_into(*ope.rule_);
+    if (!depth) { return; }
     auto save = std::exchange(result_, FirstSet{});
-    auto saved_cycle_count = cycle_count_;
+    auto outer_least_depth_met =
+        std::exchange(least_depth_met_, std::numeric_limits<size_t>::max());
     ope.rule_->accept(*this);
     computed = std::move(result_);
     result_ = std::move(save);
-    refs_.erase(ope.rule_);
-    if (cycle_count_ == saved_cycle_count) {
-      // Cycle-free: cached value is complete and safe to reuse.
+    refs_.pop_back();
+    if (least_depth_met_ >= *depth) {
       it = cache_.try_emplace(ope.rule_, std::move(computed)).first;
       rule_fs = &it->second;
     } else {
-      // Cycle was hit during this rule's computation — its result may be
-      // missing contributions from rules that were on the call stack.
-      // Use the value here but do not cache it for other call contexts.
       rule_fs = &computed;
     }
+    least_depth_met_ = std::min(outer_least_depth_met, least_depth_met_);
   }
 
   result_.merge(*rule_fs);
-  if (!result_.first_literal) {
-    result_.first_literal = rule_fs->first_literal;
+  if (ope.rule_->no_whitespace && rule_fs->matches_empty_on_other_bytes) {
+    add_whitespace();
   }
-  if (!result_.first_rule) {
-    result_.first_rule = rule_fs->first_rule
-                             ? rule_fs->first_rule
-                             : (ope.rule_->is_token() ? ope.rule_ : nullptr);
+}
+
+// A rule that a combinator embeds is walked into as a rule is, without the
+// cache, and walked into again inside itself it is a cycle, so that what is
+// computed below it is not cached as complete either.
+inline void ComputeFirstSet::visit(WeakHolder &ope) {
+  auto holder = std::dynamic_pointer_cast<Holder>(ope.weak_.lock());
+  if (!holder) { return; }
+  if (!walk_into(*holder->outer_)) { return; }
+  holder->accept(*this);
+  refs_.pop_back();
+}
+
+// A rule met again, when it can match empty, lets what follows it here start
+// a match as well. Its first set is not worked out yet, and one that matches
+// empty on other bytes can match empty (asserted in SetupFirstSets), so
+// can_be_empty takes no less than the first set would.
+inline std::optional<size_t>
+ComputeFirstSet::walk_into(const Definition &rule) {
+  auto it = std::find(refs_.begin(), refs_.end(), &rule);
+  if (it == refs_.end()) {
+    refs_.push_back(&rule);
+    return refs_.size() - 1;
   }
+  least_depth_met_ =
+      std::min(least_depth_met_, static_cast<size_t>(it - refs_.begin()));
+  if (rule.can_be_empty) {
+    result_.matches_empty_on_other_bytes = true;
+    if (rule.no_whitespace) { add_whitespace(); }
+  }
+  return std::nullopt;
 }
 
 inline void SetupFirstSets::visit(Reference &ope) {
@@ -4637,132 +5360,644 @@ inline void SetupFirstSets::visit(Reference &ope) {
 // is O(N^2) for grammars with dense cross-references.
 inline void SetupFirstSets::visit(Holder &ope) {
   if (!visited_rules_.insert(ope.outer_).second) { return; }
+
+  auto &rule = *ope.outer_;
+  ComputeFirstSet cfs(first_set_cache_);
+  ope.ope_->accept(cfs);
+  rule.first_set = std::move(cfs.result_);
+  const auto &fs = rule.first_set;
+  assert(!fs.matches_empty_on_other_bytes || rule.can_be_empty);
+  auto known = !fs.any_char && !fs.matches_empty_on_other_bytes;
+  rule.start_bytes = known ? fs.chars : std::bitset<256>().set();
+
   ope.ope_->accept(*this);
 }
 
-inline void SetupFirstSets::visit(Sequence &ope) {
-  ope.kw_guard_.reset();
-  setup_keyword_guarded_identifier(ope);
-  for (const auto &op : ope.opes_) {
-    op->accept(*this);
+inline void Definition::analyze() const {
+  AssignIDToDefinition vis;
+  holder_->accept(vis);
+  if (whitespaceOpe) { whitespaceOpe->accept(vis); }
+  if (wordOpe) { wordOpe->accept(vis); }
+  analysis_.has_cut = vis.has_cut;
+  analysis_.has_user = vis.has_user;
+  analysis_.alternative_starts.assign(vis.alternative_starts.begin(),
+                                      vis.alternative_starts.end());
+  analysis_.rules.resize(vis.ids.size());
+  for (const auto &[ptr, order] : vis.ids) {
+    analysis_.rules[order] = static_cast<Definition *>(ptr);
+    analysis_.rules[order]->is_token(); // see Context::push_rule
+  }
+  number_new_rules();
+}
+
+// The rules an operator refers to where it does not mute errors: outside
+// the operand of `!` and the expression of a recovery. A rule in a macro
+// argument counts as referred to there, wherever the macro puts it.
+struct CollectUnmutedRefs : public TraversalVisitor {
+  using TraversalVisitor::visit;
+  std::vector<const Definition *> rules;
+
+  void visit(NotPredicate &) override {}
+  void visit(Recovery &) override {}
+  void visit(Holder &ope) override { rules.push_back(ope.outer_); }
+  void visit(Reference &ope) override {
+    if (ope.rule_) { rules.push_back(ope.rule_); }
+    for (const auto &arg : ope.args_) {
+      arg->accept(*this);
+    }
+  }
+};
+
+inline void
+Definition::decide_parsed_only_where_muted(std::vector<RuleUse> &uses) const {
+  const auto &a = analysis_;
+  std::vector<bool> unmuted(a.rules_by_id.size(), false);
+  std::vector<const Definition *> todo;
+  auto reach_from = [&](Ope &ope) {
+    CollectUnmutedRefs refs;
+    ope.accept(refs);
+    for (const auto *rule : refs.rules) {
+      if (a.indexes(*rule) && !unmuted[rule->id]) {
+        unmuted[rule->id] = true;
+        todo.push_back(rule);
+      }
+    }
+  };
+  reach_from(*holder_);
+  if (whitespaceOpe) { reach_from(*whitespaceOpe); }
+  if (wordOpe) { reach_from(*wordOpe); }
+  // A rule that this start rule does not index is taken to be parsed where
+  // errors are not muted.
+  for (const auto *rule : a.rules) {
+    if (!a.indexes(*rule)) { reach_from(*rule->get_core_operator()); }
+  }
+  while (!todo.empty()) {
+    const auto *rule = todo.back();
+    todo.pop_back();
+    reach_from(*rule->get_core_operator());
+  }
+  for (const auto *rule : a.rules_by_id) {
+    if (rule) { uses[rule->id].parsed_only_where_muted = !unmuted[rule->id]; }
   }
 }
 
-inline void SetupFirstSets::setup_keyword_guarded_identifier(Sequence &seq) {
-  // Detect pattern: NotPredicate(Reference→PrioritizedChoice<literals>)
-  //                 TokenBoundary(Sequence[CharacterClass,
-  //                 Repetition(CharacterClass)])
-  // This is the pattern used by: PlainIdentifier <- !ReservedKeyword
-  // <[a-z_]i[a-z0-9_]i*>
-  if (seq.opes_.size() != 2) { return; }
+// The rules an operator refers to, without walking into them, macros and
+// the rules in their arguments included.
+struct CollectRuleRefs : public TraversalVisitor {
+  using TraversalVisitor::visit;
 
-  // Child 0 must be NotPredicate
-  auto *not_pred = dynamic_cast<NotPredicate *>(seq.opes_[0].get());
-  if (!not_pred) { return; }
-
-  // NotPredicate's child must be Reference to a rule
-  auto *ref = dynamic_cast<Reference *>(not_pred->ope_.get());
-  if (!ref || !ref->rule_) { return; }
-
-  // The referenced rule's inner operator (Holder) must contain
-  // PrioritizedChoice
-  auto *holder = dynamic_cast<Holder *>(ref->get_core_operator().get());
-  if (!holder) { return; }
-  auto *choice = dynamic_cast<PrioritizedChoice *>(holder->ope_.get());
-  if (!choice) { return; }
-
-  // Extract keywords from PrioritizedChoice alternatives
-  std::vector<std::string> exact_keywords;
-  std::vector<std::string> prefix_keywords;
-
-  for (const auto &alt : choice->opes_) {
-    auto *lit = dynamic_cast<LiteralString *>(alt.get());
-    if (lit) {
-      if (!lit->ignore_case_) { return; }
-      exact_keywords.push_back(to_lower(lit->lit_));
-      continue;
+  void visit(AndPredicate &ope) override { thrown_away(*ope.ope_); }
+  void visit(NotPredicate &ope) override { thrown_away(*ope.ope_); }
+  void visit(Ignore &ope) override { thrown_away(*ope.ope_); }
+  void visit(Recovery &ope) override { thrown_away(*ope.ope_); }
+  void visit(Holder &ope) override { add(ope.outer_); }
+  void visit(Reference &ope) override {
+    if (ope.rule_) {
+      add(ope.rule_);
+      if (ope.rule_->is_macro) { calls_macro = true; }
     }
-    // Check for compound keyword (Sequence of LiteralStrings)
-    auto *sub_seq = dynamic_cast<Sequence *>(alt.get());
-    if (sub_seq && !sub_seq->opes_.empty()) {
-      auto *first_lit = dynamic_cast<LiteralString *>(sub_seq->opes_[0].get());
-      if (first_lit) {
-        auto all_ignore_case_lits =
-            std::all_of(sub_seq->opes_.begin(), sub_seq->opes_.end(),
-                        [](const auto &child) {
-                          auto *l = dynamic_cast<LiteralString *>(child.get());
-                          return l && l->ignore_case_;
-                        });
-        if (all_ignore_case_lits) {
-          prefix_keywords.push_back(to_lower(first_lit->lit_));
-          continue;
-        }
+    for (const auto &arg : ope.args_) {
+      read(*arg);
+    }
+  }
+  void visit(PrecedenceClimbing &ope) override {
+    has_precedence = true;
+    ope.atom_->accept(*this);
+    read(*ope.binop_);
+  }
+
+  // Every rule, those in a lookahead or an ignored operator too.
+  std::vector<Definition *> rules;
+  // Of those, the rules whose values land in the scope the operator is
+  // parsed into: not those whose match is thrown away.
+  std::vector<Definition *> value_rules;
+  // The rules whose values are read whatever that scope is to its reader:
+  // those in a macro argument, which land where the macro puts them, and a
+  // precedence's operator, whose action runs as it hands over its token.
+  std::vector<Definition *> read_rules;
+  bool has_precedence = false; // which reads the scope it folds
+  // A macro's body parses in the scope too, putting there the values of
+  // rules not listed above.
+  bool calls_macro = false;
+
+private:
+  void add(Definition *rule) {
+    rules.push_back(rule);
+    if (!thrown_away_) { value_rules.push_back(rule); }
+    if (reading_) { read_rules.push_back(rule); }
+  }
+  void read(Ope &ope) {
+    reading_++;
+    ope.accept(*this);
+    reading_--;
+  }
+  void thrown_away(Ope &ope) {
+    thrown_away_++;
+    ope.accept(*this);
+    thrown_away_--;
+  }
+  size_t reading_ = 0;
+  size_t thrown_away_ = 0;
+};
+
+// The rules a rule's body enters when the rule is entered on a byte its first
+// set excludes. Nothing consumes that byte, so only what the body starts with
+// runs: an alternative that cannot start with the byte is skipped, a
+// lookahead's operand fails at its own start, and a macro's body runs up to
+// its first parameter. Whitespace skipped after an empty match, a cut, a
+// recovery, a back reference, a User operator or a macro parameter there
+// would make the first set any byte (ComputeFirstSet), so none of them runs.
+// The walk goes on past what can match empty, also past a lookahead that
+// fails there, so it can collect rules that do not run, which only keeps a
+// rule from being skipped.
+struct CollectStartRegion : public TraversalVisitor {
+  using TraversalVisitor::visit;
+
+  std::vector<Definition *> entered;
+  // A rule a combinator embeds, whose nullability is not worked out.
+  bool unknown = false;
+
+  void visit(Sequence &ope) override {
+    for (const auto &op : ope.opes_) {
+      op->accept(*this);
+      if (!ComputeCanBeEmpty::check(*op)) { break; }
+    }
+  }
+  void visit(PrioritizedChoice &ope) override {
+    for (size_t i = 0; i < ope.opes_.size(); i++) {
+      if (i < ope.first_sets().size()) {
+        const auto &fs = ope.first_sets()[i];
+        if (!fs.any_char && !fs.matches_empty_on_other_bytes) { continue; }
+      }
+      ope.opes_[i]->accept(*this);
+    }
+  }
+  void visit(Holder &) override { unknown = true; }
+  // A macro too: its body starts where it is called, and a parameter there
+  // would make the first set any byte.
+  void visit(Reference &ope) override {
+    if (ope.rule_) { entered.push_back(ope.rule_); }
+  }
+};
+
+// What goes unnoticed in a match of a rule depends on the callbacks of the
+// rule and of the rules below it, which can be set between parses. So it is
+// decided again when one of them has changed. A parse keeps the outcome it
+// started with.
+inline std::shared_ptr<const RuleUses>
+Definition::rule_uses(bool builds_everything) const {
+  std::lock_guard lock(rule_uses_mutex_);
+  if (update_rule_use_inputs(builds_everything) || !rule_uses_) {
+    RuleUses uses;
+    uses.by_id = builds_everything
+                     ? std::vector<RuleUse>(analysis_.rules_by_id.size())
+                     : analyze_rule_uses();
+    decide_must_be_tried(uses);
+    decide_parsed_only_where_muted(uses.by_id);
+    rule_uses_ = std::make_shared<const RuleUses>(std::move(uses));
+  }
+  return rule_uses_;
+}
+
+inline bool Definition::update_rule_use_inputs(bool builds_everything) const {
+  auto changed = false;
+  auto update = [&](auto &was, const auto &is) {
+    if (!(was == is)) {
+      was = is;
+      changed = true;
+    }
+  };
+
+  auto &inputs = rule_use_inputs_;
+  update(inputs.builds_everything, builds_everything);
+  update(inputs.packrat, enablePackratParsing);
+  inputs.rules.resize(analysis_.rules.size());
+  for (size_t i = 0; i < analysis_.rules.size(); i++) {
+    const auto &rule = *analysis_.rules[i];
+    auto callbacks = static_cast<uint8_t>(
+        (rule.enter ? 1 : 0) | (rule.leave ? 2 : 0) | (rule.predicate ? 4 : 0) |
+        (rule.action ? 8 : 0) | (rule.disable_action ? 16 : 0) |
+        (rule.error_message.empty() ? 0 : 32) |
+        (rule.ignoreSemanticValue ? 64 : 0));
+    update(inputs.rules[i], std::pair(rule.action.ast_node_type(), callbacks));
+  }
+  return changed;
+}
+
+// With packrat, the rules to memoize have been selected.
+inline std::vector<RuleUse> Definition::analyze_rule_uses() const {
+  const auto &a = analysis_;
+  auto count = a.rules_by_id.size();
+
+  // A rule that this start rule does not index gets no entry.
+  std::vector<RuleUse> uses(count);
+  std::vector<CollectRuleRefs> refs(count);
+  for (auto *rule : a.rules_by_id) {
+    if (rule) { rule->get_core_operator()->accept(refs[rule->id]); }
+  }
+
+  // What the whitespace matches lands in the scope of the rule being parsed,
+  // unless it is ignored, as wsp() makes it.
+  CollectRuleRefs whitespace;
+  if (whitespaceOpe) { whitespaceOpe->accept(whitespace); }
+  for (auto &r : refs) {
+    r.value_rules.insert(r.value_rules.end(), whitespace.value_rules.begin(),
+                         whitespace.value_rules.end());
+  }
+
+  decide_value_use(refs, whitespace, uses);
+  decide_skippable(uses);
+  return uses;
+}
+
+// A rule that this start rule does not index is taken to be observed and to
+// have a value.
+inline void
+Definition::decide_value_use(const std::vector<CollectRuleRefs> &refs,
+                             const CollectRuleRefs &whitespace,
+                             std::vector<RuleUse> &uses) const {
+  const auto &a = analysis_;
+  auto count = a.rules_by_id.size();
+  std::vector<bool> observed(count, true), value_always_empty(count, false);
+
+  for (auto *rule : a.rules_by_id) {
+    if (!rule) { continue; }
+    auto id = rule->id;
+    const auto &rules = refs[id].value_rules;
+
+    auto has_action = rule->action && !rule->disable_action;
+    auto node_type = rule->action.ast_node_type();
+    auto token_node = node_type && rule->is_token();
+
+    // Not running an AST action goes unnoticed, unless it would have thrown
+    // on a value that is not a node.
+    auto values_are_nodes =
+        token_node || (node_type && !refs[id].calls_macro &&
+                       std::all_of(rules.begin(), rules.end(), [&](auto *r) {
+                         return r->action.ast_node_type() == node_type;
+                       }));
+
+    observed[id] = rule->enter || rule->leave || rule->predicate ||
+                   !rule->error_message.empty() || rule->is_left_recursive ||
+                   refs[id].has_precedence || (has_action && !values_are_nodes);
+
+    // A `leave` handler can put a value in place of the rule's.
+    value_always_empty[id] =
+        !rule->action && !rule->leave && !refs[id].has_precedence;
+
+    if (rule->predicate || refs[id].has_precedence ||
+        (has_action && !token_node) || (!has_action && rule->leave)) {
+      uses[id].child_values = RuleUse::ChildValues::read;
+    } else if (has_action) {
+      uses[id].child_values = RuleUse::ChildValues::unread;
+    } else {
+      uses[id].child_values = RuleUse::ChildValues::passed_up;
+    }
+  }
+
+  // A rule that may take a value from below may have one.
+  for (auto again = true; again;) {
+    again = false;
+    for (auto *rule : a.rules_by_id) {
+      if (!rule || !value_always_empty[rule->id]) { continue; }
+      const auto &rules = refs[rule->id].value_rules;
+      if (!std::all_of(rules.begin(), rules.end(), [&](auto *r) {
+            return a.indexes(*r) && value_always_empty[r->id];
+          })) {
+        value_always_empty[rule->id] = false;
+        again = true;
       }
     }
-    // Unrecognized alternative — bail out
+  }
+
+  // Whether a match of the rule may be delivered to a scope that holds rule
+  // values. It starts from the rules whose scope is not followed: the parse
+  // result, whatever a whitespace operator, a macro or a rule that this
+  // start rule does not index refers to, the rules in macro arguments and a
+  // precedence's operator.
+  std::vector<bool> value_read(count, false);
+  auto mark_read = [&](const Definition *rule) {
+    if (!a.indexes(*rule) || value_read[rule->id]) { return false; }
+    value_read[rule->id] = true;
+    return true;
+  };
+  auto mark_all_read = [&](const std::vector<Definition *> &rules) {
+    for (const auto *r : rules) {
+      mark_read(r);
+    }
+  };
+  mark_read(this);
+  mark_all_read(whitespace.value_rules);
+  mark_all_read(whitespace.read_rules);
+  for (auto *rule : a.rules) {
+    if (!a.indexes(*rule)) {
+      CollectRuleRefs vis;
+      rule->get_core_operator()->accept(vis);
+      mark_all_read(vis.value_rules);
+      mark_all_read(vis.read_rules);
+      continue;
+    }
+    mark_all_read(refs[rule->id].read_rules);
+    if (rule->is_macro) { mark_all_read(refs[rule->id].value_rules); }
+  }
+  for (auto again = true; again;) {
+    again = false;
+    for (auto *rule : a.rules_by_id) {
+      if (!rule) { continue; }
+      auto id = rule->id;
+      auto holds_rule_values = false;
+      switch (uses[id].child_values) {
+      case RuleUse::ChildValues::read:
+        holds_rule_values = value_read[id] || observed[id];
+        break;
+      case RuleUse::ChildValues::unread: break;
+      case RuleUse::ChildValues::passed_up:
+        holds_rule_values = value_read[id] && !rule->ignoreSemanticValue;
+        break;
+      }
+      if (!holds_rule_values) { continue; }
+      // The value of a `~` rule is not delivered.
+      for (const auto *r : refs[id].value_rules) {
+        if (!r->ignoreSemanticValue && mark_read(r)) { again = true; }
+      }
+    }
+  }
+
+  for (auto *rule : a.rules_by_id) {
+    if (!rule) { continue; }
+    auto id = rule->id;
+    auto &use = uses[id];
+
+    // A memoized match is handed to every caller at its position, so whether
+    // its value is read cannot depend on the one that makes it. Neither can
+    // it for a `~` rule, whose value no caller gets.
+    auto has_memo = rule->is_left_recursive ||
+                    (enablePackratParsing && a.packrat_index[id] >= 0);
+    auto read_nowhere =
+        rule->ignoreSemanticValue || (has_memo && !value_read[id]);
+    auto read_everywhere = has_memo && !read_nowhere;
+
+    use.value_always_empty = value_always_empty[id];
+    if (observed[id] || (read_everywhere && !value_always_empty[id])) {
+      use.recognized = RuleUse::Recognized::never;
+    } else if (value_always_empty[id] || read_nowhere) {
+      use.recognized = RuleUse::Recognized::always;
+    } else {
+      use.recognized = RuleUse::Recognized::where_unread;
+    }
+
+    if (use.child_values == RuleUse::ChildValues::passed_up) {
+      if (read_everywhere) {
+        use.child_values = RuleUse::ChildValues::read;
+      } else if (read_nowhere) {
+        use.child_values = RuleUse::ChildValues::unread;
+      }
+    }
+  }
+}
+
+// A rule that cannot start with the next byte is skipped instead of entered
+// (see Reference::parse_dispatch) only where entering it would run no callback,
+// so that skipping it goes unnoticed. Entered there, the rule fails without
+// consuming anything: its enter and leave run, and so do those of the rules
+// it enters at its start, whose actions and predicates run too if they can
+// match empty (CollectStartRegion). An AST action depends on its values alone
+// and does not count. A rule that this start rule does not index is taken to
+// run callbacks.
+inline void Definition::decide_skippable(std::vector<RuleUse> &uses) const {
+  const auto &a = analysis_;
+  auto count = a.rules_by_id.size();
+  std::vector<bool> on_enter(count), on_match(count);
+  for (auto *rule : a.rules_by_id) {
+    if (!rule) { continue; }
+    auto id = rule->id;
+    on_enter[id] = rule->enter || rule->leave;
+    on_match[id] = rule->predicate || (rule->action && !rule->disable_action &&
+                                       !rule->action.ast_node_type());
+  }
+
+  std::vector<bool> start(count);
+  std::vector<std::vector<Definition *>> entered(count);
+  for (auto *rule : a.rules_by_id) {
+    if (!rule) { continue; }
+    auto id = rule->id;
+    CollectStartRegion region;
+    rule->get_core_operator()->accept(region);
+    start[id] = on_enter[id] || region.unknown ||
+                std::any_of(region.entered.begin(), region.entered.end(),
+                            [&](const auto *r) {
+                              return !a.indexes(*r) ||
+                                     (on_match[r->id] && r->can_be_empty);
+                            });
+    entered[id] = std::move(region.entered);
+  }
+  spread(start, [&](size_t id) -> const auto & { return entered[id]; });
+
+  for (auto *rule : a.rules_by_id) {
+    if (rule) { uses[rule->id].skippable = !start[rule->id]; }
+  }
+}
+
+// What a rule gives can be set between parses, as callbacks can.
+inline void Definition::decide_must_be_tried(RuleUses &uses) const {
+  const auto &a = analysis_;
+  std::vector<bool> must(a.rules_by_id.size());
+  std::vector<std::vector<const Definition *>> at_start(a.rules_by_id.size());
+  for (auto *rule : a.rules_by_id) {
+    if (!rule) { continue; }
+    const auto &fs = rule->first_set;
+    // Where it cannot start, a rule fails, or matches empty and runs its
+    // predicate on the empty match. A macro that is not left-recursive gives
+    // no message (see Holder::parse_core).
+    auto gives_message =
+        !rule->is_macro &&
+        (fs.matches_empty_on_other_bytes ? !!rule->predicate
+                                         : !rule->error_message.empty());
+    must[rule->id] = gives_message || rule->is_left_recursive;
+    for (const auto &f : fs.failures) {
+      if (f.rule) { at_start[rule->id].push_back(f.rule); }
+    }
+  }
+  spread(must, [&](size_t id) -> const auto & { return at_start[id]; });
+
+  uses.some_must_be_tried = any_flagged(must, a.alternative_starts);
+  for (auto *rule : a.rules_by_id) {
+    if (rule) { uses.by_id[rule->id].must_be_tried = must[rule->id]; }
+  }
+}
+
+// Ids are never renumbered: other parses' packrat tables are indexed by them.
+inline void Definition::number_new_rules() const {
+  const auto &rules = analysis_.rules;
+
+  size_t next_id = 0;
+  for (const auto *rule : rules) {
+    if (rule->has_id_) { next_id = std::max(next_id, rule->id + 1); }
+  }
+  for (auto *rule : rules) {
+    if (!rule->has_id_) {
+      rule->id = next_id++;
+      rule->has_id_ = true;
+    }
+  }
+
+  auto &rules_by_id = analysis_.rules_by_id;
+  rules_by_id.assign(next_id, nullptr);
+  for (auto *rule : rules) {
+    if (!rules_by_id[rule->id]) { rules_by_id[rule->id] = rule; }
+  }
+}
+
+template <typename T>
+inline void Context::reuse_or_parse(const char *a_s, const Definition &rule,
+                                    bool rule_has_id, bool needs_token,
+                                    RuleMatch &match, T parse) {
+  auto call = call_of(*rule.holder_, a_s);
+  if (!rule_has_id) {
+    if (enters_again(!in_progress.insert(call).second)) {
+      match.len = kFail;
+      return;
+    }
+    auto se = scope_exit([&]() { in_progress.erase(call); });
+    parse(match);
     return;
   }
 
-  if (exact_keywords.empty()) { return; }
-
-  // Child 1 must be TokenBoundary
-  auto *tb = dynamic_cast<TokenBoundary *>(seq.opes_[1].get());
-  if (!tb) { return; }
-
-  // TokenBoundary content: Sequence[CharacterClass, Repetition(CharacterClass)]
-  // or just CharacterClass (single char identifier)
-  CharacterClass *first_cc = nullptr;
-  CharacterClass *rest_cc = nullptr;
-
-  auto *inner_seq = dynamic_cast<Sequence *>(tb->ope_.get());
-  if (inner_seq && inner_seq->opes_.size() == 2) {
-    first_cc = dynamic_cast<CharacterClass *>(inner_seq->opes_[0].get());
-    auto *rep = dynamic_cast<Repetition *>(inner_seq->opes_[1].get());
-    if (rep) { rest_cc = dynamic_cast<CharacterClass *>(rep->ope_.get()); }
+  auto def_id = rule.id;
+  assert(mutes_errors || !rule_use[def_id].parsed_only_where_muted);
+  auto &active = active_pos[skips_no_whitespace][def_id];
+  if (enters_again(active, a_s)) {
+    match.len = kFail;
+    return;
   }
 
-  if (!first_cc || !rest_cc) { return; }
-  if (!first_cc->is_ascii_only() || !rest_cc->is_ascii_only()) { return; }
-
-  // All conditions met — set up the fast path
-  auto kw = std::make_unique<KeywordGuardData>();
-  kw->identifier_first = first_cc->ascii_bitset();
-  kw->identifier_rest = rest_cc->ascii_bitset();
-
-  // Compute keyword length range for early-out in hot path
-  size_t min_len = SIZE_MAX, max_len = 0;
-  for (const auto &k : exact_keywords) {
-    min_len = std::min(min_len, k.size());
-    max_len = std::max(max_len, k.size());
+  auto slot = needs_token ? -1 : cache_slot(def_id);
+  size_t idx = 0;
+  if (slot >= 0) {
+    idx = cache_index(slot, a_s);
+    if (cache_registered[idx]) {
+      if (packrat_stats && def_id < packrat_stats->size()) {
+        (*packrat_stats)[def_id].hits++;
+      }
+      if (cache_success[idx]) {
+        match.len = cache_len[idx];
+        if (!cache_values.find(idx, match.val)) { match.val.reset(); }
+      } else {
+        match.len = kFail;
+      }
+      if (collects_expected_tokens()) { error_info.replay(call, token_rule()); }
+      return;
+    }
   }
-  for (const auto &k : prefix_keywords) {
-    min_len = std::min(min_len, k.size());
-    max_len = std::max(max_len, k.size());
+  if (enablePackratParsing && packrat_stats && def_id < packrat_stats->size()) {
+    (*packrat_stats)[def_id].misses++;
   }
-  kw->min_keyword_len = min_len;
-  kw->max_keyword_len = max_len;
 
-  kw->exact_keywords = std::move(exact_keywords);
-  kw->prefix_keywords = std::move(prefix_keywords);
-  seq.kw_guard_ = std::move(kw);
+  {
+    auto save = std::exchange(active, a_s);
+    auto se = scope_exit([&]() { active = save; });
+    if (slot >= 0) {
+      parse_memoized(call, [&]() { parse(match); });
+    } else {
+      parse(match);
+    }
+  }
+
+  if (slot < 0 || !makes_packrat_memo(rule_use[def_id])) { return; }
+  if (success(match.len)) {
+    write_packrat_cache(idx, match.len, match.val);
+  } else {
+    cache_registered[idx] = true;
+    cache_success[idx] = false;
+  }
+}
+
+template <typename T>
+inline void Context::reuse_or_grow(const char *a_s, const Holder &rule,
+                                   RuleMatch &match, T parse) {
+  auto call = call_of(rule, a_s);
+
+  if (auto i = growth_of(call); i != no_growth) {
+    match = growing[i].seed;
+    use_seed(i);
+    return;
+  }
+  if (auto it = lr_memo.find(call);
+      it != lr_memo.end() && (it->second.notes_failures || !notes_failures())) {
+    const auto &m = it->second;
+    match = m.match;
+    if (m.built_from != no_growth) { use_seed(m.built_from); }
+    if (collects_expected_tokens()) { error_info.replay(call, token_rule()); }
+    return;
+  }
+
+  assert(growing.empty() || growing.back().call.pos <= a_s);
+  // The seed starts as a failure. Held by index: growing grows in the parse.
+  growing.push_back({call, RuleMatch(), no_growth, {}});
+  auto pop = scope_exit([&]() { growing.pop_back(); });
+  auto i = growing.size() - 1;
+
+  parse_memoized(call, [&]() {
+    parse(match);
+    if (success(match.len)) {
+      growing[i].seed = std::move(match);
+      while (true) {
+        forget_built(i);
+        RuleMatch grown;
+        parse(grown);
+        if (!success(grown.len) || grown.len <= growing[i].seed.len) { break; }
+        growing[i].seed = std::move(grown);
+      }
+      match = growing[i].seed;
+    }
+    forget_built(i);
+  });
+
+  // Confirmed, a failure too, so the rule is not seeded here again
+  auto built_from = growing[i].built_from;
+  lr_memo[call] = {std::move(growing[i].seed), built_from, notes_failures()};
+  if (built_from != no_growth) { growing[built_from].built.push_back(call); }
 }
 
 // Compute which rules benefit from packrat memoization.
 // A rule benefits if it's reachable from 2+ alternatives of the same
-// PrioritizedChoice (backtracking will re-visit it at the same position).
-inline void Definition::initialize_packrat_filter() const {
-  std::call_once(packrat_filter_init_, [&]() {
-    auto def_count = definition_ids_.size();
+// PrioritizedChoice (backtracking will re-visit it at the same position),
+// unless all of them only reach it through one shared rule, which answers
+// from its own memo.
+inline void Definition::select_packrat_rules() const {
+  std::call_once(packrat_rules_init_, [&]() {
+    auto def_count = analysis_.rules_by_id.size();
     if (def_count == 0) { return; }
 
-    // Collect rule IDs that can be invoked at the *same start position* as
-    // the given Ope subtree (leftmost reachability). A packrat cache hit
-    // requires the same rule to be queried twice at the same position, and
-    // in a PEG that only happens when alternatives of a choice share a
-    // leftmost prefix — rules reachable only past a consuming element can
-    // never be re-queried by a sibling alternative.
-    struct CollectLeftmostRules : public TraversalVisitor {
+    // Walks what can be invoked at the *same start position* as the given Ope
+    // subtree (leftmost reachability). A packrat cache hit requires the same
+    // rule to be queried twice at the same position, and in a PEG that only
+    // happens when alternatives of a choice share a leftmost prefix — rules
+    // reachable only past a consuming element can never be re-queried by a
+    // sibling alternative.
+    struct LeftmostWalker : public TraversalVisitor {
       using TraversalVisitor::visit;
+
+      // Walk from the position element `from` starts at: element `from`
+      // itself, plus what follows for as long as elements can match empty —
+      // only up to (and including) the first one that must consume input.
+      void collect(const std::vector<std::shared_ptr<Ope>> &opes, size_t from) {
+        for (auto i = from; i < opes.size(); i++) {
+          opes[i]->accept(*this);
+          if (!ComputeCanBeEmpty::check(*opes[i])) { break; }
+        }
+      }
+
+      void visit(Sequence &ope) override { collect(ope.opes_, 0); }
+      // A recovery's expression runs only after an error, so the tries it
+      // makes are no reason to memoize a rule. FindBacktrackRules skips it
+      // too.
+      void visit(Recovery &) override {}
+    };
+
+    // The rule IDs leftmost-reachable from the given subtree.
+    struct CollectLeftmostRules : public LeftmostWalker {
+      using LeftmostWalker::visit;
       std::vector<bool> reachable; // indexed by def_id
       std::vector<bool>
           visited_rules; // indexed by def_id; guards Holder cycles
@@ -4770,19 +6005,6 @@ inline void Definition::initialize_packrat_filter() const {
       CollectLeftmostRules(size_t n)
           : reachable(n, false), visited_rules(n, false) {}
 
-      // Collect from the position element `from` starts at: element `from`
-      // itself, plus what follows for as long as elements can match empty —
-      // only up to (and including) the first one that must consume input.
-      void collect(const std::vector<std::shared_ptr<Ope>> &opes, size_t from) {
-        for (auto i = from; i < opes.size(); i++) {
-          opes[i]->accept(*this);
-          ComputeCanBeEmpty empty_vis;
-          opes[i]->accept(empty_vis);
-          if (!empty_vis.result) { break; }
-        }
-      }
-
-      void visit(Sequence &ope) override { collect(ope.opes_, 0); }
       void visit(Holder &ope) override {
         auto id = ope.outer_->id;
         if (id < reachable.size()) {
@@ -4804,6 +6026,45 @@ inline void Definition::initialize_packrat_filter() const {
           reachable[ope.rule_->id] = true;
           ope.rule_->accept(*this);
         }
+      }
+    };
+
+    // For each leftmost-reachable rule, its gateways: the first shared rule
+    // (one reachable from 2+ alternatives) on each path to it, or the rule
+    // itself when a path reaches it before any shared rule.
+    struct CollectGateways : public LeftmostWalker {
+      using LeftmostWalker::visit;
+      const std::vector<size_t> &share_count;    // indexed by def_id
+      std::vector<std::vector<size_t>> gateways; // indexed by def_id
+      const Definition *gateway = nullptr;       // of the path being walked
+
+      CollectGateways(const std::vector<size_t> &share_count)
+          : share_count(share_count), gateways(share_count.size()) {}
+
+      void visit(Holder &ope) override {
+        auto id = ope.outer_->id;
+        if (id >= gateways.size()) { return; }
+
+        // A rule and the gateway it is reached through are the state of the
+        // walk, so the list doubles as the visited set.
+        auto &list = gateways[id];
+        auto through = gateway ? gateway->id : id;
+        if (std::find(list.begin(), list.end(), through) != list.end()) {
+          return;
+        }
+        list.push_back(through);
+
+        // Only a memoized rule answers for what lies below it, and a macro
+        // is never memoized.
+        auto saved = gateway;
+        if (!gateway && share_count[id] >= 2 && !ope.outer_->is_macro) {
+          gateway = ope.outer_;
+        }
+        ope.ope_->accept(*this);
+        gateway = saved;
+      }
+      void visit(Reference &ope) override {
+        if (ope.rule_) { ope.rule_->accept(*this); }
       }
     };
 
@@ -4839,19 +6100,28 @@ inline void Definition::initialize_packrat_filter() const {
       void mark_aligned(const std::vector<Elements> &group, size_t k) {
         if (group.size() < 2) { return; }
 
-        std::vector<std::vector<bool>> reachable;
-        reachable.reserve(group.size());
+        std::vector<size_t> share_count(def_count, 0);
         for (const auto &seq : group) {
           CollectLeftmostRules clr(def_count);
           clr.collect(seq, k);
-          reachable.push_back(std::move(clr.reachable));
+          for (size_t id = 0; id < def_count; id++) {
+            if (clr.reachable[id]) { share_count[id]++; }
+          }
+        }
+
+        // A shared rule that is only reached through one other shared rule is
+        // not queried again here: by the time a later alternative gets to it,
+        // that gateway has answered from its own memo.
+        CollectGateways vis(share_count);
+        for (const auto &seq : group) {
+          vis.collect(seq, k);
         }
         for (size_t id = 0; id < def_count; id++) {
-          size_t count = 0;
-          for (const auto &alt : reachable) {
-            if (alt[id]) { count++; }
+          const auto &gateways = vis.gateways[id];
+          if (share_count[id] >= 2 &&
+              (gateways.size() != 1 || gateways[0] == id)) {
+            benefits[id] = true;
           }
-          if (count >= 2) { benefits[id] = true; }
         }
 
         // Only alternatives that also agree on element k stay aligned past it.
@@ -4889,30 +6159,115 @@ inline void Definition::initialize_packrat_filter() const {
       void visit(Reference &ope) override {
         if (ope.rule_) { ope.rule_->accept(*this); }
       }
+      void visit(Recovery &) override {} // as LeftmostWalker does
     };
 
+    // Neither the whitespace nor the word check makes a packrat memo
+    // (Context::makes_packrat_memo, Context::detached), so they are not
+    // walked.
     FindBacktrackRules finder(benefits, def_count);
     holder_->accept(finder);
-    if (whitespaceOpe) { whitespaceOpe->accept(finder); }
-    if (wordOpe) { wordOpe->accept(finder); }
 
-    // Left-recursive rules read and write the packrat cache directly during
-    // seed-growing, so they must stay in the cached set. Macros are the
-    // exception: they use lr_memo only, keyed by instantiation.
-    for (const auto &[ptr, id] : definition_ids_) {
-      auto *def = static_cast<Definition *>(ptr);
-      if (def->is_left_recursive && !def->is_macro && id < def_count) {
-        benefits[id] = true;
+    // The cache keeps a match's length and value, not what else its parse
+    // did to the parse around it: the captures it recorded, which a back
+    // reference reads, or a cut, or a recovery, that commits the choice
+    // around the rule. A rule whose match may do either, itself or through
+    // the rules below it, is therefore not memoized. Nor is any rule when the
+    // whitespace skipping may do either, since a literal skips whitespace
+    // after it in whatever rule it is in.
+    struct Effects {
+      bool captures = false;
+      bool cuts = false; // the choice around the match
+    };
+    struct CollectEffects : public TraversalVisitor {
+      using TraversalVisitor::visit;
+      const StartRuleAnalysis &analysis;
+      const std::vector<Effects> &rules; // by id: what is known of them
+      Effects result;
+
+      CollectEffects(const StartRuleAnalysis &analysis,
+                     const std::vector<Effects> &rules)
+          : analysis(analysis), rules(rules) {}
+
+      void visit(Capture &) override { result.captures = true; }
+      void visit(BackReference &) override { result.captures = true; }
+      // A choice keeps the cuts made in it, unless it is a label's, and so
+      // does a predicate (Context::contain_cuts).
+      void visit(PrioritizedChoice &ope) override {
+        if (!ope.for_label_) { cut_keepers_++; }
+        TraversalVisitor::visit(ope);
+        if (!ope.for_label_) { cut_keepers_--; }
+      }
+      void visit(AndPredicate &ope) override { keep_cuts_in(*ope.ope_); }
+      void visit(NotPredicate &ope) override { keep_cuts_in(*ope.ope_); }
+      void visit(Cut &) override { cut(); }
+      void visit(Recovery &ope) override {
+        cut();
+        TraversalVisitor::visit(ope);
+      }
+      void visit(Holder &ope) override { add(*ope.outer_); }
+      void visit(Reference &ope) override {
+        if (ope.rule_) { add(*ope.rule_); }
+        for (const auto &arg : ope.args_) {
+          arg->accept(*this);
+        }
+      }
+
+    private:
+      size_t cut_keepers_ = 0;
+      void keep_cuts_in(Ope &ope) {
+        cut_keepers_++;
+        ope.accept(*this);
+        cut_keepers_--;
+      }
+      void cut() {
+        if (!cut_keepers_) { result.cuts = true; }
+      }
+      // A rule this analysis does not index is taken to do both.
+      void add(const Definition &rule) {
+        auto known = analysis.indexes(rule);
+        if (!known || rules[rule.id].captures) { result.captures = true; }
+        if (!known || rules[rule.id].cuts) { cut(); }
+      }
+    };
+
+    std::vector<Effects> effects(def_count);
+    for (auto changed = true; changed;) {
+      changed = false;
+      for (const auto *rule : analysis_.rules) {
+        if (!analysis_.indexes(*rule)) { continue; }
+        CollectEffects vis(analysis_, effects);
+        rule->get_core_operator()->accept(vis);
+        auto &e = effects[rule->id];
+        if (vis.result.captures > e.captures || vis.result.cuts > e.cuts) {
+          e = vis.result;
+          changed = true;
+        }
+      }
+    }
+    CollectEffects whitespace(analysis_, effects);
+    if (whitespaceOpe) { whitespaceOpe->accept(whitespace); }
+    const auto &ws = whitespace.result;
+    for (size_t id = 0; id < def_count; id++) {
+      const auto &e = effects[id];
+      if (ws.captures || ws.cuts || e.captures || e.cuts) {
+        benefits[id] = false;
       }
     }
 
-    // Compact index: def_id -> slot in the cache tables (-1 = guard only)
-    packrat_index_.assign(def_count, -1);
+    // Compact index: def_id -> slot in the cache tables (-1 = not memoized)
+    analysis_.packrat_index.assign(def_count, -1);
     int32_t k = 0;
     for (size_t id = 0; id < def_count; id++) {
-      if (benefits[id]) { packrat_index_[id] = k++; }
+      if (!benefits[id]) { continue; }
+      // A macro parses in its caller's scope and is never memoized, and a
+      // left-recursive rule keeps its matches in lr_memo.
+      const auto &rule = *analysis_.rules_by_id[id];
+      if (!rule.is_macro && !rule.is_left_recursive) {
+        analysis_.packrat_index[id] = k++;
+      }
     }
-    packrat_cached_count_ = static_cast<size_t>(k);
+    analysis_.packrat_cached_count = static_cast<size_t>(k);
   });
 }
 
@@ -4939,15 +6294,84 @@ inline void LinkReferences::visit(Reference &ope) {
   }
 }
 
-inline void FindReference::visit(Reference &ope) {
-  for (size_t i = 0; i < args_.size(); i++) {
-    const auto &name = params_[i];
-    if (name == ope.name_) {
-      found_ope = args_[i];
-      return;
+inline void ReplaceParameters::visit(Reference &ope) {
+  if (!ope.rule_) {
+    resolved_ = args_[ope.iarg_];
+  } else if (auto args = resolve_all(ope.args_)) {
+    auto call = std::make_shared<Reference>(ope.grammar_, ope.name_, ope.s_,
+                                            ope.is_macro_, std::move(*args));
+    call->rule_ = ope.rule_;
+    resolved_ = std::move(call);
+  }
+}
+
+inline void ReplaceParameters::visit(PrecedenceClimbing &ope) {
+  auto atom = resolve(ope.atom_);
+  auto binop = resolve(ope.binop_);
+  if (atom != ope.atom_ || binop != ope.binop_) {
+    resolved_ = pre(atom, binop, ope.info_, ope.rule_);
+  }
+}
+
+// A parse enters the start rule, %whitespace and %word with nothing to fill
+// a macro's parameters with, and the start rule cannot be ignored. Returns
+// the rule that breaks this and why, if one does.
+inline std::pair<const Definition *, std::string>
+entry_rule_error(const Grammar &g, const Definition &start) {
+  if (start.ignoreSemanticValue) {
+    return {&start,
+            "ignore operator cannot be applied to '" + start.name + "'."};
+  }
+  if (start.is_macro) {
+    return {&start, "the macro '" + start.name + "' cannot be the start rule."};
+  }
+  for (auto name : {WHITESPACE_DEFINITION_NAME, WORD_DEFINITION_NAME}) {
+    if (auto it = g.find(name); it != g.end() && it->second.is_macro) {
+      return {&it->second, "'" + it->first + "' cannot be a macro."};
     }
   }
-  found_ope = ope.shared_from_this();
+  return {};
+}
+
+// Works out which rules can match empty, the rules made with the combinators
+// that the rules embed included. The fixed point starts from none, so that it
+// is the least one, whatever the rules held before.
+inline void work_out_can_be_empty(Grammar &g) {
+  CollectWalkedRules walked;
+  for (auto &[name, rule] : g) {
+    rule.accept(walked);
+  }
+  for (auto *rule : walked.rules) {
+    rule->can_be_empty = false;
+  }
+  for (auto changed = true; changed;) {
+    changed = false;
+    for (auto *rule : walked.rules) {
+      auto can_be_empty = ComputeCanBeEmpty::check(*rule->get_core_operator());
+      if (can_be_empty != rule->can_be_empty) {
+        rule->can_be_empty = can_be_empty;
+        changed = true;
+      }
+    }
+  }
+}
+
+// What a loaded grammar is finished with: the start rule skips the
+// %whitespace and checks the %word the grammar defines, and every rule gets
+// its first sets and fast loops (SetupFirstSets). One visitor walks all
+// rules, so that each rule's first sets are worked out once. Which rules can
+// match empty must be worked out before (work_out_can_be_empty).
+inline void finish_grammar(Grammar &g, Definition &start_rule) {
+  if (auto it = g.find(WHITESPACE_DEFINITION_NAME); it != g.end()) {
+    start_rule.whitespaceOpe = wsp(it->second.get_core_operator());
+  }
+  if (auto it = g.find(WORD_DEFINITION_NAME); it != g.end()) {
+    start_rule.wordOpe = it->second.get_core_operator();
+  }
+  SetupFirstSets vis;
+  for (auto &x : g) {
+    x.second.accept(vis);
+  }
 }
 
 /*-----------------------------------------------------------------------------
@@ -4958,35 +6382,54 @@ inline void FindReference::visit(Reference &ope) {
  *  prebuilt blob. Structure only: semantic callbacks (actions / enter / leave /
  *  predicate, attached by enable_ast() etc.) are NOT serialized and must be
  *  re-applied after deserialize. References resolve by name (no pointer fixup);
- *  first-sets and keyword guards are recomputed on load (O(N)). The
- *  `precedence` instruction is supported (its operator table is structural).
+ *  first-sets (O(N)) and which rules can match empty are recomputed on load.
+ *  The `precedence` instruction is supported (its operator table is
+ *  structural).
  *  Grammars using the `User` operator or a Capture with a match action are
  *  rejected. The blob is specific to this peglib version's layout.
  *---------------------------------------------------------------------------*/
 
 struct GrammarBlob {
+  // The values are what a blob stores, so they only ever grow at the end.
   enum Tag : uint8_t {
-    T_Sequence,
-    T_Choice,
-    T_Repetition,
-    T_And,
-    T_Not,
-    T_Dictionary,
-    T_Literal,
-    T_CharClass,
-    T_Char,
-    T_AnyChar,
-    T_CaptureScope,
-    T_Capture,
-    T_TokenBoundary,
-    T_Ignore,
-    T_BackRef,
-    T_Reference,
-    T_Whitespace,
-    T_Recovery,
-    T_Cut,
-    T_PrecedenceClimbing,
-    T_Null
+    T_Sequence = 0,
+    T_Choice = 1,
+    T_Repetition = 2,
+    T_And = 3,
+    T_Not = 4,
+    T_Dictionary = 5,
+    T_Literal = 6,
+    T_CharClass = 7,
+    T_Char = 8,
+    T_AnyChar = 9,
+    T_CaptureScope = 10,
+    T_Capture = 11,
+    T_TokenBoundary = 12,
+    T_Ignore = 13,
+    T_BackRef = 14,
+    T_Reference = 15,
+    T_Whitespace = 16,
+    T_Recovery = 17,
+    T_Cut = 18,
+    T_PrecedenceClimbing = 19,
+    // 20 marked a missing operator, which no blob may hold any more.
+  };
+
+  // The bits of the two flag bytes a rule is stored with, which only ever
+  // grow: the first byte is full, so a new one goes in the second.
+  enum Flag : uint8_t {
+    F_IgnoreSemanticValue = 1,
+    F_IsMacro = 2,
+    F_NoAstOpt = 4,
+    F_EoiCheck = 8,
+    F_EnablePackratParsing = 16,
+    F_IsLeftRecursive = 32,
+    // Earlier versions read it; this one works it out again.
+    F_CanBeEmpty = 64,
+    F_DisableAction = 128,
+  };
+  enum Flag2 : uint8_t {
+    F2_NoWhitespace = 1,
   };
 
   struct Writer {
@@ -5007,119 +6450,133 @@ struct GrammarBlob {
   };
 
   static void write_ope(Writer &w, const std::shared_ptr<Ope> &o) {
-    if (!o) {
-      w.u8(T_Null);
-      return;
-    }
-    Ope *p = o.get();
-    if (auto x = dynamic_cast<Sequence *>(p)) {
+    assert(o);
+    OpeWriter vis(w);
+    o->accept(vis);
+  }
+
+  struct OpeWriter : StrictVisitor {
+    using StrictVisitor::visit;
+
+    explicit OpeWriter(Writer &w) : w(w) {}
+
+    void visit(Sequence &x) override {
       w.u8(T_Sequence);
-      w.u32((uint32_t)x->opes_.size());
-      for (auto &c : x->opes_)
-        write_ope(w, c);
-    } else if (auto x = dynamic_cast<PrioritizedChoice *>(p)) {
+      list(x.opes_);
+    }
+    void visit(PrioritizedChoice &x) override {
       w.u8(T_Choice);
-      w.u8(x->for_label_ ? 1 : 0);
-      w.u32((uint32_t)x->opes_.size());
-      for (auto &c : x->opes_)
-        write_ope(w, c);
-    } else if (auto x = dynamic_cast<Repetition *>(p)) {
+      w.u8(x.for_label_ ? 1 : 0);
+      list(x.opes_);
+    }
+    void visit(Repetition &x) override {
       w.u8(T_Repetition);
-      w.u64(x->min_);
-      w.u64(x->max_);
-      write_ope(w, x->ope_);
-    } else if (auto x = dynamic_cast<AndPredicate *>(p)) {
-      w.u8(T_And);
-      write_ope(w, x->ope_);
-    } else if (auto x = dynamic_cast<NotPredicate *>(p)) {
-      w.u8(T_Not);
-      write_ope(w, x->ope_);
-    } else if (auto x = dynamic_cast<Dictionary *>(p)) {
+      w.u64(x.min_);
+      w.u64(x.max_);
+      write_ope(w, x.ope_);
+    }
+    void visit(AndPredicate &x) override { unary(T_And, x.ope_); }
+    void visit(NotPredicate &x) override { unary(T_Not, x.ope_); }
+    void visit(Dictionary &x) override {
       w.u8(T_Dictionary);
-      w.u8(x->trie_.ignore_case_ ? 1 : 0);
+      w.u8(x.trie_.ignore_case_ ? 1 : 0);
       // Recover words in their original choice-index order. The Trie stores
       // each full word's id (its index in the constructor vector), which
       // parse_core reports as vs.choice(). Iterating dic_ directly yields
       // sorted key order and would renumber the choices, so place each word at
-      // its id.
-      std::vector<std::string> words(x->trie_.items_count());
-      for (auto &kv : x->trie_.dic_)
+      // its id. A word listed twice leaves an empty word, which matches
+      // nothing, at its later ids.
+      std::vector<std::string> words(x.trie_.items_count());
+      for (auto &kv : x.trie_.dic_)
         if (kv.second.match && kv.second.id < words.size())
           words[kv.second.id] = kv.first;
       w.u32((uint32_t)words.size());
       for (auto &s : words)
         w.str(s);
-    } else if (auto x = dynamic_cast<LiteralString *>(p)) {
+    }
+    void visit(LiteralString &x) override {
       w.u8(T_Literal);
-      w.u8(x->ignore_case_ ? 1 : 0);
-      w.str(x->lit_);
-    } else if (auto x = dynamic_cast<CharacterClass *>(p)) {
+      w.u8(x.ignore_case_ ? 1 : 0);
+      w.str(x.lit_);
+    }
+    void visit(CharacterClass &x) override {
       w.u8(T_CharClass);
-      w.u8(x->negated_ ? 1 : 0);
-      w.u8(x->ignore_case_ ? 1 : 0);
-      w.u32((uint32_t)x->ranges_.size());
-      for (auto &r : x->ranges_) {
+      w.u8(x.negated_ ? 1 : 0);
+      w.u8(x.ignore_case_ ? 1 : 0);
+      w.u32((uint32_t)x.ranges_.size());
+      for (auto &r : x.ranges_) {
         w.u32((uint32_t)r.first);
         w.u32((uint32_t)r.second);
       }
-    } else if (auto x = dynamic_cast<Character *>(p)) {
+    }
+    void visit(Character &x) override {
       w.u8(T_Char);
-      w.u32((uint32_t)x->ch_);
-    } else if (dynamic_cast<AnyCharacter *>(p)) {
-      w.u8(T_AnyChar);
-    } else if (auto x = dynamic_cast<CaptureScope *>(p)) {
-      w.u8(T_CaptureScope);
-      write_ope(w, x->ope_);
-    } else if (auto x = dynamic_cast<Capture *>(p)) {
-      if (x->match_action_) {
+      w.u32((uint32_t)x.ch_);
+    }
+    void visit(AnyCharacter &) override { w.u8(T_AnyChar); }
+    void visit(CaptureScope &x) override { unary(T_CaptureScope, x.ope_); }
+    void visit(Capture &x) override {
+      if (x.match_action_) {
         throw std::runtime_error(
             "GrammarBlob: Capture with a match action is not serializable");
       }
-      w.u8(T_Capture);
-      write_ope(w, x->ope_);
-    } else if (auto x = dynamic_cast<TokenBoundary *>(p)) {
-      w.u8(T_TokenBoundary);
-      write_ope(w, x->ope_);
-    } else if (auto x = dynamic_cast<Ignore *>(p)) {
-      w.u8(T_Ignore);
-      write_ope(w, x->ope_);
-    } else if (auto x = dynamic_cast<BackReference *>(p)) {
+      unary(T_Capture, x.ope_);
+    }
+    void visit(TokenBoundary &x) override { unary(T_TokenBoundary, x.ope_); }
+    void visit(Ignore &x) override { unary(T_Ignore, x.ope_); }
+    void visit(BackReference &x) override {
       w.u8(T_BackRef);
-      w.str(x->name_);
-    } else if (auto x = dynamic_cast<Reference *>(p)) {
+      w.str(x.name_);
+    }
+    void visit(Reference &x) override {
       w.u8(T_Reference);
-      w.u8(x->is_macro_ ? 1 : 0);
-      w.str(x->name_);
-      w.u32((uint32_t)x->args_.size());
-      for (auto &a : x->args_)
-        write_ope(w, a);
-    } else if (auto x = dynamic_cast<Whitespace *>(p)) {
-      w.u8(T_Whitespace);
-      write_ope(w, x->ope_);
-    } else if (auto x = dynamic_cast<Recovery *>(p)) {
-      w.u8(T_Recovery);
-      write_ope(w, x->ope_);
-    } else if (dynamic_cast<Cut *>(p)) {
-      w.u8(T_Cut);
-    } else if (auto x = dynamic_cast<PrecedenceClimbing *>(p)) {
+      w.u8(x.is_macro_ ? 1 : 0);
+      w.str(x.name_);
+      list(x.args_);
+    }
+    void visit(Whitespace &x) override { unary(T_Whitespace, x.ope_); }
+    void visit(Recovery &x) override { unary(T_Recovery, x.ope_); }
+    void visit(Cut &) override { w.u8(T_Cut); }
+    void visit(PrecedenceClimbing &x) override {
       w.u8(T_PrecedenceClimbing);
-      write_ope(w, x->atom_);
-      write_ope(w, x->binop_);
-      w.u32((uint32_t)x->info_.size());
-      for (auto &[key, pri] : x->info_) {
-        w.str(std::string(key));
+      write_ope(w, x.atom_);
+      write_ope(w, x.binop_);
+      w.u32((uint32_t)x.info_.size());
+      for (auto &[key, pri] : x.info_) {
+        w.str(key);
         w.u64((uint64_t)pri.first);
         w.u8((uint8_t)pri.second);
       }
-    } else {
+    }
+
+    // A rule is written by name, so it never gets here; a User operator holds
+    // code.
+    void visit(Holder &) override { not_serializable(); }
+    void visit(WeakHolder &) override { not_serializable(); }
+    void visit(User &) override { not_serializable(); }
+
+  private:
+    void unary(Tag tag, const std::shared_ptr<Ope> &ope) {
+      w.u8(tag);
+      write_ope(w, ope);
+    }
+    void list(const std::vector<std::shared_ptr<Ope>> &opes) {
+      w.u32((uint32_t)opes.size());
+      for (auto &o : opes)
+        write_ope(w, o);
+    }
+    [[noreturn]] static void not_serializable() {
       throw std::runtime_error(
           "GrammarBlob: operator not serializable (a custom User operator or "
           "a Capture with a match action)");
     }
-  }
+
+    Writer &w;
+  };
 
   struct Reader {
     const uint8_t *p, *end;
+    size_t depth = 0; // how deeply read_ope has nested
     uint8_t u8() {
       if (p >= end)
         throw std::runtime_error("GrammarBlob: unexpected end of blob");
@@ -5139,16 +6596,27 @@ struct GrammarBlob {
     }
     std::string str() {
       uint32_t n = u32();
+      if (n > static_cast<size_t>(end - p))
+        throw std::runtime_error("GrammarBlob: unexpected end of blob");
       std::string s((const char *)p, (const char *)p + n);
       p += n;
       return s;
     }
   };
 
+  // Deeper than a grammar loaded from text can nest its operators (about a
+  // thousand levels), and shallow enough that a corrupt blob cannot exhaust
+  // the stack.
+  static constexpr size_t MAX_OPE_DEPTH = 2048;
+
   static std::shared_ptr<Ope> read_ope(Reader &r, Grammar &g,
                                        Definition *owner) {
+    if (r.depth == MAX_OPE_DEPTH)
+      throw std::runtime_error("GrammarBlob: operators nest too deeply");
+    r.depth++;
+    auto se = scope_exit([&]() { r.depth--; });
+
     switch (r.u8()) {
-    case T_Null: return nullptr;
     case T_Sequence: {
       uint32_t n = r.u32();
       std::vector<std::shared_ptr<Ope>> v;
@@ -5162,9 +6630,7 @@ struct GrammarBlob {
       std::vector<std::shared_ptr<Ope>> v;
       for (uint32_t i = 0; i < n; i++)
         v.push_back(read_ope(r, g, owner));
-      auto c = std::make_shared<PrioritizedChoice>(std::move(v));
-      c->for_label_ = fl;
-      return c;
+      return std::make_shared<PrioritizedChoice>(std::move(v), fl);
     }
     case T_Repetition: {
       uint64_t mn = r.u64(), mx = r.u64();
@@ -5189,6 +6655,8 @@ struct GrammarBlob {
     case T_CharClass: {
       bool neg = r.u8(), ic = r.u8();
       uint32_t n = r.u32();
+      if (n == 0)
+        throw std::runtime_error("GrammarBlob: a character class has no range");
       std::vector<std::pair<char32_t, char32_t>> ranges;
       for (uint32_t i = 0; i < n; i++) {
         auto lo = r.u32(), hi = r.u32();
@@ -5231,16 +6699,11 @@ struct GrammarBlob {
       uint32_t n = r.u32();
       auto pc = std::make_shared<PrecedenceClimbing>(
           atom, binop, PrecedenceClimbing::BinOpeInfo{}, *owner);
-      // info_ keys are string_views; back them with owned strings whose
-      // addresses stay stable (reserve avoids reallocation, and the node is
-      // never moved once held by shared_ptr).
-      pc->info_keys_.reserve(n);
       for (uint32_t i = 0; i < n; i++) {
         std::string key = r.str();
         auto level = (size_t)r.u64();
         auto assoc = (char)r.u8();
-        pc->info_keys_.push_back(std::move(key));
-        pc->info_[pc->info_keys_.back()] = std::pair(level, assoc);
+        pc->info_[std::move(key)] = std::pair(level, assoc);
       }
       return pc;
     }
@@ -5248,45 +6711,48 @@ struct GrammarBlob {
     }
   }
 
-  static const uint32_t MAGIC = 0x50454732; // "PEG2"
+  static const uint32_t MAGIC = 0x50454734; // "PEG4"
 
   static std::vector<uint8_t> serialize(const Grammar &g,
                                         const std::string &start) {
     Writer w;
     w.u32(MAGIC);
     w.str(start);
-    w.u32((uint32_t)g.size());
     // Grammar is an unordered_map, whose iteration order is implementation
     // defined: walking it directly yields different bytes for the same grammar
     // on different standard libraries, so a blob generated on one platform
     // cannot be byte-compared on another. Emit the definitions by name.
     // deserialize() rebuilds the map from the names, so the order carries no
     // meaning of its own.
+    // A rule without a body is one that operator[] made for a name the
+    // grammar does not define.
     std::vector<const Grammar::value_type *> defs;
     defs.reserve(g.size());
     for (auto &kv : g)
-      defs.push_back(&kv);
+      if (kv.second.get_core_operator()) defs.push_back(&kv);
     std::sort(defs.begin(), defs.end(),
               [](const auto *a, const auto *b) { return a->first < b->first; });
+    w.u32((uint32_t)defs.size());
     for (auto *kv : defs) {
       const auto &name = kv->first;
       const auto &def = kv->second;
       w.str(name);
-      uint8_t flags =
-          (def.ignoreSemanticValue ? 1 : 0) | (def.is_macro ? 2 : 0) |
-          (def.no_ast_opt ? 4 : 0) | (def.eoi_check ? 8 : 0) |
-          (def.enablePackratParsing ? 16 : 0) |
-          (def.is_left_recursive ? 32 : 0) | (def.can_be_empty ? 64 : 0) |
-          (def.disable_action ? 128 : 0);
+      uint8_t flags = (def.ignoreSemanticValue ? F_IgnoreSemanticValue : 0) |
+                      (def.is_macro ? F_IsMacro : 0) |
+                      (def.no_ast_opt ? F_NoAstOpt : 0) |
+                      (def.eoi_check ? F_EoiCheck : 0) |
+                      (def.enablePackratParsing ? F_EnablePackratParsing : 0) |
+                      (def.is_left_recursive ? F_IsLeftRecursive : 0) |
+                      (def.can_be_empty ? F_CanBeEmpty : 0) |
+                      (def.disable_action ? F_DisableAction : 0);
       w.u8(flags);
-      uint8_t flags2 = (def.no_whitespace ? 1 : 0);
-      w.u8(flags2);
+      w.u8(def.no_whitespace ? F2_NoWhitespace : 0);
       w.u32((uint32_t)def.params.size());
       for (auto &s : def.params)
         w.str(s);
       w.str(def.ast_name);
       w.str(def.error_message);
-      write_ope(w, const_cast<Definition &>(def).get_core_operator());
+      write_ope(w, def.get_core_operator());
     }
     return std::move(w.b);
   }
@@ -5296,7 +6762,9 @@ struct GrammarBlob {
     Reader r{blob.data(), blob.data() + blob.size()};
     if (r.u32() != MAGIC)
       throw std::runtime_error("GrammarBlob: bad magic / not a grammar blob");
-    start_out = r.str();
+    // start_out is written only once the blob has been read in full, so a bad
+    // blob leaves it as it was.
+    auto start = r.str();
     uint32_t ndef = r.u32();
     auto g = std::make_shared<Grammar>();
     // Create each Definition before reading its body: a PrecedenceClimbing node
@@ -5313,17 +6781,19 @@ struct GrammarBlob {
       std::string ast_name = r.str();
       std::string err = r.str();
 
+      if (np && !(flags & F_IsMacro))
+        throw std::runtime_error("GrammarBlob: rule '" + name +
+                                 "' has parameters but is no macro");
       auto &def = (*g)[name];
       def.name = name;
-      def.ignoreSemanticValue = flags & 1;
-      def.is_macro = flags & 2;
-      def.no_ast_opt = flags & 4;
-      def.eoi_check = flags & 8;
-      def.enablePackratParsing = flags & 16;
-      def.is_left_recursive = flags & 32;
-      def.can_be_empty = flags & 64;
-      def.disable_action = flags & 128;
-      def.no_whitespace = flags2 & 1;
+      def.ignoreSemanticValue = flags & F_IgnoreSemanticValue;
+      def.is_macro = flags & F_IsMacro;
+      def.no_ast_opt = flags & F_NoAstOpt;
+      def.eoi_check = flags & F_EoiCheck;
+      def.enablePackratParsing = flags & F_EnablePackratParsing;
+      def.is_left_recursive = flags & F_IsLeftRecursive;
+      def.disable_action = flags & F_DisableAction;
+      def.no_whitespace = flags2 & F2_NoWhitespace;
       def.params = std::move(params);
       def.ast_name = std::move(ast_name);
       def.error_message = std::move(err);
@@ -5331,34 +6801,30 @@ struct GrammarBlob {
       auto body = read_ope(r, *g, &def);
       def <= body;
     }
+    if (r.p != r.end)
+      throw std::runtime_error("GrammarBlob: trailing bytes after the grammar");
+    if (!g->count(start))
+      throw std::runtime_error("GrammarBlob: start rule '" + start +
+                               "' is not defined");
+    if (auto [rule, msg] = entry_rule_error(*g, (*g)[start]); rule)
+      throw std::runtime_error("GrammarBlob: " + msg);
     for (auto &x : *g) {
+      // A reference to a rule the blob does not define, or with the wrong
+      // arguments, would be followed when the grammar is analyzed.
+      ReferenceChecker check(*g, x.second.params);
+      x.second.accept(check);
+      if (!check.error_message.empty()) {
+        throw std::runtime_error("GrammarBlob: rule '" + x.first +
+                                 "': " + check.error_message.begin()->second);
+      }
+
       LinkReferences vis(*g, x.second.params);
       x.second.accept(vis);
-      // TraversalVisitor descends only into a PrecedenceClimbing's atom_. In
-      // the from-source path binop_ is linked while the body is still a
-      // Sequence, before precedence lowering; a deserialized node is built
-      // already lowered so its binop_ reference must be linked explicitly here.
-      auto core = x.second.get_core_operator();
-      if (auto pc = std::dynamic_pointer_cast<PrecedenceClimbing>(core)) {
-        pc->binop_->accept(vis);
-      }
     }
-    {
-      SetupFirstSets vis; // shared across rules -> O(N)
-      for (auto &x : *g)
-        x.second.accept(vis);
-    }
-    // Re-derive automatic whitespace/word skipping on the start rule from the
-    // %whitespace / %word definitions, exactly as ParserGenerator does. Sharing
-    // the (already linked and first-set) definition operators avoids leaving
-    // references inside the skipping ope unlinked, and keeps the blob smaller.
-    if (g->count(WHITESPACE_DEFINITION_NAME)) {
-      (*g)[start_out].whitespaceOpe =
-          wsp((*g)[WHITESPACE_DEFINITION_NAME].get_core_operator());
-    }
-    if (g->count(WORD_DEFINITION_NAME)) {
-      (*g)[start_out].wordOpe = (*g)[WORD_DEFINITION_NAME].get_core_operator();
-    }
+    work_out_can_be_empty(*g);
+    // The skipping is not stored: it is made again from the definitions.
+    finish_grammar(*g, (*g)[start]);
+    start_out = std::move(start);
     return g;
   }
 };
@@ -5396,7 +6862,7 @@ public:
 
 #if defined(__cpp_lib_char8_t)
   static bool parse_test(const char *d, const char8_t *s) {
-    return parse_test(d, reinterpret_cast<const char *>(s));
+    return parse_test(d, u8(s));
   }
 #endif
 
@@ -5414,12 +6880,8 @@ private:
     // next byte cannot match. This is safe -- First-Set filtering only skips
     // alternatives that would have failed anyway, so no semantic action that
     // would have committed is skipped (unlike packrat, which is unsound here).
-    {
-      SetupFirstSets vis;
-      for (auto &x : g) {
-        x.second.accept(vis);
-      }
-    }
+    work_out_can_be_empty(g);
+    finish_grammar(g, g["Grammar"]);
   }
 
   struct Instruction {
@@ -5439,6 +6901,7 @@ private:
     std::map<std::string, std::vector<Instruction>> instructions;
 
     std::vector<std::pair<std::string, const char *>> undefined_back_references;
+    std::vector<const char *> recovers_without_one_argument;
     std::vector<std::set<std::string_view>> captures_stack{{}};
 
     std::set<std::string_view> captures_in_current_definition;
@@ -5461,10 +6924,9 @@ private:
   void make_grammar() {
     // Setup PEG syntax parser
     g["Grammar"] <= seq(g["Spacing"], oom(g["Definition"]), g["EndOfFile"]);
-    // Left-factored: parse the rule name (IdentCont) once, then optionally the
-    // macro parameter list. `opt(Parameters)` pushes a value only for a macro
-    // (so the value layout matches the old two-alternative form), and Spacing
-    // (~, no value) consumes the gap before LEFTARROW that Identifier used to.
+    // Left-factored: parse the rule name (IdentCont) once, then the macro
+    // parameter list if any. `opt(Parameters)` pushes a value only for a
+    // macro, and Spacing (~, no value) consumes the gap before LEFTARROW.
     g["Definition"] <= seq(g["Ignore"], g["IdentCont"], opt(g["Parameters"]),
                            g["Spacing"], g["LEFTARROW"], g["Expression"],
                            opt(g["Instruction"]));
@@ -5659,7 +7121,7 @@ private:
   }
 
   void setup_actions() {
-    g["Definition"] = [&](const SemanticValues &vs, std::any &dt) {
+    g["Definition"] = [](const SemanticValues &vs, std::any &dt) {
       auto &data = *std::any_cast<Data *>(dt);
 
       // Macro iff the optional Parameters matched: its value (the parameter
@@ -5726,7 +7188,7 @@ private:
       data.captures_in_current_definition.clear();
     };
 
-    g["Expression"] = [&](const SemanticValues &vs) {
+    g["Expression"] = [](const SemanticValues &vs) {
       if (vs.size() == 1) {
         return std::any_cast<std::shared_ptr<Ope>>(vs[0]);
       } else {
@@ -5740,7 +7202,7 @@ private:
       }
     };
 
-    g["Sequence"] = [&](const SemanticValues &vs) {
+    g["Sequence"] = [](const SemanticValues &vs) {
       if (vs.empty()) {
         return npd(lit(""));
       } else if (vs.size() == 1) {
@@ -5755,7 +7217,7 @@ private:
       }
     };
 
-    g["Prefix"] = [&](const SemanticValues &vs) {
+    g["Prefix"] = [](const SemanticValues &vs) {
       std::shared_ptr<Ope> ope;
       if (vs.size() == 1) {
         ope = std::any_cast<std::shared_ptr<Ope>>(vs[0]);
@@ -5772,7 +7234,7 @@ private:
       return ope;
     };
 
-    g["SuffixWithLabel"] = [&](const SemanticValues &vs, std::any &dt) {
+    g["SuffixWithLabel"] = [](const SemanticValues &vs, std::any &dt) {
       auto ope = std::any_cast<std::shared_ptr<Ope>>(vs[0]);
       if (vs.size() == 1) {
         return ope;
@@ -5781,9 +7243,7 @@ private:
         auto &data = *std::any_cast<Data *>(dt);
         const auto &ident = std::any_cast<std::string>(vs[1]);
         auto label = ref(*data.grammar, ident, vs.sv().data(), false, {});
-        auto recovery = rec(ref(*data.grammar, RECOVER_DEFINITION_NAME,
-                                vs.sv().data(), true, {label}));
-        return cho4label_(ope, recovery);
+        return cho4label_(ope, rec(label));
       }
     };
 
@@ -5793,7 +7253,7 @@ private:
       std::pair<size_t, size_t> range;
     };
 
-    g["Suffix"] = [&](const SemanticValues &vs) {
+    g["Suffix"] = [](const SemanticValues &vs) {
       auto ope = std::any_cast<std::shared_ptr<Ope>>(vs[0]);
       if (vs.size() == 1) {
         return ope;
@@ -5810,7 +7270,7 @@ private:
       }
     };
 
-    g["Loop"] = [&](const SemanticValues &vs) {
+    g["Loop"] = [](const SemanticValues &vs) {
       switch (vs.choice()) {
       case 0: // Option
         return Loop{Loop::Type::opt, std::pair<size_t, size_t>()};
@@ -5824,7 +7284,7 @@ private:
       }
     };
 
-    g["Primary"] = [&](const SemanticValues &vs, std::any &dt) {
+    g["Primary"] = [](const SemanticValues &vs, std::any &dt) {
       auto &data = *std::any_cast<Data *>(dt);
 
       switch (vs.choice()) {
@@ -5839,8 +7299,19 @@ private:
           args = std::any_cast<std::vector<std::shared_ptr<Ope>>>(vs[2]);
         }
 
-        auto ope = ref(*data.grammar, ident, vs.sv().data(), is_macro, args);
-        if (ident == RECOVER_DEFINITION_NAME) { ope = rec(ope); }
+        std::shared_ptr<Ope> ope;
+        if (ident == RECOVER_DEFINITION_NAME) {
+          // Reported once the grammar has parsed, as for a macro, so that a
+          // syntax error in what was meant as its argument comes first.
+          if (args.size() != 1) {
+            data.recovers_without_one_argument.push_back(vs.sv().data());
+            ope = lit("");
+          } else {
+            ope = rec(args[0]);
+          }
+        } else {
+          ope = ref(*data.grammar, ident, vs.sv().data(), is_macro, args);
+        }
 
         if (ignore) {
           return ign(ope);
@@ -5864,8 +7335,11 @@ private:
         data.captures_stack.back().insert(name);
         data.captures_in_current_definition.insert(name);
 
-        return cap(ope, [name](const char *a_s, size_t a_n, Context &c) {
-          c.capture_entries.emplace_back(name, std::string(a_s, a_n));
+        // The name is kept here, since the grammar text may be gone when
+        // the grammar is used, and shared by the copies of this action.
+        return cap(ope, [name = std::make_shared<const std::string>(name)](
+                            const char *a_s, size_t a_n, Context &c) {
+          c.capture_entries.emplace_back(*name, std::string(a_s, a_n));
         });
       }
       default: {
@@ -5904,34 +7378,43 @@ private:
       return resolve_escape_sequence(tok.data(), tok.size());
     };
 
-    // A Range produces either a single range (std::pair) or a range list
-    // (std::vector<std::pair>) for `\d`-style escapes and POSIX classes.
-    auto collect_ranges = [](const SemanticValues &vs) {
+    // A `\d`-style escape or a POSIX class, negated once its class tells
+    // whether it ignores case.
+    struct PredefinedClass {
+      std::vector<std::pair<char32_t, char32_t>> ranges;
+      bool negated;
+    };
+
+    // A Range produces either a single range (std::pair) or a PredefinedClass.
+    auto collect_ranges = [](const SemanticValues &vs, bool ignore_case) {
       std::vector<std::pair<char32_t, char32_t>> ranges;
       for (const auto &v : vs) {
         if (v.type() == typeid(std::pair<char32_t, char32_t>)) {
           ranges.push_back(std::any_cast<std::pair<char32_t, char32_t>>(v));
         } else {
-          const auto &vec =
-              std::any_cast<const std::vector<std::pair<char32_t, char32_t>> &>(
-                  v);
-          ranges.insert(ranges.end(), vec.begin(), vec.end());
+          auto [named, negated] = std::any_cast<PredefinedClass>(v);
+          if (negated) {
+            // Case is ignored before the class is negated.
+            if (ignore_case) { named = add_other_case(named); }
+            named = complement_character_ranges(named);
+          }
+          ranges.insert(ranges.end(), named.begin(), named.end());
         }
       }
       return ranges;
     };
 
     g["Class"] = [collect_ranges](const SemanticValues &vs) {
-      return cls(collect_ranges(vs));
+      return cls(collect_ranges(vs, false));
     };
     g["ClassI"] = [collect_ranges](const SemanticValues &vs) {
-      return cls(collect_ranges(vs), true);
+      return cls(collect_ranges(vs, true), true);
     };
     g["NegatedClass"] = [collect_ranges](const SemanticValues &vs) {
-      return ncls(collect_ranges(vs));
+      return ncls(collect_ranges(vs, false));
     };
     g["NegatedClassI"] = [collect_ranges](const SemanticValues &vs) {
-      return ncls(collect_ranges(vs), true);
+      return ncls(collect_ranges(vs, true), true);
     };
     g["Range"] = [](const SemanticValues &vs) -> std::any {
       switch (vs.choice()) {
@@ -5941,7 +7424,7 @@ private:
         auto cp1 = decode_codepoint(s1.data(), s1.length());
         auto cp2 = decode_codepoint(s2.data(), s2.length());
         if (cp1 > cp2) {
-          throw SyntaxErrorException("characer range is out of order...",
+          throw SyntaxErrorException("character range is out of order...",
                                      vs.line_info());
         }
         return std::pair(cp1, cp2);
@@ -5949,13 +7432,12 @@ private:
       case 1: // ClassEscape
       case 2: // PosixClass
         return vs[0];
-      case 3: {
+      default: { // Char
         auto s = std::any_cast<std::string>(vs[0]);
         auto cp = decode_codepoint(s.data(), s.length());
         return std::pair(cp, cp);
       }
       }
-      return std::pair<char32_t, char32_t>(0, 0);
     };
     g["ClassEscape"] = [](const SemanticValues &vs) {
       auto ch = vs.sv()[1];
@@ -5967,28 +7449,27 @@ private:
       case 'S': name = "space"; break;
       default: name = "word"; break;
       }
-      auto ranges = *predefined_character_class(name);
-      if (ch == 'D' || ch == 'S' || ch == 'W') {
-        ranges = complement_character_ranges(ranges);
-      }
-      return ranges;
+      return PredefinedClass{*predefined_character_class(name),
+                             ch == 'D' || ch == 'S' || ch == 'W'};
     };
     g["PosixClass"] = [](const SemanticValues &vs) {
-      auto sv = vs.sv(); // `[:name:]` or `[:^name:]`
-      auto negated = sv[2] == '^';
-      auto name = sv.substr(negated ? 3 : 2, sv.size() - (negated ? 5 : 4));
+      auto name = vs.sv(); // `[:name:]` or `[:^name:]`
+      name.remove_prefix(2);
+      name.remove_suffix(2);
+      auto negated = name.front() == '^';
+      if (negated) { name.remove_prefix(1); }
       auto ranges = predefined_character_class(name);
       if (!ranges) {
         auto msg = "invalid POSIX character class '" + std::string(name) + "'";
         throw SyntaxErrorException(msg.c_str(), vs.line_info());
       }
-      return negated ? complement_character_ranges(*ranges) : *ranges;
+      return PredefinedClass{*ranges, negated};
     };
     g["Char"] = [](const SemanticValues &vs) {
       return resolve_escape_sequence(vs.sv().data(), vs.sv().length());
     };
 
-    g["RepetitionRange"] = [&](const SemanticValues &vs) {
+    g["RepetitionRange"] = [](const SemanticValues &vs) {
       switch (vs.choice()) {
       case 0: { // Number COMMA Number
         auto min = std::any_cast<size_t>(vs[0]);
@@ -6007,7 +7488,7 @@ private:
                          std::any_cast<size_t>(vs[0]));
       }
     };
-    g["Number"] = [&](const SemanticValues &vs) {
+    g["Number"] = [](const SemanticValues &vs) {
       return vs.token_to_number<size_t>();
     };
 
@@ -6035,7 +7516,7 @@ private:
 
     g["BeginCap"] = [](const SemanticValues &vs) { return vs.token(); };
 
-    g["BackRef"] = [&](const SemanticValues &vs, std::any &dt) {
+    g["BackRef"] = [](const SemanticValues &vs, std::any &dt) {
       auto &data = *std::any_cast<Data *>(dt);
 
       // Undefined back reference check
@@ -6082,7 +7563,7 @@ private:
         auto tokens = std::any_cast<std::vector<std::string_view>>(v);
         auto assoc = tokens[0][0];
         for (size_t i = 1; i < tokens.size(); i++) {
-          binOpeInfo[tokens[i]] = std::pair(level, assoc);
+          binOpeInfo[std::string(tokens[i])] = std::pair(level, assoc);
         }
         level++;
       }
@@ -6133,9 +7614,24 @@ private:
     };
   }
 
+  // Reports `msg` at `pos` in the grammar `s`, if there is a log.
+  static void log_at(const Log &log, const char *s, const char *pos,
+                     const std::string &msg, const std::string &label = "") {
+    if (!log) { return; }
+    auto line = line_info(s, pos);
+    log(line.first, line.second, msg, label);
+  }
+
   bool apply_precedence_instruction(Definition &rule,
                                     const PrecedenceClimbing::BinOpeInfo &info,
-                                    const char *s, Log log) {
+                                    const char *s, const Log &log) {
+    auto cannot_apply = [&]() {
+      log_at(log, s, rule.s_,
+             "'precedence' instruction cannot be applied to '" + rule.name +
+                 "'.");
+      return false;
+    };
+
     try {
       auto &seq = dynamic_cast<Sequence &>(*rule.get_core_operator());
       auto atom = seq.opes_[0];
@@ -6149,28 +7645,12 @@ private:
       auto atom1_name = dynamic_cast<Reference &>(*atom1).name_;
 
       if (!rep.is_zom() || atom_name != atom1_name || atom_name == binop_name) {
-        if (log) {
-          auto line = line_info(s, rule.s_);
-          log(line.first, line.second,
-              "'precedence' instruction cannot be applied to '" + rule.name +
-                  "'.",
-              "");
-        }
-        return false;
+        return cannot_apply();
       }
 
       rule.holder_->ope_ = pre(atom, binop, info, rule);
       rule.disable_action = true;
-    } catch (...) {
-      if (log) {
-        auto line = line_info(s, rule.s_);
-        log(line.first, line.second,
-            "'precedence' instruction cannot be applied to '" + rule.name +
-                "'.",
-            "");
-      }
-      return false;
-    }
+    } catch (...) { return cannot_apply(); }
     return true;
   }
 
@@ -6180,34 +7660,16 @@ private:
     Data data;
     auto &grammar = *data.grammar;
 
-    // Built-in macros
-    {
-      // `%recover`
-      {
-        auto &rule = grammar[RECOVER_DEFINITION_NAME];
-        rule <= ref(grammar, "x", "", false, {});
-        rule.name = RECOVER_DEFINITION_NAME;
-        rule.s_ = "[native]";
-        rule.ignoreSemanticValue = true;
-        rule.is_macro = true;
-        rule.params = {"x"};
-      }
-    }
-
     try {
       std::any dt = &data;
       auto r = g["Grammar"].parse(s, n, dt, nullptr, log);
 
       if (!r.ret) {
-        if (log) {
-          if (r.error_info.message_pos) {
-            auto line = line_info(s, r.error_info.message_pos);
-            log(line.first, line.second, r.error_info.message,
-                r.error_info.label);
-          } else {
-            auto line = line_info(s, r.error_info.error_pos);
-            log(line.first, line.second, "syntax error", r.error_info.label);
-          }
+        if (r.error_info.message_pos) {
+          log_at(log, s, r.error_info.message_pos, r.error_info.message,
+                 r.error_info.label);
+        } else {
+          log_at(log, s, r.error_info.error_pos, "syntax error");
         }
         return {};
       }
@@ -6240,11 +7702,8 @@ private:
 
     if (!data.duplicates_of_definition.empty()) {
       for (const auto &[name, ptr] : data.duplicates_of_definition) {
-        if (log) {
-          auto line = line_info(s, ptr);
-          log(line.first, line.second,
-              "the definition '" + name + "' is already defined.", "");
-        }
+        log_at(log, s, ptr,
+               "the definition '" + name + "' is already defined.");
       }
       ret = false;
     }
@@ -6252,11 +7711,8 @@ private:
     // Check duplicated instructions
     if (!data.duplicates_of_instruction.empty()) {
       for (const auto &[type, ptr] : data.duplicates_of_instruction) {
-        if (log) {
-          auto line = line_info(s, ptr);
-          log(line.first, line.second,
-              "the instruction '" + type + "' is already defined.", "");
-        }
+        log_at(log, s, ptr,
+               "the instruction '" + type + "' is already defined.");
       }
       ret = false;
     }
@@ -6264,12 +7720,13 @@ private:
     // Check undefined back references
     if (!data.undefined_back_references.empty()) {
       for (const auto &[name, ptr] : data.undefined_back_references) {
-        if (log) {
-          auto line = line_info(s, ptr);
-          log(line.first, line.second,
-              "the back reference '" + name + "' is undefined.", "");
-        }
+        log_at(log, s, ptr, "the back reference '" + name + "' is undefined.");
       }
+      ret = false;
+    }
+
+    for (auto ptr : data.recovers_without_one_argument) {
+      log_at(log, s, ptr, "incorrect number of arguments.");
       ret = false;
     }
 
@@ -6280,13 +7737,9 @@ private:
       if (grammar.count(requested_start)) {
         start = requested_start;
       } else {
-        if (log) {
-          auto line = line_info(s, s);
-          log(line.first, line.second,
-              "the specified start rule '" + requested_start +
-                  "' is undefined.",
-              "");
-        }
+        log_at(log, s, s,
+               "the specified start rule '" + requested_start +
+                   "' is undefined.");
         ret = false;
       }
     }
@@ -6295,26 +7748,15 @@ private:
 
     auto &start_rule = grammar[start];
 
-    // Check if the start rule has ignore operator
-    {
-      if (start_rule.ignoreSemanticValue) {
-        if (log) {
-          auto line = line_info(s, start_rule.s_);
-          log(line.first, line.second,
-              "ignore operator cannot be applied to '" + start_rule.name + "'.",
-              "");
-        }
-        ret = false;
-      }
+    if (auto [rule, msg] = entry_rule_error(grammar, start_rule); rule) {
+      log_at(log, s, rule->s_, msg);
+      return {};
     }
-
-    if (!ret) { return {}; }
 
     // Check missing definitions
     auto referenced = std::unordered_set<std::string>{
         WHITESPACE_DEFINITION_NAME,
         WORD_DEFINITION_NAME,
-        RECOVER_DEFINITION_NAME,
         start_rule.name,
     };
 
@@ -6323,21 +7765,14 @@ private:
       rule.accept(vis);
       referenced.insert(vis.referenced.begin(), vis.referenced.end());
       for (const auto &[name, ptr] : vis.error_s) {
-        if (log) {
-          auto line = line_info(s, ptr);
-          log(line.first, line.second, vis.error_message[name], "");
-        }
+        log_at(log, s, ptr, vis.error_message[name]);
         ret = false;
       }
     }
 
     for (auto &[name, rule] : grammar) {
-      if (!referenced.count(name)) {
-        if (log) {
-          auto line = line_info(s, rule.s_);
-          auto msg = "'" + name + "' is not referenced.";
-          log(line.first, line.second, msg, "");
-        }
+      if (log && !referenced.count(name)) {
+        log_at(log, s, rule.s_, "'" + name + "' is not referenced.");
       }
     }
 
@@ -6350,47 +7785,21 @@ private:
       rule.accept(vis);
     }
 
-    // Compute can_be_empty for each rule (fixed-point iteration)
-    {
-      bool changed = true;
-      while (changed) {
-        changed = false;
-        for (auto &[name, rule] : grammar) {
-          ComputeCanBeEmpty vis;
-          rule.accept(vis);
-          if (vis.result != rule.can_be_empty) {
-            rule.can_be_empty = vis.result;
-            changed = true;
-          }
-        }
-      }
-    }
+    work_out_can_be_empty(grammar);
 
     // Check left recursion
-    if (enable_left_recursion) {
-      for (auto &[name, rule] : grammar) {
-        DetectLeftRecursion vis(name);
-        rule.accept(vis);
-        if (vis.error_s) { rule.is_left_recursive = true; }
+    for (auto &[name, rule] : grammar) {
+      DetectLeftRecursion vis(rule);
+      rule.accept(vis);
+      if (vis.error_s && enable_left_recursion) {
+        rule.is_left_recursive = true;
+      } else if (vis.error_s) {
+        log_at(log, s, vis.error_s, "'" + name + "' is left recursive.");
+        ret = false;
       }
-    } else {
-      ret = true;
-
-      for (auto &[name, rule] : grammar) {
-        DetectLeftRecursion vis(name);
-        rule.accept(vis);
-        if (vis.error_s) {
-          if (log) {
-            auto line = line_info(s, vis.error_s);
-            log(line.first, line.second, "'" + name + "' is left recursive.",
-                "");
-          }
-          ret = false;
-        }
-      }
-
-      if (!ret) { return {}; }
     }
+
+    if (!ret) { return {}; }
 
     // Check infinite loop
     if (detect_infiniteLoop(data, start_rule, log, s)) { return {}; }
@@ -6404,17 +7813,19 @@ private:
       }
 
       auto &rule = grammar[WHITESPACE_DEFINITION_NAME];
-      start_rule.whitespaceOpe = wsp(rule.get_core_operator());
-
       if (detect_infiniteLoop(data, rule, log, s)) { return {}; }
     }
 
     // Word expression
     if (grammar.count(WORD_DEFINITION_NAME)) {
       auto &rule = grammar[WORD_DEFINITION_NAME];
-      start_rule.wordOpe = rule.get_core_operator();
-
       if (detect_infiniteLoop(data, rule, log, s)) { return {}; }
+
+      if (rule.can_be_empty) {
+        log_at(log, s, rule.s_,
+               "'" + rule.name + "' can match the empty string.");
+        return {};
+      }
     }
 
     // Apply instructions
@@ -6439,32 +7850,17 @@ private:
       }
     }
 
-    // Setup First-Set and ISpan optimizations. A single visitor is shared
-    // across all rules so its first-set cache and visited-rule set persist:
-    // each rule's first-sets are computed once (O(N)) instead of re-walking
-    // every reachable rule once per referencing rule (O(N^2)).
-    {
-      SetupFirstSets vis;
-      for (auto &x : grammar) {
-        x.second.accept(vis);
-      }
-    }
-
+    finish_grammar(grammar, start_rule);
     return {data.grammar, start, data.enablePackratParsing};
   }
 
   bool detect_infiniteLoop(const Data &data, Definition &rule, const Log &log,
                            const char *s) const {
-    std::vector<std::pair<const char *, std::string>> refs;
-    std::unordered_map<std::string, bool> has_error_cache;
-    DetectInfiniteLoop vis(data.start_pos, rule.name, refs, has_error_cache);
+    DetectInfiniteLoop vis(data.start_pos, rule.name);
     rule.accept(vis);
     if (vis.has_error) {
-      if (log) {
-        auto line = line_info(s, vis.error_s);
-        log(line.first, line.second,
-            "infinite loop is detected in '" + vis.error_name + "'.", "");
-      }
+      log_at(log, s, vis.error_s,
+             "infinite loop is detected in '" + vis.error_name + "'.");
       return true;
     }
     return false;
@@ -6512,6 +7908,35 @@ template <typename Annotation> struct AstBase : public Annotation {
         preserve_position(ast.preserve_position), token(ast.token),
         nodes(ast.nodes), parent(ast.parent) {}
 
+  AstBase(const AstBase &) = default;
+  AstBase(AstBase &&) = default;
+
+  // A tree can be deeper than the call stack allows (a long chain of
+  // left-associative operators), so the nodes that die with this one are
+  // released in a loop here instead of each from its parent's destructor.
+  ~AstBase() {
+    if (nodes.empty()) { return; }
+
+    // Set while a destructor on this thread runs that loop: a node that dies
+    // meanwhile hands its children over to it.
+    static thread_local std::vector<std::shared_ptr<AstBase>> *doomed_nodes =
+        nullptr;
+    if (doomed_nodes) {
+      for (auto &node : nodes) {
+        doomed_nodes->push_back(std::move(node));
+      }
+      return;
+    }
+    auto doomed = std::move(nodes);
+    doomed_nodes = &doomed;
+    while (!doomed.empty()) {
+      // Moved out first, as its release may add to `doomed`.
+      auto node = std::move(doomed.back());
+      doomed.pop_back();
+    }
+    doomed_nodes = nullptr;
+  }
+
   const std::string path;
   const size_t line = 1;
   const size_t column = 1;
@@ -6521,11 +7946,11 @@ template <typename Annotation> struct AstBase : public Annotation {
   size_t length;
   const size_t choice_count;
   const size_t choice;
-  const std::string original_name;
-  const size_t original_choice_count;
-  const size_t original_choice;
+  std::string original_name;
+  size_t original_choice_count;
+  size_t original_choice;
   const unsigned int tag;
-  const unsigned int original_tag;
+  unsigned int original_tag;
 
   const bool is_token;
   const bool preserve_position;
@@ -6545,8 +7970,9 @@ template <typename Annotation> struct AstBase : public Annotation {
 };
 
 template <typename T>
-void ast_to_s_core(const std::shared_ptr<T> &ptr, std::string &s, int level,
-                   std::function<std::string(const T &ast, int level)> fn) {
+void ast_to_s_core(
+    const std::shared_ptr<T> &ptr, std::string &s, int level,
+    const std::function<std::string(const T &ast, int level)> &fn) {
   const auto &ast = *ptr;
   for (auto i = 0; i < level; i++) {
     s += "  ";
@@ -6578,28 +8004,38 @@ ast_to_s(const std::shared_ptr<T> &ptr,
   return s;
 }
 
+// A copy of `child` standing in for its single-child parent. Shared by
+// AstOptimizer and the collapsing AST actions so both build the same tree.
+template <typename T>
+std::shared_ptr<T> collapse_ast_node(const T &child, const char *name,
+                                     size_t position, size_t length,
+                                     size_t choice_count, size_t choice) {
+  auto pos = child.preserve_position ? child.position : position;
+  auto len = child.preserve_position ? child.length : length;
+  auto ast = std::make_shared<T>(child, name, pos, len, choice_count, choice);
+  for (auto &node : ast->nodes) {
+    node->parent = ast;
+  }
+  return ast;
+}
+
 struct AstOptimizer {
   AstOptimizer(bool mode, const std::vector<std::string> &rules = {})
       : mode_(mode), rules_(rules) {}
 
+  bool is_optimized(const std::string &name) const {
+    auto found = std::find(rules_.begin(), rules_.end(), name) != rules_.end();
+    return mode_ ? !found : found;
+  }
+
   template <typename T>
   std::shared_ptr<T> optimize(std::shared_ptr<T> original,
                               std::shared_ptr<T> parent = nullptr) {
-    auto found =
-        std::find(rules_.begin(), rules_.end(), original->name) != rules_.end();
-    auto opt = mode_ ? !found : found;
-
-    if (opt && original->nodes.size() == 1) {
-      auto child = optimize(original->nodes[0], parent);
-      auto pos =
-          child->preserve_position ? child->position : original->position;
-      auto len = child->preserve_position ? child->length : original->length;
-      auto ast = std::make_shared<T>(*child, original->name.data(), pos, len,
-                                     original->choice_count, original->choice);
-      for (auto &node : ast->nodes) {
-        node->parent = ast;
-      }
-      return ast;
+    if (is_optimized(original->name) && original->nodes.size() == 1) {
+      return collapse_ast_node(*optimize(original->nodes[0], parent),
+                               original->name.data(), original->position,
+                               original->length, original->choice_count,
+                               original->choice);
     }
 
     auto ast = std::make_shared<T>(*original);
@@ -6620,29 +8056,53 @@ private:
 struct EmptyType {};
 using Ast = AstBase<EmptyType>;
 
-template <typename T = Ast> void add_ast_action(Definition &rule) {
-  rule.action = [&](const SemanticValues &vs) {
-    auto line = vs.line_info();
-
-    // `{ ast_name: X }` overrides the node's name/tag (falls back to the
-    // rule's own name when unset).
-    const char *node_name =
-        rule.ast_name.empty() ? rule.name.data() : rule.ast_name.data();
+template <typename T = Ast>
+void add_ast_action(Definition &rule, bool collapse = false) {
+  rule.ast_node_name = rule.node_name();
+  rule.ast_node_tag = str2tag(rule.ast_node_name);
+  rule.action = [&rule, collapse](const SemanticValues &vs) {
+    const char *node_name = rule.ast_node_name.c_str();
+    auto position = static_cast<size_t>(std::distance(vs.ss, vs.sv().data()));
+    auto length = vs.sv().length();
 
     if (rule.is_token()) {
+      auto line = vs.line_info();
       return std::make_shared<T>(
-          vs.path, line.first, line.second, node_name, vs.token(),
-          std::distance(vs.ss, vs.sv().data()), vs.sv().length(),
-          vs.choice_count(), vs.choice(), rule.no_ast_opt);
+          vs.path, line.first, line.second, node_name, vs.token(), position,
+          length, vs.choice_count(), vs.choice(), rule.no_ast_opt);
     }
+
+    if (collapse && vs.size() == 1) {
+      const auto &child = std::any_cast<const std::shared_ptr<T> &>(vs[0]);
+
+      // Unless something else holds the child (the packrat cache, a user
+      // action), it stands in for this node itself instead of a copy of it.
+      // It then keeps its Annotation, which a copy would reset.
+      if (child.use_count() == 1) {
+        if (!child->preserve_position) {
+          child->position = position;
+          child->length = length;
+        }
+        child->original_name = rule.ast_node_name;
+        child->original_tag = rule.ast_node_tag;
+        child->original_choice_count = vs.choice_count();
+        child->original_choice = vs.choice();
+        return child;
+      }
+
+      return collapse_ast_node(*child, node_name, position, length,
+                               vs.choice_count(), vs.choice());
+    }
+
+    auto line = vs.line_info();
 
     // Construct with no children, then move the collected ones in: passing
     // the vector to the constructor would bind to its `const &` parameter
     // and copy the whole thing (plus a reference count bump per child).
-    auto ast = std::make_shared<T>(
-        vs.path, line.first, line.second, node_name,
-        std::vector<std::shared_ptr<T>>(), std::distance(vs.ss, vs.sv().data()),
-        vs.sv().length(), vs.choice_count(), vs.choice(), rule.no_ast_opt);
+    auto ast =
+        std::make_shared<T>(vs.path, line.first, line.second, node_name,
+                            std::vector<std::shared_ptr<T>>(), position, length,
+                            vs.choice_count(), vs.choice(), rule.no_ast_opt);
     ast->nodes = vs.transform<std::shared_ptr<T>>();
 
     for (auto &node : ast->nodes) {
@@ -6650,6 +8110,7 @@ template <typename T = Ast> void add_ast_action(Definition &rule) {
     }
     return ast;
   };
+  rule.action.template declare_ast_action<std::shared_ptr<T>>(collapse);
 }
 
 #define PEG_EXPAND(...) __VA_ARGS__
@@ -6807,12 +8268,10 @@ public:
 
 #if defined(__cpp_lib_char8_t)
   parser(std::u8string_view sv, const Rules &rules, std::string_view start = {})
-      : parser(reinterpret_cast<const char *>(sv.data()), sv.size(), rules,
-               start) {}
+      : parser(u8(sv.data()), sv.size(), rules, start) {}
 
   parser(std::u8string_view sv, std::string_view start = {})
-      : parser(reinterpret_cast<const char *>(sv.data()), sv.size(), Rules(),
-               start) {}
+      : parser(u8(sv.data()), sv.size(), Rules(), start) {}
 #endif
 
   operator bool() const { return grammar_ != nullptr; }
@@ -6824,6 +8283,21 @@ public:
     grammar_ = cxt.grammar;
     start_ = cxt.start;
     enablePackratParsing_ = cxt.enablePackratParsing;
+#ifdef CPPPEGLIB_TEST
+    // For the test suite: replace the grammar with the one its blob loads, so
+    // every test also checks GrammarBlob. A grammar that a blob cannot hold
+    // stays as parsed. The environment variable lets one test binary run both
+    // ways.
+    if (grammar_ != nullptr && std::getenv("CPPPEGLIB_TEST_BLOB_ROUNDTRIP")) {
+      std::vector<uint8_t> blob;
+      try {
+        blob = serialize_grammar();
+      } catch (const std::runtime_error &) {}
+      if (!blob.empty() && !load_blob(blob)) {
+        throw std::logic_error("a serialized grammar failed to load");
+      }
+    }
+#endif
     return grammar_ != nullptr;
   }
 
@@ -6843,7 +8317,9 @@ public:
   // Serialize the loaded grammar to a portable byte blob (see GrammarBlob).
   // Semantic callbacks are not included; throws if the grammar is not
   // serializable (uses the `User` operator or a Capture with a match action).
+  // Without a loaded grammar the blob is empty, which load_blob() rejects.
   std::vector<uint8_t> serialize_grammar() const {
+    if (grammar_ == nullptr) { return {}; }
     return GrammarBlob::serialize(*grammar_, start_);
   }
 
@@ -6854,55 +8330,49 @@ public:
       grammar_ = GrammarBlob::deserialize(blob, start_);
     } catch (const std::exception &) { return false; }
     if (grammar_ != nullptr) {
-      // Symmetry with load_grammar(): restore the parser-level packrat flag
-      // from the blob so a later enable_packrat_parsing() re-applies it
-      // instead of resetting the start rule to the false member default.
-      enablePackratParsing_ = (*grammar_)[start_].enablePackratParsing;
+      // enablePackratParsing_ says whether the grammar allows packrat, which
+      // only a back reference to a capture in another rule forbids. Such a
+      // grammar holds a capture, which a blob cannot, so a blob always allows
+      // packrat. Whether packrat is on is the start rule's own flag, which the
+      // blob restores.
+      enablePackratParsing_ = true;
     }
     return grammar_ != nullptr;
   }
 
   bool parse_n(const char *s, size_t n, const char *path = nullptr) const {
-    if (grammar_ != nullptr) {
-      const auto &rule = (*grammar_)[start_];
+    return parse_from_start([&](const Definition &rule) {
       auto result = rule.parse(s, n, path, log_, error_reporter_);
       return post_process(s, n, result);
-    }
-    return false;
+    });
   }
 
   bool parse_n(const char *s, size_t n, std::any &dt,
                const char *path = nullptr) const {
-    if (grammar_ != nullptr) {
-      const auto &rule = (*grammar_)[start_];
+    return parse_from_start([&](const Definition &rule) {
       auto result = rule.parse(s, n, dt, path, log_, error_reporter_);
       return post_process(s, n, result);
-    }
-    return false;
+    });
   }
 
   template <typename T>
   bool parse_n(const char *s, size_t n, T &val,
                const char *path = nullptr) const {
-    if (grammar_ != nullptr) {
-      const auto &rule = (*grammar_)[start_];
+    return parse_from_start([&](const Definition &rule) {
       auto result =
           rule.parse_and_get_value(s, n, val, path, log_, error_reporter_);
-      return post_process(s, n, result);
-    }
-    return false;
+      return post_process(rule, s, n, val, result);
+    });
   }
 
   template <typename T>
   bool parse_n(const char *s, size_t n, std::any &dt, T &val,
                const char *path = nullptr) const {
-    if (grammar_ != nullptr) {
-      const auto &rule = (*grammar_)[start_];
+    return parse_from_start([&](const Definition &rule) {
       auto result =
           rule.parse_and_get_value(s, n, dt, val, path, log_, error_reporter_);
-      return post_process(s, n, result);
-    }
-    return false;
+      return post_process(rule, s, n, val, result);
+    });
   }
 
   bool parse(std::string_view sv, const char *path = nullptr) const {
@@ -6927,26 +8397,23 @@ public:
 
 #if defined(__cpp_lib_char8_t)
   bool parse(std::u8string_view sv, const char *path = nullptr) const {
-    return parse_n(reinterpret_cast<const char *>(sv.data()), sv.size(), path);
+    return parse(as_chars(sv), path);
   }
 
   bool parse(std::u8string_view sv, std::any &dt,
              const char *path = nullptr) const {
-    return parse_n(reinterpret_cast<const char *>(sv.data()), sv.size(), dt,
-                   path);
+    return parse(as_chars(sv), dt, path);
   }
 
   template <typename T>
   bool parse(std::u8string_view sv, T &val, const char *path = nullptr) const {
-    return parse_n(reinterpret_cast<const char *>(sv.data()), sv.size(), val,
-                   path);
+    return parse(as_chars(sv), val, path);
   }
 
   template <typename T>
   bool parse(std::u8string_view sv, std::any &dt, T &val,
              const char *path = nullptr) const {
-    return parse_n(reinterpret_cast<const char *>(sv.data()), sv.size(), dt,
-                   val, path);
+    return parse(as_chars(sv), dt, val, path);
   }
 #endif
 
@@ -6957,54 +8424,72 @@ public:
   const Grammar &get_grammar() const { return *grammar_; }
 
   void disable_eoi_check() {
-    if (grammar_ != nullptr) {
-      auto &rule = (*grammar_)[start_];
-      rule.eoi_check = false;
-    }
+    with_start_rule([](Definition &rule) { rule.eoi_check = false; });
   }
 
+  // Applies to the next load_grammar, not to a grammar already loaded.
   void enable_left_recursion(bool enable = true) {
     enableLeftRecursion_ = enable;
   }
 
   void enable_packrat_parsing() {
-    if (grammar_ != nullptr) {
-      auto &rule = (*grammar_)[start_];
+    with_start_rule([this](Definition &rule) {
       rule.enablePackratParsing = enablePackratParsing_;
-    }
+    });
   }
 
   void enable_trace(TracerEnter tracer_enter, TracerLeave tracer_leave) {
-    if (grammar_ != nullptr) {
-      auto &rule = (*grammar_)[start_];
+    with_start_rule([&](Definition &rule) {
       rule.tracer_enter = tracer_enter;
       rule.tracer_leave = tracer_leave;
-    }
+    });
   }
 
   void enable_trace(TracerEnter tracer_enter, TracerLeave tracer_leave,
                     TracerStartOrEnd tracer_start,
                     TracerStartOrEnd tracer_end) {
-    if (grammar_ != nullptr) {
-      auto &rule = (*grammar_)[start_];
+    with_start_rule([&](Definition &rule) {
       rule.tracer_enter = tracer_enter;
       rule.tracer_leave = tracer_leave;
       rule.tracer_start = tracer_start;
       rule.tracer_end = tracer_end;
-    }
+    });
   }
 
   void set_verbose_trace(bool verbose_trace) {
-    if (grammar_ != nullptr) {
-      auto &rule = (*grammar_)[start_];
-      rule.verbose_trace = verbose_trace;
-    }
+    with_start_rule(
+        [&](Definition &rule) { rule.verbose_trace = verbose_trace; });
   }
 
-  template <typename T = Ast> parser &enable_ast() {
+  // Fails a parse that nests more than max_depth rule matches, with an
+  // error, before deep input can overflow the stack, and one that returns
+  // an AST deeper than that (see check_ast_depth).
+  void set_max_depth(size_t max_depth) {
+    with_start_rule([&](Definition &rule) { rule.max_depth = max_depth; });
+  }
+
+  // With collapse_mode, nodes are collapsed as they are built, giving the
+  // tree optimize_ast(ast, opt_mode) would return without copying it again.
+  // Rules with a user action are not collapsed.
+  template <typename T = Ast>
+  parser &enable_ast(bool collapse_mode = false, bool opt_mode = true) {
+    return enable_ast<T>(collapse_mode, opt_mode, get_no_ast_opt_rules());
+  }
+
+  // As above, but with `rules` in place of the rules marked no_ast_opt, as
+  // in AstOptimizer(opt_mode, rules).
+  template <typename T = Ast>
+  parser &enable_ast(bool collapse_mode, bool opt_mode,
+                     const std::vector<std::string> &rules) {
+    if (grammar_ == nullptr) { return *this; }
+    const AstOptimizer optimizer(opt_mode, rules);
     for (auto &[_, rule] : *grammar_) {
-      if (!rule.action) { add_ast_action<T>(rule); }
+      if (!rule.action) {
+        add_ast_action<T>(rule, collapse_mode &&
+                                    optimizer.is_optimized(rule.node_name()));
+      }
     }
+    builds_ast_ = true;
     return *this;
   }
 
@@ -7030,6 +8515,22 @@ public:
   }
 
 private:
+  // Runs `f` on the start rule, if a grammar is loaded.
+  template <typename F> void with_start_rule(F f) {
+    if (grammar_ != nullptr) { f((*grammar_)[start_]); }
+  }
+
+  // Runs `parse` on the start rule, which fails without a grammar.
+  template <typename F> bool parse_from_start(F parse) const {
+    return grammar_ != nullptr && parse((*grammar_)[start_]);
+  }
+
+#if defined(__cpp_lib_char8_t)
+  static std::string_view as_chars(std::u8string_view sv) {
+    return {u8(sv.data()), sv.size()};
+  }
+#endif
+
   bool post_process(const char *s, size_t n, Definition::Result &r) const {
     if ((log_ || error_reporter_) && !r.ret) {
       r.error_info.output_log(log_, error_reporter_, s, n);
@@ -7037,14 +8538,83 @@ private:
     return r.ret && !r.recovered;
   }
 
+  template <typename T>
+  bool post_process(const Definition &rule, const char *s, size_t n, T &val,
+                    Definition::Result &r) const {
+    check_ast_depth(rule, s, n, val, r);
+    auto ret = post_process(s, n, r);
+    if (ret) { link_ast(val); }
+    return ret;
+  }
+
+  // A tree can nest deeper than its parse did: a left-associative precedence
+  // operator or left recursion folds a chain in a loop, and packrat parsing
+  // reuses a subtree wherever it matches again. Under a max_depth, the
+  // returned tree is held to it too, and one that goes past it is reported at
+  // its first node that does, as the parse reports the rule match that does.
+  template <typename V>
+  void check_ast_depth(const Definition &, const char *, size_t, V &,
+                       Definition::Result &) const {}
+  template <typename A>
+  void check_ast_depth(const Definition &rule, const char *s, size_t n,
+                       std::shared_ptr<AstBase<A>> &ast,
+                       Definition::Result &r) const {
+    if (!r.ret || !ast ||
+        rule.max_depth == std::numeric_limits<size_t>::max()) {
+      return;
+    }
+    std::vector<std::pair<const AstBase<A> *, size_t>> stack{{ast.get(), 1}};
+    while (!stack.empty()) {
+      auto [node, depth] = stack.back();
+      stack.pop_back();
+      if (depth > rule.max_depth) {
+        r.ret = false;
+        // A node a user action took from another parse can start past the
+        // end of this input.
+        r.error_info.set_nesting_too_deep(s + std::min(node->position, n),
+                                          node->name, rule.max_depth);
+        ast.reset();
+        return;
+      }
+      // In reverse, so that nodes are visited in the order of the text.
+      for (auto it = node->nodes.rbegin(); it != node->nodes.rend(); ++it) {
+        stack.emplace_back(it->get(), depth + 1);
+      }
+    }
+  }
+
+  // Packrat or left recursion can reuse a node after a parent that took it in
+  // was discarded, leaving it with a stale parent, so link the finished tree
+  // again. A direct Definition::parse_and_get_value call skips this.
+  template <typename V> void link_ast(V &) const {}
+  template <typename A> void link_ast(std::shared_ptr<AstBase<A>> &ast) const {
+    if (!builds_ast_ || !ast) { return; }
+    ast->parent.reset();
+    // Only a zero-length node can sit under two parents (packrat reuses it);
+    // each extra occurrence gets its own copy.
+    std::unordered_set<const AstBase<A> *> zero_length;
+    std::vector<std::shared_ptr<AstBase<A>> *> stack{&ast};
+    while (!stack.empty()) {
+      auto &node = *stack.back();
+      stack.pop_back();
+      for (auto &child : node->nodes) {
+        if (child->length == 0 && !zero_length.insert(child.get()).second) {
+          child = std::make_shared<AstBase<A>>(*child);
+          zero_length.insert(child.get());
+        }
+        child->parent = node;
+        stack.push_back(&child);
+      }
+    }
+  }
+
   std::vector<std::string> get_no_ast_opt_rules() const {
     std::vector<std::string> rules;
-    for (auto &[name, rule] : *grammar_) {
+    if (grammar_ == nullptr) { return rules; }
+    for (auto &[_, rule] : *grammar_) {
       // The optimizer keeps nodes by their emitted name, so honor the
       // `ast_name` override when present (else the rule's own name).
-      if (rule.no_ast_opt) {
-        rules.push_back(rule.ast_name.empty() ? name : rule.ast_name);
-      }
+      if (rule.no_ast_opt) { rules.push_back(rule.node_name()); }
     }
     return rules;
   }
@@ -7053,6 +8623,7 @@ private:
   std::string start_;
   bool enableLeftRecursion_ = true;
   bool enablePackratParsing_ = false;
+  bool builds_ast_ = false; // enable_ast() was called
   Log log_;
   ErrorReporter error_reporter_;
 };
@@ -7061,39 +8632,35 @@ private:
  *  enable_tracing
  *---------------------------------------------------------------------------*/
 
+// The bars that show how deep in the trace a rule match is.
+inline std::string trace_indent(const Context &c) {
+  std::string indent;
+  for (size_t level = 1; level < c.trace_ids.size(); level++) {
+    indent += "│";
+  }
+  return indent;
+}
+
 inline void enable_tracing(parser &parser, std::ostream &os) {
   parser.enable_trace(
       [&](auto &ope, auto s, auto, auto &, auto &c, auto &, auto &trace_data) {
         auto prev_pos = std::any_cast<size_t>(trace_data);
         auto pos = static_cast<size_t>(s - c.s);
         auto backtrack = (pos < prev_pos ? "*" : "");
-        std::string indent;
-        auto level = c.trace_ids.size() - 1;
-        while (level--) {
-          indent += "│";
+        auto name = peg::TraceOpeName::get(ope);
+        if (auto lit = dynamic_cast<const peg::LiteralString *>(&ope)) {
+          name += " '" + peg::escape_characters(lit->lit_) + "'";
         }
-        std::string name;
-        {
-          name = peg::TraceOpeName::get(const_cast<peg::Ope &>(ope));
-
-          auto lit = dynamic_cast<const peg::LiteralString *>(&ope);
-          if (lit) { name += " '" + peg::escape_characters(lit->lit_) + "'"; }
-        }
-        os << "E " << pos + 1 << backtrack << "\t" << indent << "┌" << name
-           << " #" << c.trace_ids.back() << std::endl;
+        os << "E " << pos + 1 << backtrack << "\t" << trace_indent(c) << "┌"
+           << name << " #" << c.trace_ids.back() << std::endl;
         trace_data = static_cast<size_t>(pos);
       },
       [&](auto &ope, auto s, auto, auto &sv, auto &c, auto &, auto len,
           auto &) {
         auto pos = static_cast<size_t>(s - c.s);
-        if (len != static_cast<size_t>(-1)) { pos += len; }
-        std::string indent;
-        auto level = c.trace_ids.size() - 1;
-        while (level--) {
-          indent += "│";
-        }
-        auto ret = len != static_cast<size_t>(-1) ? "└o " : "└x ";
-        auto name = peg::TraceOpeName::get(const_cast<peg::Ope &>(ope));
+        if (peg::success(len)) { pos += len; }
+        auto ret = peg::success(len) ? "└o " : "└x ";
+        auto name = peg::TraceOpeName::get(ope);
         std::stringstream choice;
         if (sv.choice_count() > 0) {
           choice << " " << sv.choice() << "/" << sv.choice_count();
@@ -7109,7 +8676,7 @@ inline void enable_tracing(parser &parser, std::ostream &os) {
             peg::TokenChecker::is_token(const_cast<peg::Ope &>(ope))) {
           matched = ", match '" + peg::escape_characters(s, len) + "'";
         }
-        os << "L " << pos + 1 << "\t" << indent << ret << name << " #"
+        os << "L " << pos + 1 << "\t" << trace_indent(c) << ret << name << " #"
            << c.trace_ids.back() << choice.str() << token << matched
            << std::endl;
       },
@@ -7137,11 +8704,10 @@ inline void enable_profiling(parser &parser, std::ostream &os) {
   parser.enable_trace(
       [&](auto &ope, auto, auto, auto &, auto &, auto &, std::any &trace_data) {
         if (auto holder = dynamic_cast<const peg::Holder *>(&ope)) {
-          auto &stats = *std::any_cast<Stats *>(trace_data);
+          auto &stats = *std::any_cast<std::shared_ptr<Stats> &>(trace_data);
 
           auto &name = holder->name();
-          if (stats.index.find(name) == stats.index.end()) {
-            stats.index[name] = stats.index.size();
+          if (stats.index.emplace(name, stats.items.size()).second) {
             stats.items.push_back({name, 0, 0});
           }
           stats.total++;
@@ -7150,70 +8716,69 @@ inline void enable_profiling(parser &parser, std::ostream &os) {
       [&](auto &ope, auto, auto, auto &, auto &, auto &, auto len,
           std::any &trace_data) {
         if (auto holder = dynamic_cast<const peg::Holder *>(&ope)) {
-          auto &stats = *std::any_cast<Stats *>(trace_data);
+          auto &stats = *std::any_cast<std::shared_ptr<Stats> &>(trace_data);
 
-          auto &name = holder->name();
-          auto index = stats.index[name];
-          auto &stat = stats.items[index];
-          if (len != static_cast<size_t>(-1)) {
+          auto &stat = stats.items[stats.index[holder->name()]];
+          if (peg::success(len)) {
             stat.success++;
           } else {
             stat.fail++;
           }
-
-          if (index == 0) {
-            auto end = std::chrono::steady_clock::now();
-            auto nano = std::chrono::duration_cast<std::chrono::microseconds>(
-                            end - stats.start)
-                            .count();
-            auto sec = nano / 1000000.0;
-            os << "duration: " << sec << "s (" << nano << "µs)" << std::endl
-               << std::endl;
-
-            char buff[BUFSIZ];
-            size_t total_success = 0;
-            size_t total_fail = 0;
-            for (auto &[name, success, fail] : stats.items) {
-              total_success += success;
-              total_fail += fail;
-            }
-
-            os << "  id       total      %     success        fail  "
-                  "definition"
-               << std::endl;
-
-            auto grand_total = total_success + total_fail;
-            snprintf(buff, BUFSIZ, "%4s  %10zu  %5s  %10zu  %10zu  %s", "",
-                     grand_total, "", total_success, total_fail,
-                     "Total counters");
-            os << buff << std::endl;
-
-            snprintf(buff, BUFSIZ, "%4s  %10s  %5s  %10.2f  %10.2f  %s", "", "",
-                     "", total_success * 100.0 / grand_total,
-                     total_fail * 100.0 / grand_total, "% success/fail");
-            os << buff << std::endl << std::endl;
-            ;
-
-            size_t id = 0;
-            for (auto &[name, success, fail] : stats.items) {
-              auto total = success + fail;
-              auto ratio = total * 100.0 / stats.total;
-              snprintf(buff, BUFSIZ, "%4zu  %10zu  %5.2f  %10zu  %10zu  %s", id,
-                       total, ratio, success, fail, name.c_str());
-              os << buff << std::endl;
-              id++;
-            }
-          }
         }
       },
       [&](auto &trace_data) {
-        auto stats = new Stats{};
+        auto stats = std::make_shared<Stats>();
         stats->start = std::chrono::steady_clock::now();
-        trace_data = stats;
+        trace_data = std::move(stats);
       },
+      // Reports here, where every parse ends, rather than where the start
+      // rule is left: a parse that an exception cuts short never gets there,
+      // and a start rule that matches inside itself gets there many times.
       [&](auto &trace_data) {
-        auto stats = std::any_cast<Stats *>(trace_data);
-        delete stats;
+        auto &stats = *std::any_cast<std::shared_ptr<Stats> &>(trace_data);
+
+        auto end = std::chrono::steady_clock::now();
+        auto usec = std::chrono::duration_cast<std::chrono::microseconds>(
+                        end - stats.start)
+                        .count();
+        auto sec = usec / 1000000.0;
+        os << "duration: " << sec << "s (" << usec << "µs)" << std::endl
+           << std::endl;
+
+        char buff[BUFSIZ];
+        size_t total_success = 0;
+        size_t total_fail = 0;
+        for (auto &[name, success, fail] : stats.items) {
+          total_success += success;
+          total_fail += fail;
+        }
+
+        os << "  id       total      %     success        fail  "
+              "definition"
+           << std::endl;
+
+        auto grand_total = total_success + total_fail;
+        snprintf(buff, BUFSIZ, "%4s  %10zu  %5s  %10zu  %10zu  %s", "",
+                 grand_total, "", total_success, total_fail, "Total counters");
+        os << buff << std::endl;
+
+        // A parse cut short may have left no rule at all.
+        auto percent = [&](size_t count) {
+          return grand_total ? count * 100.0 / grand_total : 0.0;
+        };
+        snprintf(buff, BUFSIZ, "%4s  %10s  %5s  %10.2f  %10.2f  %s", "", "", "",
+                 percent(total_success), percent(total_fail), "% success/fail");
+        os << buff << std::endl << std::endl;
+
+        size_t id = 0;
+        for (auto &[name, success, fail] : stats.items) {
+          auto total = success + fail;
+          auto ratio = total * 100.0 / stats.total;
+          snprintf(buff, BUFSIZ, "%4zu  %10zu  %5.2f  %10zu  %10zu  %s", id,
+                   total, ratio, success, fail, name.c_str());
+          os << buff << std::endl;
+          id++;
+        }
       });
 }
 } // namespace peg

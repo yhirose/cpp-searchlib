@@ -14,8 +14,9 @@ namespace segmentlib::unicode {
 // Version of the Unicode data the generated grapheme-break property table was
 // built from, encoded as major*100 + minor (18.0 -> 1800). UAX #29 rules and
 // property assignments can change between Unicode versions, so model files
-// record the version they were trained with (design.ja.md 4.7 field 4b) and
-// the loader warns when it differs from this segmenter's tables.
+// record the version they were trained with (design.ja.md 4.7 field 4b), and
+// Segmenter::unicode_version_mismatch() reports when it differs from this
+// segmenter's tables.
 inline constexpr std::uint16_t kEgcUnicodeVersion = 1800;
 
 // UAX #29 Grapheme_Cluster_Break property values (exactly the set the

@@ -48,6 +48,8 @@ class KyteaBackend {
 public:
     explicit KyteaBackend(Model model) noexcept : model_(std::move(model)) {}
 
+    [[nodiscard]] static constexpr bool unicode_version_mismatch() noexcept { return false; }
+
     [[nodiscard]] Expected<Segments, Error> tokenize(std::string_view text) const {
         detail::Scratch& s = detail::scratch();
         if (auto r = model_.chars().encode_into(text, s.enc); !r) {

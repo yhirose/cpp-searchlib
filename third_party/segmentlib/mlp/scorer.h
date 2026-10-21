@@ -14,14 +14,12 @@
 
 namespace segmentlib::mlp {
 
-// Per-call buffers for the scorer: the
-// accumulator (whichever precision the model was loaded with) and the
+// Per-call buffers for the scorer: the Int32 accumulator and the
 // dictionary-feature scratch. score_boundaries_into allocates nothing once
 // these have grown to the sentence's size, matching the kytea::scorer _into
 // convention.
 struct Workspace {
-    std::vector<std::int32_t> acc;    // H (TablePrecision::Int32)
-    std::vector<std::int16_t> acc16;  // H (TablePrecision::Int16)
+    std::vector<std::int32_t> acc;  // H (TablePrecision::Int32)
     DictFeatures dict;
     // Int16 fused path (kernels::fused_score_i16): the per-boundary block
     // pointers (2w window slots then active dict columns) and 2w×H scratch for
@@ -53,37 +51,32 @@ inline Span<const std::uint32_t> slot_rows(const EncodedEgc& enc, std::size_t m,
                : Span<const std::uint32_t>(pad, 1);
 }
 
-// The per-boundary loop of I.2, generic over the accumulator representation.
-// `Acc` is int32 (exact path) or int16 (requantized path); the caller wires
-// the mode-specific pieces (bias init, table add, dict-column add, relu, dot,
-// output offset) so the window/boundary structure lives in one place.
-template <class Acc, class InitAcc, class AddSlot, class AddDict, class Relu, class Dot>
-void score_loop(const Model& model, const EncodedEgc& enc, Workspace& ws,
-                std::vector<std::int32_t>& out, std::vector<Acc>& acc,
-                InitAcc init_acc, AddSlot add_slot, AddDict add_dict, Relu relu,
-                Dot dot) {
+// The Int32 (exact) path: the per-boundary loop of I.2 over the full-width
+// int32 accumulator — b1, the 2w window contributions, the active dictionary
+// columns, relu, the output dot in int64 plus the b2 offset (I.1-(5)).
+inline void score_i32(const Model& model, const EncodedEgc& enc, Workspace& ws,
+                      std::vector<std::int32_t>& out) {
     const Config& c = model.config();
     const std::size_t m = enc.egc_count();
     const std::size_t boundaries = m - 1;
     const std::size_t h_dim = c.hidden;
     const std::size_t slots = 2u * c.char_window;
+    const PrecomputeTable& precompute = model.precompute();
+    const Span<const std::int32_t> b1_q = model.b1_q();
+    const Span<const std::int16_t> w2 = model.w2();
 
-    acc.resize(h_dim);
+    ws.acc.resize(h_dim);
+    std::int32_t* acc = ws.acc.data();
     for (std::size_t i = 0; i < boundaries; ++i) {
-        // acc = b1, then the 2w window contributions (I.2).
-        init_acc(acc.data());
+        std::copy(b1_q.begin(), b1_q.end(), acc);
         for (std::size_t j = 0; j < slots; ++j) {
-            add_slot(slot_rows(enc, m, i, j, c.char_window), j, acc.data());
+            precompute.add_into(slot_rows(enc, m, i, j, c.char_window), j, acc);
         }
-
-        // Active dictionary features: one column addition each (5.4).
         for (std::uint32_t o = ws.dict.offsets[i]; o < ws.dict.offsets[i + 1]; ++o) {
-            add_dict(ws.dict.indices[o], acc.data());
+            kernels::add_i32(model.dict_col(ws.dict.indices[o]).data(), acc, h_dim);
         }
-
-        // ReLU, output dot product in int64, plus the b2 offset (I.1-(5)).
-        relu(acc.data());
-        out.push_back(saturate(dot(acc.data())));
+        kernels::relu_i32(acc, h_dim);
+        out.push_back(saturate(kernels::dot_i32(w2.data(), acc, h_dim) + model.b2_q()));
     }
 }
 
@@ -150,25 +143,8 @@ inline void score_boundaries_into(const Model& model, const EncodedEgc& enc,
     out.reserve(m - 1);
     model.dict().features_into(enc, ws.dict);
 
-    const std::size_t h_dim = model.config().hidden;
-    const PrecomputeTable& precompute = model.precompute();
-    const Span<const std::int16_t> w2 = model.w2();
-
     if (model.table_precision() == TablePrecision::Int32) {
-        const Span<const std::int32_t> b1_q = model.b1_q();
-        detail::score_loop(
-            model, enc, ws, out, ws.acc,
-            [&](std::int32_t* acc) { std::copy(b1_q.begin(), b1_q.end(), acc); },
-            [&](Span<const std::uint32_t> rows, std::size_t j, std::int32_t* acc) {
-                precompute.add_into(rows, j, acc);
-            },
-            [&](std::uint32_t k, std::int32_t* acc) {
-                kernels::add_i32(model.dict_col(k).data(), acc, h_dim);
-            },
-            [&](std::int32_t* acc) { kernels::relu_i32(acc, h_dim); },
-            [&](const std::int32_t* acc) {
-                return kernels::dot_i32(w2.data(), acc, h_dim) + model.b2_q();
-            });
+        detail::score_i32(model, enc, ws, out);
     } else {
         detail::score_i16_fused(model, enc, ws, out);
     }

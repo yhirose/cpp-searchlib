@@ -3,14 +3,12 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <string>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
 
 #include "segmentlib/bytes/binary_reader.h"
 #include "segmentlib/support/expected.h"
-#include "segmentlib/support/span.h"
 #include "segmentlib/types.h"
 #include "segmentlib/unicode/normalize.h"
 #include "segmentlib/unicode/utf8.h"
@@ -112,7 +110,6 @@ public:
     // malformed UTF-8 (caught at the model-loading boundary).
     explicit CharTable(std::string_view char_map_utf8) {
         CharId next_id = 1;      // id 0 is the reserved empty-string sentinel
-        id_to_cp_.push_back(0);  // index 0: the empty-string sentinel
         std::size_t pos = 0;
         while (pos < char_map_utf8.size()) {
             const auto dec = unicode::decode(char_map_utf8.substr(pos));
@@ -121,7 +118,6 @@ public:
             }
             // First occurrence wins; a repeated character does not consume an id.
             if (ids_.try_emplace(dec->codepoint, next_id).second) {
-                id_to_cp_.push_back(dec->codepoint);  // index == next_id
                 ++next_id;
             }
             pos += dec->length;
@@ -147,21 +143,6 @@ public:
     }
 
     [[nodiscard]] std::size_t size() const noexcept { return ids_.size(); }
-
-    // Decodes a KyteaString (a sequence of interned char ids, as tag candidate
-    // strings are stored in the model) back to UTF-8, the inverse of the id
-    // assignment done at construction. The reserved empty-string id 0 yields no
-    // output. Used off the hot path, at load time, to materialize tag strings.
-    [[nodiscard]] std::string decode(Span<const CharId> ids) const {
-        std::string out;
-        for (const CharId id : ids) {
-            const char32_t cp = id < id_to_cp_.size() ? id_to_cp_[id] : 0;
-            if (cp != 0) {  // id 0 (empty-string sentinel) contributes nothing
-                unicode::encode(cp, out);
-            }
-        }
-        return out;
-    }
 
     // Same as encode(), but fills a caller-owned EncodedText (its buffers are
     // reused, avoiding per-call allocation on the hot path).
@@ -212,7 +193,6 @@ private:
 
     std::unordered_map<char32_t, CharId> ids_;  // authoritative; astral fallback
     std::vector<CharId> bmp_ids_;               // size kBmpSize, direct-indexed
-    std::vector<char32_t> id_to_cp_;            // id -> codepoint (index 0 unused)
     std::array<CharId, 6> type_ids_{};          // by CharType
 };
 
