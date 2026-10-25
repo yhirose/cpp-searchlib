@@ -18,8 +18,8 @@
 
 #pragma once
 
-#define CPPSEARCHLIB_VERSION "0.2.0"
-#define CPPSEARCHLIB_VERSION_NUM "0x000200"
+#define CPPSEARCHLIB_VERSION "0.2.1"
+#define CPPSEARCHLIB_VERSION_NUM "0x000201"
 
 #include <algorithm>
 #include <any>
